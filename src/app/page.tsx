@@ -99,14 +99,21 @@ export default function App() {
     }
   }, [members, expenses]);
 
- const handleCreateGroup = async (e: React.FormEvent) => {
+  const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newGroupName.trim() || !user) return;
+    if (!newGroupName.trim()) return;
 
-    // 1. Create the Group
+    // 1. Fetch the absolute latest user session to satisfy RLS
+    const { data: { user: currentUser } } = await supabase.auth.getUser();
+    if (!currentUser) {
+      alert("You must be logged in to create a group.");
+      return;
+    }
+
+    // 2. Create the Group
     const { data: newGroup, error: groupError } = await supabase
       .from('groups')
-      .insert({ name: newGroupName, created_by: user.id })
+      .insert({ name: newGroupName, created_by: currentUser.id })
       .select()
       .single();
 
@@ -115,12 +122,12 @@ export default function App() {
       return;
     }
 
-    // 2. Add the creator as an Admin member
+    // 3. Add the creator as an Admin member
     const { error: memberError } = await supabase
       .from('group_members')
       .insert({
         group_id: newGroup.id,
-        user_id: user.id,
+        user_id: currentUser.id,
         role: 'admin'
       });
 
@@ -129,7 +136,7 @@ export default function App() {
       return;
     }
 
-    // 3. Update the UI
+    // 4. Update the UI
     setNewGroupName('');
     setGroups([...groups, newGroup]);
     setActiveGroupId(newGroup.id);
@@ -247,7 +254,7 @@ export default function App() {
                 placeholder="Group Name"
                 value={newGroupName}
                 onChange={(e) => setNewGroupName(e.target.value)}
-                className="w-full border border-slate-300 rounded-lg p-2 text-sm"
+                className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400"
                 required
               />
               <button
