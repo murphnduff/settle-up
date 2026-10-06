@@ -10,6 +10,7 @@ export default function App() {
   const [groups, setGroups] = useState<any[]>([]);
   const [activeGroupId, setActiveGroupId] = useState<string>('');
   const [members, setMembers] = useState<any[]>([]);
+  const [newGroupName, setNewGroupName] = useState('');
   const [expenses, setExpenses] = useState<any[]>([]);
   const [settlements, setSettlements] = useState<SettlementInstruction[]>([]);
 
@@ -98,6 +99,41 @@ export default function App() {
     }
   }, [members, expenses]);
 
+ const handleCreateGroup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newGroupName.trim() || !user) return;
+
+    // 1. Create the Group
+    const { data: newGroup, error: groupError } = await supabase
+      .from('groups')
+      .insert({ name: newGroupName, created_by: user.id })
+      .select()
+      .single();
+
+    if (groupError) {
+      alert("Error creating group: " + groupError.message);
+      return;
+    }
+
+    // 2. Add the creator as an Admin member
+    const { error: memberError } = await supabase
+      .from('group_members')
+      .insert({
+        group_id: newGroup.id,
+        user_id: user.id,
+        role: 'admin'
+      });
+
+    if (memberError) {
+      alert("Error adding admin member: " + memberError.message);
+      return;
+    }
+
+    // 3. Update the UI
+    setNewGroupName('');
+    setGroups([...groups, newGroup]);
+    setActiveGroupId(newGroup.id);
+  };
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!amount || !payerId || selectedMembers.length === 0) return;
@@ -178,26 +214,52 @@ export default function App() {
       </header>
 
       <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 md:grid-cols-4 gap-6">
-        {/* Groups Sidebar */}
-        <aside className="bg-white border border-slate-200 p-4 rounded-xl h-fit">
-          <h2 className="font-semibold text-slate-800 mb-3 text-sm">Your Groups</h2>
-          <div className="space-y-1">
-            {groups.map((g) => (
+{/* Groups Sidebar */}
+        <aside className="bg-white border border-slate-200 p-4 rounded-xl h-fit flex flex-col gap-4">
+          <div>
+            <h2 className="font-semibold text-slate-800 mb-3 text-sm">Your Groups</h2>
+            <div className="space-y-1">
+              {groups.length === 0 ? (
+                <p className="text-xs text-slate-400 italic">No groups yet.</p>
+              ) : (
+                groups.map((g) => (
+                  <button
+                    key={g.id}
+                    onClick={() => setActiveGroupId(g.id)}
+                    className={`w-full text-left px-3 py-2 text-sm rounded-lg transition ${
+                      activeGroupId === g.id
+                        ? 'bg-blue-50 text-blue-700 font-medium'
+                        : 'text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    {g.name}
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="pt-4 border-t border-slate-100">
+            <form onSubmit={handleCreateGroup} className="flex flex-col gap-2">
+              <label className="text-xs font-semibold text-slate-500">Create New Group</label>
+              <input
+                type="text"
+                placeholder="Group Name"
+                value={newGroupName}
+                onChange={(e) => setNewGroupName(e.target.value)}
+                className="w-full border border-slate-300 rounded-lg p-2 text-sm"
+                required
+              />
               <button
-                key={g.id}
-                onClick={() => setActiveGroupId(g.id)}
-                className={`w-full text-left px-3 py-2 text-sm rounded-lg transition ${
-                  activeGroupId === g.id
-                    ? 'bg-blue-50 text-blue-700 font-medium'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
+                type="submit"
+                className="w-full bg-blue-600 text-white py-1.5 rounded-lg text-xs font-semibold hover:bg-blue-700 transition"
               >
-                {g.name}
+                Create
               </button>
-            ))}
+            </form>
           </div>
         </aside>
-
+        
         {/* Expense Entry & Settlement Panel */}
         <section className="md:col-span-2 space-y-6">
           <form onSubmit={handleAddExpense} className="bg-white border border-slate-200 p-6 rounded-xl space-y-4">
