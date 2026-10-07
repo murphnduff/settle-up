@@ -1,0 +1,7 @@
+Starting:
+	Refer to @PROJECT_CONTEXT.md and let's implement the member invitation modal.
+
+Exiting:
+	"Please update PROJECT_CONTEXT.md with what we accomplished in this session and list our next immediate tasks, then we are done."
+
+	Then sync "Wrap up session and update PROJECT_CONTEXT.md" to commit to Git
