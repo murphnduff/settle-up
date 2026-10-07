@@ -1,41 +1,46 @@
-'use client';
+"use client";
 
-import { useEffect, useState, useTransition } from 'react';
-import { createClient } from '@/lib/supabase';
-import { calculateSettlements, SettlementInstruction } from '@/lib/reconciliation';
+import { useEffect, useState, useTransition } from "react";
+import { createClient } from "@/lib/supabase";
+import {
+  calculateSettlements,
+  SettlementInstruction,
+} from "@/lib/reconciliation";
 
 export default function App() {
   const supabase = createClient();
   const [user, setUser] = useState<any>(null);
   const [groups, setGroups] = useState<any[]>([]);
-  const [activeGroupId, setActiveGroupId] = useState<string>('');
+  const [activeGroupId, setActiveGroupId] = useState<string>("");
   const [members, setMembers] = useState<any[]>([]);
-  const [newGroupName, setNewGroupName] = useState('');
+  const [newGroupName, setNewGroupName] = useState("");
   const [expenses, setExpenses] = useState<any[]>([]);
   const [settlements, setSettlements] = useState<SettlementInstruction[]>([]);
 
   // Form state
-  const [description, setDescription] = useState('');
-  const [amount, setAmount] = useState('');
-  const [currency, setCurrency] = useState('$');
-  const [payerId, setPayerId] = useState('');
-  const [type, setType] = useState<'expense' | 'payment'>('expense');
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [currency, setCurrency] = useState("$");
+  const [payerId, setPayerId] = useState("");
+  const [type, setType] = useState<"expense" | "payment">("expense");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [, startTransition] = useTransition();
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => setUser(data.user));
-    const { data: authListener } = supabase.auth.onAuthStateChange((_, session) => {
-      setUser(session?.user ?? null);
-    });
+    const { data: authListener } = supabase.auth.onAuthStateChange(
+      (_, session) => {
+        setUser(session?.user ?? null);
+      },
+    );
     return () => authListener.subscription.unsubscribe();
   }, []);
 
   useEffect(() => {
     if (!user) return;
     supabase
-      .from('groups')
-      .select('*')
+      .from("groups")
+      .select("*")
       .then(({ data }) => {
         if (data && data.length > 0) {
           setGroups(data);
@@ -49,9 +54,9 @@ export default function App() {
 
     // Load group members
     supabase
-      .from('group_members')
-      .select('user_id, role, profiles(id, full_name, email)')
-      .eq('group_id', activeGroupId)
+      .from("group_members")
+      .select("user_id, role, profiles(id, full_name, email)")
+      .eq("group_id", activeGroupId)
       .then(({ data }) => {
         if (data) {
           const list = data.map((m: any) => ({
@@ -66,10 +71,12 @@ export default function App() {
 
     // Load group expenses with splits
     supabase
-      .from('expenses')
-      .select('id, payer_id, description, amount, currency, type, date, expense_splits(user_id, amount)')
-      .eq('group_id', activeGroupId)
-      .order('date', { ascending: false })
+      .from("expenses")
+      .select(
+        "id, payer_id, description, amount, currency, type, date, expense_splits(user_id, amount)",
+      )
+      .eq("group_id", activeGroupId)
+      .order("date", { ascending: false })
       .then(({ data }) => {
         if (data) {
           const formatted = data.map((e: any) => ({
@@ -104,7 +111,9 @@ export default function App() {
     if (!newGroupName.trim()) return;
 
     // 1. Fetch the absolute latest user session to satisfy RLS
-    const { data: { user: currentUser } } = await supabase.auth.getUser();
+    const {
+      data: { user: currentUser },
+    } = await supabase.auth.getUser();
     if (!currentUser) {
       alert("You must be logged in to create a group.");
       return;
@@ -112,7 +121,7 @@ export default function App() {
 
     // 2. Create the Group
     const { data: newGroup, error: groupError } = await supabase
-      .from('groups')
+      .from("groups")
       .insert({ name: newGroupName, created_by: currentUser.id })
       .select()
       .single();
@@ -123,13 +132,11 @@ export default function App() {
     }
 
     // 3. Add the creator as an Admin member
-    const { error: memberError } = await supabase
-      .from('group_members')
-      .insert({
-        group_id: newGroup.id,
-        user_id: currentUser.id,
-        role: 'admin'
-      });
+    const { error: memberError } = await supabase.from("group_members").insert({
+      group_id: newGroup.id,
+      user_id: currentUser.id,
+      role: "admin",
+    });
 
     if (memberError) {
       alert("Error adding admin member: " + memberError.message);
@@ -137,19 +144,48 @@ export default function App() {
     }
 
     // 4. Update the UI
-    setNewGroupName('');
+    setNewGroupName("");
     setGroups([...groups, newGroup]);
     setActiveGroupId(newGroup.id);
   };
+
+  const handleDeleteGroup = async (groupId: string, groupName: string) => {
+    const confirmed = window.confirm(
+      `Are you sure you want to delete the group "${groupName}"? This will remove all associated expenses and settlements.`,
+    );
+    if (!confirmed) return;
+
+    // 1. Delete associated expenses, splits, and members if not set to cascade in PostgreSQL
+    await supabase.from("expenses").delete().eq("group_id", groupId);
+    await supabase.from("group_members").delete().eq("group_id", groupId);
+
+    // 2. Delete the group
+    const { error } = await supabase.from("groups").delete().eq("id", groupId);
+
+    if (error) {
+      alert("Error deleting group: " + error.message);
+      return;
+    }
+
+    // 3. Update local state
+    const remaining = groups.filter((g) => g.id !== groupId);
+    setGroups(remaining);
+    if (activeGroupId === groupId) {
+      setActiveGroupId(remaining.length > 0 ? remaining[0].id : "");
+    }
+  };
+
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!amount || !payerId || selectedMembers.length === 0) return;
 
     const parsedAmount = parseFloat(amount);
-    const splitAmount = Number((parsedAmount / selectedMembers.length).toFixed(2));
+    const splitAmount = Number(
+      (parsedAmount / selectedMembers.length).toFixed(2),
+    );
 
     const { data: newExp, error } = await supabase
-      .from('expenses')
+      .from("expenses")
       .insert({
         group_id: activeGroupId,
         created_by: user.id,
@@ -173,17 +209,17 @@ export default function App() {
       amount: splitAmount,
     }));
 
-    await supabase.from('expense_splits').insert(splitsPayload);
+    await supabase.from("expense_splits").insert(splitsPayload);
 
     // Refresh UI
-    setDescription('');
-    setAmount('');
+    setDescription("");
+    setAmount("");
     startTransition(() => setActiveGroupId(activeGroupId));
   };
 
   const signInWithGoogle = () => {
     supabase.auth.signInWithOAuth({
-      provider: 'google',
+      provider: "google",
       options: { redirectTo: window.location.origin },
     });
   };
@@ -193,7 +229,9 @@ export default function App() {
       <main className="flex min-h-screen flex-col items-center justify-center p-6 bg-slate-50">
         <div className="p-8 bg-white border border-slate-200 rounded-xl shadow-sm text-center max-w-sm w-full">
           <h1 className="text-2xl font-bold tracking-tight mb-2">Settle Up</h1>
-          <p className="text-sm text-slate-500 mb-6">Multi-group expense settlement tracker</p>
+          <p className="text-sm text-slate-500 mb-6">
+            Multi-group expense settlement tracker
+          </p>
           <button
             onClick={signInWithGoogle}
             className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-4 rounded-lg transition"
@@ -221,26 +259,44 @@ export default function App() {
       </header>
 
       <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 md:grid-cols-4 gap-6">
-{/* Groups Sidebar */}
+        {/* Groups Sidebar */}
         <aside className="bg-white border border-slate-200 p-4 rounded-xl h-fit flex flex-col gap-4">
           <div>
-            <h2 className="font-semibold text-slate-800 mb-3 text-sm">Your Groups</h2>
+            <h2 className="font-semibold text-slate-800 mb-3 text-sm">
+              Your Groups
+            </h2>
             <div className="space-y-1">
               {groups.length === 0 ? (
                 <p className="text-xs text-slate-400 italic">No groups yet.</p>
               ) : (
                 groups.map((g) => (
-                  <button
+                  <div
                     key={g.id}
-                    onClick={() => setActiveGroupId(g.id)}
-                    className={`w-full text-left px-3 py-2 text-sm rounded-lg transition ${
+                    className={`group flex items-center justify-between px-3 py-2 text-sm rounded-lg transition ${
                       activeGroupId === g.id
-                        ? 'bg-blue-50 text-blue-700 font-medium'
-                        : 'text-slate-600 hover:bg-slate-100'
+                        ? "bg-blue-50 text-blue-700 font-medium"
+                        : "text-slate-600 hover:bg-slate-100"
                     }`}
                   >
-                    {g.name}
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveGroupId(g.id)}
+                      className="flex-1 text-left truncate mr-2"
+                    >
+                      {g.name}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteGroup(g.id, g.name);
+                      }}
+                      title="Delete group"
+                      className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 text-xs px-1.5 py-0.5 rounded transition"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))
               )}
             </div>
@@ -248,7 +304,9 @@ export default function App() {
 
           <div className="pt-4 border-t border-slate-100">
             <form onSubmit={handleCreateGroup} className="flex flex-col gap-2">
-              <label className="text-xs font-semibold text-slate-500">Create New Group</label>
+              <label className="text-xs font-semibold text-slate-500">
+                Create New Group
+              </label>
               <input
                 type="text"
                 placeholder="Group Name"
@@ -266,25 +324,28 @@ export default function App() {
             </form>
           </div>
         </aside>
-        
+
         {/* Expense Entry & Settlement Panel */}
         <section className="md:col-span-2 space-y-6">
-          <form onSubmit={handleAddExpense} className="bg-white border border-slate-200 p-6 rounded-xl space-y-4">
+          <form
+            onSubmit={handleAddExpense}
+            className="bg-white border border-slate-200 p-6 rounded-xl space-y-4"
+          >
             <h2 className="font-semibold text-slate-800">Add Transaction</h2>
             <div className="flex gap-4">
               <label className="text-sm font-medium flex items-center gap-2">
                 <input
                   type="radio"
-                  checked={type === 'expense'}
-                  onChange={() => setType('expense')}
+                  checked={type === "expense"}
+                  onChange={() => setType("expense")}
                 />
                 Group Expense
               </label>
               <label className="text-sm font-medium flex items-center gap-2">
                 <input
                   type="radio"
-                  checked={type === 'payment'}
-                  onChange={() => setType('payment')}
+                  checked={type === "payment"}
+                  onChange={() => setType("payment")}
                 />
                 Direct Payment
               </label>
@@ -292,7 +353,9 @@ export default function App() {
 
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="text-xs font-semibold text-slate-500 block mb-1">Paid By</label>
+                <label className="text-xs font-semibold text-slate-500 block mb-1">
+                  Paid By
+                </label>
                 <select
                   value={payerId}
                   onChange={(e) => setPayerId(e.target.value)}
@@ -301,13 +364,17 @@ export default function App() {
                 >
                   <option value="">Select Member</option>
                   {members.map((m) => (
-                    <option key={m.id} value={m.id}>{m.name}</option>
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
                   ))}
                 </select>
               </div>
 
               <div>
-                <label className="text-xs font-semibold text-slate-500 block mb-1">Amount & Currency</label>
+                <label className="text-xs font-semibold text-slate-500 block mb-1">
+                  Amount & Currency
+                </label>
                 <div className="flex gap-2">
                   <input
                     type="number"
@@ -331,7 +398,9 @@ export default function App() {
             </div>
 
             <div>
-              <label className="text-xs font-semibold text-slate-500 block mb-1">Description</label>
+              <label className="text-xs font-semibold text-slate-500 block mb-1">
+                Description
+              </label>
               <input
                 type="text"
                 placeholder="e.g. Dinner, Fuel, Lodging"
@@ -343,25 +412,29 @@ export default function App() {
             </div>
 
             <div>
-              <label className="text-xs font-semibold text-slate-500 block mb-1">Split Among</label>
+              <label className="text-xs font-semibold text-slate-500 block mb-1">
+                Split Among
+              </label>
               <div className="flex flex-wrap gap-2">
                 {members.map((m) => (
                   <button
                     type="button"
                     key={m.id}
                     onClick={() => {
-                      if (type === 'payment') {
+                      if (type === "payment") {
                         setSelectedMembers([m.id]);
                       } else {
                         setSelectedMembers((prev) =>
-                          prev.includes(m.id) ? prev.filter((id) => id !== m.id) : [...prev, m.id]
+                          prev.includes(m.id)
+                            ? prev.filter((id) => id !== m.id)
+                            : [...prev, m.id],
                         );
                       }
                     }}
                     className={`px-3 py-1 rounded-full text-xs font-medium border ${
                       selectedMembers.includes(m.id)
-                        ? 'bg-blue-600 text-white border-blue-600'
-                        : 'bg-white text-slate-600 border-slate-300'
+                        ? "bg-blue-600 text-white border-blue-600"
+                        : "bg-white text-slate-600 border-slate-300"
                     }`}
                   >
                     {m.name}
@@ -385,16 +458,25 @@ export default function App() {
             </div>
             <div className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
               {expenses.map((exp) => (
-                <div key={exp.id} className="p-4 flex items-center justify-between text-sm">
+                <div
+                  key={exp.id}
+                  className="p-4 flex items-center justify-between text-sm"
+                >
                   <div>
-                    <div className="font-medium text-slate-900">{exp.description}</div>
+                    <div className="font-medium text-slate-900">
+                      {exp.description}
+                    </div>
                     <div className="text-xs text-slate-500">
-                      Paid by {members.find((m) => m.id === exp.payerId)?.name || 'Unknown'} on {exp.date}
+                      Paid by{" "}
+                      {members.find((m) => m.id === exp.payerId)?.name ||
+                        "Unknown"}{" "}
+                      on {exp.date}
                     </div>
                   </div>
                   <div className="text-right">
                     <span className="font-semibold text-slate-900">
-                      {exp.currency}{exp.amount.toFixed(2)}
+                      {exp.currency}
+                      {exp.amount.toFixed(2)}
                     </span>
                     <span className="block text-xs uppercase tracking-wide text-slate-400">
                       {exp.type}
@@ -408,18 +490,34 @@ export default function App() {
 
         {/* Settlement Minimization Plan */}
         <aside className="bg-white border border-slate-200 p-6 rounded-xl h-fit">
-          <h2 className="font-semibold text-slate-800 mb-2">Optimal Settlement Plan</h2>
-          <p className="text-xs text-slate-500 mb-4">Minimizes total payments needed to settle debts across all members.</p>
+          <h2 className="font-semibold text-slate-800 mb-2">
+            Optimal Settlement Plan
+          </h2>
+          <p className="text-xs text-slate-500 mb-4">
+            Minimizes total payments needed to settle debts across all members.
+          </p>
           <div className="space-y-2">
             {settlements.length === 0 ? (
-              <p className="text-xs text-slate-400 italic">All debts are settled up.</p>
+              <p className="text-xs text-slate-400 italic">
+                All debts are settled up.
+              </p>
             ) : (
               settlements.map((s, idx) => (
-                <div key={idx} className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs">
-                  <span className="font-semibold text-slate-800">{s.fromUser}</span> pays{' '}
-                  <span className="font-semibold text-slate-800">{s.toUser}</span>:
+                <div
+                  key={idx}
+                  className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                >
+                  <span className="font-semibold text-slate-800">
+                    {s.fromUser}
+                  </span>{" "}
+                  pays{" "}
+                  <span className="font-semibold text-slate-800">
+                    {s.toUser}
+                  </span>
+                  :
                   <div className="text-sm font-bold text-blue-600 mt-1">
-                    {s.currency}{s.amount.toFixed(2)}
+                    {s.currency}
+                    {s.amount.toFixed(2)}
                   </div>
                 </div>
               ))
@@ -430,4 +528,3 @@ export default function App() {
     </div>
   );
 }
-
