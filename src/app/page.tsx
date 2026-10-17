@@ -18,12 +18,17 @@ import {
   Trash2,
   LogOut,
   Plus,
+  Receipt,
+  ArrowRightLeft,
+  Wallet,
+  Sparkles,
 } from "lucide-react";
 import type { User } from "@supabase/supabase-js";
 
 interface ExpenseItem extends ExpenseRecord {
   description: string;
   date: string;
+  amount: number;
 }
 
 export default function App() {
@@ -35,6 +40,9 @@ export default function App() {
   const [newGroupName, setNewGroupName] = useState("");
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
+  const [historyCurrencyFilter, setHistoryCurrencyFilter] = useState<
+    "all" | "$" | "€"
+  >("all");
   const [notification, setNotification] = useState<{
     type: "success" | "error";
     message: string;
@@ -55,7 +63,7 @@ export default function App() {
   // Form state
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("$");
+  const [currency, setCurrency] = useState<"$" | "€">("$");
   const [payerId, setPayerId] = useState("");
   const [type, setType] = useState<"expense" | "payment">("expense");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
@@ -190,20 +198,30 @@ export default function App() {
       .then(({ data }) => {
         if (cancelled || !data) return;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const formatted: ExpenseItem[] = (data as any[]).map((e) => ({
-          id: e.id,
-          payerId: e.payer_id,
-          description: e.description,
-          amount: Number(e.amount),
-          currency: e.currency,
-          type: e.type,
-          date: e.date,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          splits: (e.expense_splits || []).map((s: any) => ({
-            userId: s.user_id,
-            amount: Number(s.amount),
-          })),
-        }));
+        const formatted: ExpenseItem[] = (data as any[]).map((e) => {
+          const amt = Number(e.amount);
+          return {
+            id: e.id,
+            paidByMemberId: e.payer_id,
+            payerId: e.payer_id,
+            description: e.description,
+            amount: amt,
+            amountCents: Math.round(amt * 100),
+            currency: e.currency,
+            type: e.type,
+            date: e.date,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            splits: (e.expense_splits || []).map((s: any) => {
+              const splitAmt = Number(s.amount);
+              return {
+                memberId: s.user_id,
+                userId: s.user_id,
+                amount: splitAmt,
+                splitAmountCents: Math.round(splitAmt * 100),
+              };
+            }),
+          };
+        });
         setExpenses(formatted);
       });
 
@@ -211,6 +229,16 @@ export default function App() {
       cancelled = true;
     };
   }, [activeGroupId, supabase]);
+
+  // Effective payer defaults to current user or first group member
+  const effectivePayerId = useMemo(() => {
+    if (payerId && members.some((m) => m.id === payerId)) {
+      return payerId;
+    }
+    const userMember = members.find((m) => m.id === user?.id);
+    if (userMember) return userMember.id;
+    return members[0]?.id || "";
+  }, [payerId, members, user]);
 
   // Refresh members callback for after invite modal adds a member
   const refreshMembers = useCallback(
@@ -253,25 +281,58 @@ export default function App() {
 
       if (data) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const formatted: ExpenseItem[] = (data as any[]).map((e) => ({
-          id: e.id,
-          payerId: e.payer_id,
-          description: e.description,
-          amount: Number(e.amount),
-          currency: e.currency,
-          type: e.type,
-          date: e.date,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          splits: (e.expense_splits || []).map((s: any) => ({
-            userId: s.user_id,
-            amount: Number(s.amount),
-          })),
-        }));
+        const formatted: ExpenseItem[] = (data as any[]).map((e) => {
+          const amt = Number(e.amount);
+          return {
+            id: e.id,
+            paidByMemberId: e.payer_id,
+            payerId: e.payer_id,
+            description: e.description,
+            amount: amt,
+            amountCents: Math.round(amt * 100),
+            currency: e.currency,
+            type: e.type,
+            date: e.date,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            splits: (e.expense_splits || []).map((s: any) => {
+              const splitAmt = Number(s.amount);
+              return {
+                memberId: s.user_id,
+                userId: s.user_id,
+                amount: splitAmt,
+                splitAmountCents: Math.round(splitAmt * 100),
+              };
+            }),
+          };
+        });
         setExpenses(formatted);
       }
     },
     [supabase]
   );
+
+  // Currency totals
+  const usdTotal = useMemo(
+    () =>
+      expenses
+        .filter((e) => e.currency === "$")
+        .reduce((acc, e) => acc + e.amount, 0),
+    [expenses]
+  );
+
+  const eurTotal = useMemo(
+    () =>
+      expenses
+        .filter((e) => e.currency === "€")
+        .reduce((acc, e) => acc + e.amount, 0),
+    [expenses]
+  );
+
+  // Filtered transactions for the ledger
+  const filteredExpenses = useMemo(() => {
+    if (historyCurrencyFilter === "all") return expenses;
+    return expenses.filter((e) => e.currency === historyCurrencyFilter);
+  }, [expenses, historyCurrencyFilter]);
 
   // Memoized settlement calculations
   const settlements: SettlementInstruction[] = useMemo(() => {
@@ -281,11 +342,28 @@ export default function App() {
     return [];
   }, [members, expenses]);
 
+  // Isolate settlements by currency
+  const usdSettlements = useMemo(
+    () => settlements.filter((s) => s.currency === "$"),
+    [settlements]
+  );
+  const eurSettlements = useMemo(
+    () => settlements.filter((s) => s.currency === "€"),
+    [settlements]
+  );
+
+  // Live split computation
+  const parsedAmount = parseFloat(amount);
+  const perPersonAmount =
+    !isNaN(parsedAmount) && parsedAmount > 0 && selectedMembers.length > 0
+      ? (parsedAmount / selectedMembers.length).toFixed(2)
+      : null;
+
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newGroupName.trim()) return;
 
-    // 1. Fetch the absolute latest user session to satisfy RLS
+    // 1. Fetch latest user session
     const {
       data: { user: currentUser },
     } = await supabase.auth.getUser();
@@ -306,7 +384,7 @@ export default function App() {
       return;
     }
 
-    // 3. Add the creator as an Admin member
+    // 3. Add creator as Admin
     const { error: memberError } = await supabase.from("group_members").insert({
       group_id: newGroup.id,
       user_id: currentUser.id,
@@ -330,11 +408,9 @@ export default function App() {
     );
     if (!confirmed) return;
 
-    // 1. Delete associated expenses, splits, and members
     await supabase.from("expenses").delete().eq("group_id", groupId);
     await supabase.from("group_members").delete().eq("group_id", groupId);
 
-    // 2. Delete the group
     const { error } = await supabase.from("groups").delete().eq("id", groupId);
 
     if (error) {
@@ -342,7 +418,6 @@ export default function App() {
       return;
     }
 
-    // 3. Update local state
     const remaining = groups.filter((g) => g.id !== groupId);
     setGroups(remaining);
     if (activeGroupId === groupId) {
@@ -352,21 +427,20 @@ export default function App() {
 
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!amount || !payerId || selectedMembers.length === 0 || !user) return;
+    const finalPayerId = payerId || effectivePayerId;
+    if (!amount || !finalPayerId || selectedMembers.length === 0 || !user) return;
 
-    const parsedAmount = parseFloat(amount);
-    const splitAmount = Number(
-      (parsedAmount / selectedMembers.length).toFixed(2)
-    );
+    const parsed = parseFloat(amount);
+    const splitAmount = Number((parsed / selectedMembers.length).toFixed(2));
 
     const { data: newExp, error } = await supabase
       .from("expenses")
       .insert({
         group_id: activeGroupId,
         created_by: user.id,
-        payer_id: payerId,
+        payer_id: finalPayerId,
         description,
-        amount: parsedAmount,
+        amount: parsed,
         currency,
         type,
       })
@@ -484,7 +558,7 @@ export default function App() {
 
       <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 md:grid-cols-4 gap-6">
         {/* Groups Sidebar */}
-        <aside className="bg-white border border-slate-200 p-4 rounded-xl h-fit flex flex-col gap-4">
+        <aside className="bg-white border border-slate-200 p-4 rounded-2xl h-fit flex flex-col gap-4">
           <div>
             <h2 className="font-semibold text-slate-800 mb-3 text-sm flex items-center justify-between">
               <span>Your Groups</span>
@@ -501,9 +575,9 @@ export default function App() {
                 groups.map((g) => (
                   <div
                     key={g.id}
-                    className={`group flex items-center justify-between px-3 py-2 text-sm rounded-lg transition ${
+                    className={`group flex items-center justify-between px-3 py-2 text-sm rounded-xl transition ${
                       activeGroupId === g.id
-                        ? "bg-blue-50 text-blue-700 font-medium border border-blue-100"
+                        ? "bg-blue-50 text-blue-700 font-semibold border border-blue-100 shadow-2xs"
                         : "text-slate-600 hover:bg-slate-100 border border-transparent"
                     }`}
                   >
@@ -557,87 +631,129 @@ export default function App() {
 
         {/* Expense Entry & Settlement Panel */}
         <section className="md:col-span-2 space-y-6">
-          {/* Active Group Header with Member Info and Invite Trigger */}
+          {/* Active Group Header with Member Info, Summary Metrics, and Invite Trigger */}
           {activeGroup ? (
-            <div className="bg-white border border-slate-200 p-5 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-lg font-bold text-slate-900">
-                    {activeGroup.name}
-                  </h2>
-                  <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">
-                    {members.length} {members.length === 1 ? "member" : "members"}
+            <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2.5">
+                    <h2 className="text-xl font-bold text-slate-900 tracking-tight">
+                      {activeGroup.name}
+                    </h2>
+                    <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700">
+                      {members.length} {members.length === 1 ? "member" : "members"}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                    {members.map((m) => (
+                      <span
+                        key={m.id}
+                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs bg-slate-50 border border-slate-200 text-slate-700"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                        <span className="font-medium">{m.name}</span>
+                        {m.role === "admin" && (
+                          <span className="text-[10px] text-indigo-600 font-bold uppercase tracking-wider ml-0.5">
+                            Admin
+                          </span>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsInviteModalOpen(true)}
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs shrink-0 cursor-pointer"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  Invite Members
+                </button>
+              </div>
+
+              {/* Multi-Currency Ledger Summary Metrics */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-3 border-t border-slate-100 text-xs">
+                <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100">
+                  <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
+                    USD Spent
+                  </span>
+                  <span className="text-base font-bold text-slate-900">
+                    ${usdTotal.toFixed(2)}
                   </span>
                 </div>
-                <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                  {members.map((m) => (
-                    <span
-                      key={m.id}
-                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs bg-slate-50 border border-slate-200 text-slate-700"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                      <span className="font-medium">{m.name}</span>
-                      {m.role === "admin" && (
-                        <span className="text-[10px] text-indigo-600 font-semibold uppercase tracking-wider ml-0.5">
-                          Admin
-                        </span>
-                      )}
-                    </span>
-                  ))}
+                <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100">
+                  <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
+                    EUR Spent
+                  </span>
+                  <span className="text-base font-bold text-slate-900">
+                    €{eurTotal.toFixed(2)}
+                  </span>
+                </div>
+                <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100 col-span-2 sm:col-span-1">
+                  <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
+                    Total Transactions
+                  </span>
+                  <span className="text-base font-bold text-slate-900">
+                    {expenses.length}
+                  </span>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => setIsInviteModalOpen(true)}
-                className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs shrink-0 cursor-pointer"
-              >
-                <UserPlus className="w-4 h-4" />
-                Invite Members
-              </button>
             </div>
           ) : (
-            <div className="bg-white border border-slate-200 p-6 rounded-xl text-center text-slate-500 text-sm">
+            <div className="bg-white border border-slate-200 p-8 rounded-2xl text-center text-slate-500 text-sm">
               Select or create a group to start tracking expenses.
             </div>
           )}
 
           {activeGroup && (
             <>
+              {/* Add Transaction Form */}
               <form
                 onSubmit={handleAddExpense}
-                className="bg-white border border-slate-200 p-6 rounded-xl space-y-4"
+                className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs space-y-4"
               >
-                <h2 className="font-semibold text-slate-800 text-base">
-                  Add Transaction
-                </h2>
-                <div className="flex gap-4">
-                  <label className="text-sm font-medium flex items-center gap-2 cursor-pointer text-slate-700">
-                    <input
-                      type="radio"
-                      checked={type === "expense"}
-                      onChange={() => setType("expense")}
-                      className="text-blue-600 focus:ring-blue-500"
-                    />
-                    Group Expense
-                  </label>
-                  <label className="text-sm font-medium flex items-center gap-2 cursor-pointer text-slate-700">
-                    <input
-                      type="radio"
-                      checked={type === "payment"}
-                      onChange={() => setType("payment")}
-                      className="text-blue-600 focus:ring-blue-500"
-                    />
-                    Direct Payment
-                  </label>
+                <div className="flex items-center justify-between">
+                  <h2 className="font-bold text-slate-900 text-base">
+                    Add Transaction
+                  </h2>
+                  <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => setType("expense")}
+                      className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
+                        type === "expense"
+                          ? "bg-white text-slate-900 shadow-2xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      Group Expense
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setType("payment");
+                        if (members.length > 0) {
+                          setSelectedMembers([members[0].id]);
+                        }
+                      }}
+                      className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
+                        type === "payment"
+                          ? "bg-white text-slate-900 shadow-2xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      Direct Payment
+                    </button>
+                  </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="text-xs font-semibold text-slate-600 block mb-1">
                       Paid By
                     </label>
                     <select
-                      value={payerId}
+                      value={effectivePayerId}
                       onChange={(e) => setPayerId(e.target.value)}
                       className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                       required
@@ -645,7 +761,7 @@ export default function App() {
                       <option value="">Select Member</option>
                       {members.map((m) => (
                         <option key={m.id} value={m.id}>
-                          {m.name}
+                          {m.name} {m.id === user.id ? "(You)" : ""}
                         </option>
                       ))}
                     </select>
@@ -656,23 +772,44 @@ export default function App() {
                       Amount & Currency
                     </label>
                     <div className="flex gap-2">
-                      <input
-                        type="number"
-                        step="0.01"
-                        placeholder="0.00"
-                        value={amount}
-                        onChange={(e) => setAmount(e.target.value)}
-                        className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                        required
-                      />
-                      <select
-                        value={currency}
-                        onChange={(e) => setCurrency(e.target.value)}
-                        className="border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                      >
-                        <option value="$">$</option>
-                        <option value="€">€</option>
-                      </select>
+                      <div className="relative flex-1">
+                        <span className="absolute left-3 top-2 text-sm font-semibold text-slate-400">
+                          {currency}
+                        </span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={amount}
+                          onChange={(e) => setAmount(e.target.value)}
+                          className="w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                          required
+                        />
+                      </div>
+                      <div className="flex border border-slate-300 rounded-lg p-0.5 bg-slate-100">
+                        <button
+                          type="button"
+                          onClick={() => setCurrency("$")}
+                          className={`px-3 py-1 text-xs font-bold rounded-md transition cursor-pointer ${
+                            currency === "$"
+                              ? "bg-white text-blue-700 shadow-2xs"
+                              : "text-slate-500 hover:text-slate-800"
+                          }`}
+                        >
+                          $ USD
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCurrency("€")}
+                          className={`px-3 py-1 text-xs font-bold rounded-md transition cursor-pointer ${
+                            currency === "€"
+                              ? "bg-white text-blue-700 shadow-2xs"
+                              : "text-slate-500 hover:text-slate-800"
+                          }`}
+                        >
+                          € EUR
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -683,7 +820,7 @@ export default function App() {
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g. Dinner, Fuel, Lodging"
+                    placeholder="e.g. Dinner, Fuel, Groceries, Hotel"
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
                     className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
@@ -691,84 +828,196 @@ export default function App() {
                   />
                 </div>
 
-                <div>
-                  <label className="text-xs font-semibold text-slate-600 block mb-1">
-                    Split Among
-                  </label>
-                  <div className="flex flex-wrap gap-2">
-                    {members.map((m) => (
-                      <button
-                        type="button"
-                        key={m.id}
-                        onClick={() => {
-                          if (type === "payment") {
-                            setSelectedMembers([m.id]);
-                          } else {
-                            setSelectedMembers((prev) =>
-                              prev.includes(m.id)
-                                ? prev.filter((id) => id !== m.id)
-                                : [...prev, m.id]
-                            );
+                {/* Split Among with Live Preview and Select All */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-slate-600">
+                      {type === "expense"
+                        ? `Split Among (${selectedMembers.length} selected)`
+                        : "Paid To (Recipient)"}
+                    </label>
+                    {type === "expense" && members.length > 0 && (
+                      <div className="flex items-center gap-2 text-xs">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSelectedMembers(members.map((m) => m.id))
                           }
-                        }}
-                        className={`px-3 py-1 rounded-full text-xs font-medium border transition cursor-pointer ${
-                          selectedMembers.includes(m.id)
-                            ? "bg-blue-600 text-white border-blue-600 shadow-xs"
-                            : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
-                        }`}
-                      >
-                        {m.name}
-                      </button>
-                    ))}
+                          className="text-blue-600 hover:text-blue-700 font-semibold cursor-pointer"
+                        >
+                          Select All
+                        </button>
+                        <span className="text-slate-300">•</span>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedMembers([])}
+                          className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    )}
                   </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {members.map((m) => {
+                      const isSelected = selectedMembers.includes(m.id);
+                      return (
+                        <button
+                          type="button"
+                          key={m.id}
+                          onClick={() => {
+                            if (type === "payment") {
+                              setSelectedMembers([m.id]);
+                            } else {
+                              setSelectedMembers((prev) =>
+                                prev.includes(m.id)
+                                  ? prev.filter((id) => id !== m.id)
+                                  : [...prev, m.id]
+                              );
+                            }
+                          }}
+                          className={`px-3 py-1.5 rounded-full text-xs font-medium border transition cursor-pointer flex items-center gap-1.5 ${
+                            isSelected
+                              ? "bg-blue-600 text-white border-blue-600 shadow-xs"
+                              : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                          }`}
+                        >
+                          <span>{m.name}</span>
+                          {isSelected && <span className="text-[10px]">✓</span>}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Live split calculation preview */}
+                  {perPersonAmount && type === "expense" && (
+                    <div className="p-2.5 bg-blue-50/70 border border-blue-100 rounded-xl text-xs text-blue-800 flex items-center justify-between animate-in fade-in-50">
+                      <span className="flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                        <span>
+                          Equal split across {selectedMembers.length}{" "}
+                          {selectedMembers.length === 1 ? "person" : "people"}:
+                        </span>
+                      </span>
+                      <span className="font-bold text-blue-900 text-sm">
+                        {currency}
+                        {perPersonAmount} each
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 <button
                   type="submit"
-                  className="w-full bg-slate-900 text-white py-2 rounded-lg text-sm font-semibold hover:bg-slate-800 transition cursor-pointer shadow-xs"
+                  className="w-full bg-slate-900 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-slate-800 transition cursor-pointer shadow-xs"
                 >
                   Save Transaction
                 </button>
               </form>
 
-              {/* Ledger Table */}
-              <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-200 font-semibold text-sm text-slate-800 flex items-center justify-between">
-                  <span>Transaction History</span>
-                  <span className="text-xs text-slate-400 font-normal">
-                    {expenses.length} {expenses.length === 1 ? "entry" : "entries"}
-                  </span>
-                </div>
-                <div className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
-                  {expenses.length === 0 ? (
-                    <p className="p-6 text-center text-xs text-slate-400 italic">
-                      No transactions recorded yet for this group.
+              {/* Ledger Table with Currency Isolation Filter */}
+              <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
+                <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="font-bold text-sm text-slate-900">
+                      Transaction History
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Showing {filteredExpenses.length} of {expenses.length}{" "}
+                      records
                     </p>
+                  </div>
+
+                  {/* Currency Segmented Tabs */}
+                  <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setHistoryCurrencyFilter("all")}
+                      className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
+                        historyCurrencyFilter === "all"
+                          ? "bg-white text-slate-900 shadow-2xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHistoryCurrencyFilter("$")}
+                      className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
+                        historyCurrencyFilter === "$"
+                          ? "bg-white text-blue-700 shadow-2xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      $ USD ({expenses.filter((e) => e.currency === "$").length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHistoryCurrencyFilter("€")}
+                      className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
+                        historyCurrencyFilter === "€"
+                          ? "bg-white text-blue-700 shadow-2xs"
+                          : "text-slate-500 hover:text-slate-800"
+                      }`}
+                    >
+                      € EUR ({expenses.filter((e) => e.currency === "€").length})
+                    </button>
+                  </div>
+                </div>
+
+                <div className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
+                  {filteredExpenses.length === 0 ? (
+                    <div className="p-8 text-center text-xs text-slate-400 italic">
+                      No transactions recorded for this currency filter.
+                    </div>
                   ) : (
-                    expenses.map((exp) => (
+                    filteredExpenses.map((exp) => (
                       <div
                         key={exp.id}
-                        className="p-4 flex items-center justify-between text-sm hover:bg-slate-50/50 transition"
+                        className="p-4 flex items-center justify-between text-sm hover:bg-slate-50/50 transition gap-3"
                       >
-                        <div>
-                          <div className="font-medium text-slate-900">
-                            {exp.description}
+                        <div className="flex items-start gap-3 min-w-0">
+                          <div
+                            className={`p-2 rounded-xl shrink-0 mt-0.5 ${
+                              exp.type === "payment"
+                                ? "bg-emerald-50 text-emerald-600"
+                                : "bg-blue-50 text-blue-600"
+                            }`}
+                          >
+                            {exp.type === "payment" ? (
+                              <ArrowRightLeft className="w-4 h-4" />
+                            ) : (
+                              <Receipt className="w-4 h-4" />
+                            )}
                           </div>
-                          <div className="text-xs text-slate-500 mt-0.5">
-                            Paid by{" "}
-                            <span className="font-medium text-slate-700">
-                              {members.find((m) => m.id === exp.payerId)?.name ||
-                                "Unknown"}
-                            </span>{" "}
-                            on {exp.date}
+                          <div className="min-w-0">
+                            <div className="font-semibold text-slate-900 truncate">
+                              {exp.description}
+                            </div>
+                            <div className="text-xs text-slate-500 mt-0.5">
+                              Paid by{" "}
+                              <span className="font-medium text-slate-700">
+                                {members.find((m) => m.id === exp.payerId)?.name ||
+                                  "Unknown"}
+                              </span>{" "}
+                              • {exp.date}
+                            </div>
                           </div>
                         </div>
-                        <div className="text-right">
-                          <span className="font-semibold text-slate-900">
+                        <div className="text-right shrink-0">
+                          <span className="font-bold text-slate-900 text-sm">
                             {exp.currency}
                             {exp.amount.toFixed(2)}
                           </span>
-                          <span className="block text-[10px] uppercase font-semibold tracking-wider text-slate-400">
+                          <span
+                            className={`block text-[10px] uppercase font-bold tracking-wider mt-0.5 ${
+                              exp.type === "payment"
+                                ? "text-emerald-600"
+                                : "text-slate-400"
+                            }`}
+                          >
                             {exp.type}
                           </span>
                         </div>
@@ -781,38 +1030,86 @@ export default function App() {
           )}
         </section>
 
-        {/* Settlement Minimization Plan */}
-        <aside className="bg-white border border-slate-200 p-6 rounded-xl h-fit space-y-3">
+        {/* Multi-Currency Settlement Minimization Plan */}
+        <aside className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs h-fit space-y-4">
           <div>
-            <h2 className="font-semibold text-slate-800 text-sm">
-              Optimal Settlement Plan
+            <h2 className="font-bold text-slate-900 text-base flex items-center gap-2">
+              <Wallet className="w-4 h-4 text-blue-600" />
+              Settlement Plan
             </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Minimizes total payments needed to settle debts across all members.
+            <p className="text-xs text-slate-500 mt-1">
+              Greedy cash-flow minimization pairing largest debtors with largest creditors across isolated currency ledgers.
             </p>
           </div>
-          <div className="space-y-2">
-            {settlements.length === 0 ? (
-              <p className="text-xs text-slate-400 italic py-2">
-                All debts are settled up.
-              </p>
+
+          {/* USD ($) Settlements */}
+          <div className="space-y-2 pt-3 border-t border-slate-100">
+            <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-blue-600"></span>
+                USD ($) Ledger
+              </span>
+              <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                {usdSettlements.length === 0
+                  ? "Settled"
+                  : `${usdSettlements.length} transfer(s)`}
+              </span>
+            </div>
+
+            {usdSettlements.length === 0 ? (
+              <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                All USD debts are settled up.
+              </div>
             ) : (
-              settlements.map((s, idx) => (
+              usdSettlements.map((s, idx) => (
                 <div
                   key={idx}
-                  className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                  className="p-3 bg-blue-50/50 border border-blue-100 rounded-xl text-xs space-y-1"
                 >
-                  <span className="font-semibold text-slate-800">
-                    {s.fromUser}
-                  </span>{" "}
-                  pays{" "}
-                  <span className="font-semibold text-slate-800">
-                    {s.toUser}
-                  </span>
-                  :
-                  <div className="text-sm font-bold text-blue-600 mt-1">
-                    {s.currency}
-                    {s.amount.toFixed(2)}
+                  <div className="text-slate-700">
+                    <span className="font-bold text-slate-900">{s.fromUser}</span>{" "}
+                    pays{" "}
+                    <span className="font-bold text-slate-900">{s.toUser}</span>
+                  </div>
+                  <div className="text-sm font-bold text-blue-700">
+                    ${s.amount.toFixed(2)}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* EUR (€) Settlements */}
+          <div className="space-y-2 pt-3 border-t border-slate-100">
+            <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
+                EUR (€) Ledger
+              </span>
+              <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                {eurSettlements.length === 0
+                  ? "Settled"
+                  : `${eurSettlements.length} transfer(s)`}
+              </span>
+            </div>
+
+            {eurSettlements.length === 0 ? (
+              <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                All EUR debts are settled up.
+              </div>
+            ) : (
+              eurSettlements.map((s, idx) => (
+                <div
+                  key={idx}
+                  className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl text-xs space-y-1"
+                >
+                  <div className="text-slate-700">
+                    <span className="font-bold text-slate-900">{s.fromUser}</span>{" "}
+                    pays{" "}
+                    <span className="font-bold text-slate-900">{s.toUser}</span>
+                  </div>
+                  <div className="text-sm font-bold text-indigo-700">
+                    €{s.amount.toFixed(2)}
                   </div>
                 </div>
               ))
