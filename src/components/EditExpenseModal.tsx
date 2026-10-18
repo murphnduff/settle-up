@@ -130,16 +130,32 @@ export default function EditExpenseModal({
 
     try {
       // 1. Update the expense record
-      const { error: updateError } = await supabase
+      const updatePayload: Record<string, unknown> = {
+        description:
+          description.trim() || (type === "payment" ? "Payment" : "Expense"),
+        amount_cents: totalCents,
+        currency,
+        type,
+        paid_by_member_id: payerId,
+      };
+
+      let { error: updateError } = await supabase
         .from("expenses")
-        .update({
-          description: description.trim() || (type === "payment" ? "Payment" : "Expense"),
-          amount_cents: totalCents,
-          currency: currency === "€" ? "EUR" : "USD",
-          type,
-          paid_by_member_id: payerId,
-        })
+        .update(updatePayload)
         .eq("id", expense.id);
+
+      if (
+        updateError &&
+        (updateError.message?.toLowerCase().includes("expenses_currency_check") ||
+          updateError.message?.toLowerCase().includes("currency"))
+      ) {
+        updatePayload.currency = currency === "€" ? "EUR" : "USD";
+        const retryUpdate = await supabase
+          .from("expenses")
+          .update(updatePayload)
+          .eq("id", expense.id);
+        updateError = retryUpdate.error;
+      }
 
       if (updateError) {
         setError("Error updating expense: " + updateError.message);

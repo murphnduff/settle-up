@@ -69,12 +69,15 @@ CREATE TABLE IF NOT EXISTS public.expenses (
     type TEXT NOT NULL DEFAULT 'expense' CHECK (type IN ('expense', 'payment')),
     description TEXT NOT NULL DEFAULT '',
     amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
-    currency TEXT NOT NULL DEFAULT 'USD' CHECK (currency IN ('USD', 'EUR')),
+    currency TEXT NOT NULL DEFAULT 'USD' CHECK (currency IN ('USD', 'EUR', '$', '€')),
     date DATE NOT NULL DEFAULT CURRENT_DATE,
     paid_by_member_id UUID NOT NULL REFERENCES public.group_members(id) ON DELETE RESTRICT,
     created_by_member_id UUID REFERENCES public.group_members(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.expenses DROP CONSTRAINT IF EXISTS expenses_currency_check;
+ALTER TABLE public.expenses ADD CONSTRAINT expenses_currency_check CHECK (currency IN ('USD', 'EUR', '$', '€'));
 
 CREATE TABLE IF NOT EXISTS public.expense_splits (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

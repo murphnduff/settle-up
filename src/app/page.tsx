@@ -294,7 +294,7 @@ export function SettleUpDashboard({
         const formatted: ExpenseItem[] = (data as any[]).map((e) => {
           const amtCents = Number(e.amount_cents || 0);
           const amt = amtCents / 100;
-          const curr = e.currency === "EUR" ? "€" : "$";
+          const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
           return {
             id: e.id,
             paidByMemberId: e.paid_by_member_id,
@@ -522,7 +522,7 @@ export function SettleUpDashboard({
         const formatted: ExpenseItem[] = (data as any[]).map((e) => {
           const amtCents = Number(e.amount_cents || 0);
           const amt = amtCents / 100;
-          const curr = e.currency === "EUR" ? "€" : "$";
+          const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
           return {
             id: e.id,
             paidByMemberId: e.paid_by_member_id,
@@ -780,21 +780,29 @@ export function SettleUpDashboard({
         description.trim() ||
         (type === "payment" ? "Direct Payment" : "Group Expense"),
       amount_cents: totalCents,
-      currency: currency === "€" ? "EUR" : "USD",
+      currency,
       type,
       date: new Date().toISOString().split("T")[0],
     };
 
-    // 1. Insert into expenses (auto-adapts if legacy NOT NULL columns still exist in DB)
+    // 1. Insert into expenses (auto-adapts if legacy NOT NULL or currency check constraints exist in DB)
     let { data: newExp, error: expError } = await supabase
       .from("expenses")
       .insert(expensePayload)
       .select("id")
       .single();
 
-    for (let attempt = 0; attempt < 3 && expError; attempt++) {
+    for (let attempt = 0; attempt < 4 && expError; attempt++) {
       const msg = expError.message?.toLowerCase() || "";
       let updated = false;
+      const isoCurrency = currency === "€" ? "EUR" : "USD";
+      if (
+        (msg.includes("expenses_currency_check") || msg.includes("currency")) &&
+        expensePayload.currency !== isoCurrency
+      ) {
+        expensePayload.currency = isoCurrency;
+        updated = true;
+      }
       if (msg.includes('"amount"') && !("amount" in expensePayload)) {
         expensePayload.amount = Number((totalCents / 100).toFixed(2));
         updated = true;
