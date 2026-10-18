@@ -15,11 +15,11 @@
 - **Single Global Super-Admin (`murph@murphnduff.org`):**
   - The **ONLY** user who signs in via Google OAuth (`user?.email?.toLowerCase() === 'murph@murphnduff.org'` on the client, and `lower(coalesce(auth.jwt() ->> 'email', '')) = 'murph@murphnduff.org'` in Supabase RLS).
   - Sees **ALL** groups in the database in the left sidebar.
-  - Is the **ONLY** user who can Create Groups, Delete Groups, or Manage Members (Add/Delete members).
-  - **Non-Participant Super-Admin Support:** When creating a new group, the Super-Admin is **not** automatically added to `public.group_members` unless they explicitly check the optional `"Add me as a member"` checkbox (unchecked by default). This allows creating and managing groups for other people without polluting their participant list. When viewing a group as a non-participant, the UI displays `"Admin View (non-participant)"` instead of nagging with `"Who are you in this group?"`, while still allowing the Admin to add/edit transactions on behalf of any group member or optionally tap a member pill to act as them.
+  - Is the **ONLY** user who can Create Groups, Delete Groups, Import CSV files, or Manage Members (Add/Delete members).
+  - **Super-Admin Group Creation (`"Add me as a member"` defaults to Checked `true`):** In the Create New Group form, the `"Add me as a member"` checkbox defaults to `true`, and can be unchecked when the Admin is creating a group for someone else. When viewing a group as a non-participant, the UI displays `"Admin View (non-participant)"` instead of nagging with `"Who are you in this group?"`.
 - **Root-Level Friendly Group URLs (`https://split.murphnduff.org/SoCal_2026`):**
   - Groups have a `slug` column in `public.groups` derived from `name` (`name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')`, e.g., `'Test Group 1'` -> `'Test_Group_1'`, `'SoCal 2026'` -> `'SoCal_2026'`).
-  - Groups are served directly at the root dynamic route `src/app/[slug]/page.tsx` (matching `ilike(slug, slugParam)` or `id = slugParam` if a UUID is passed).
+  - Groups are served directly at the root dynamic route `src/app/[slug]/page.tsx` (matching `ilike(slug, slugParam)`, `ilike(name, spaceNormalizedTarget)`, or `id = slugParam` if a UUID is passed).
   - Any legacy `/g/[slug]` requests automatically redirect to `/[slug]`.
 - **Zero-Login Regular Users & Cross-Device Recognition:**
   - Anyone visiting `/<slug>` (or `/<slug>?m=<display_name>`) on a phone, tablet, or computer immediately sees and loads the group without logging in.
@@ -29,8 +29,34 @@
   - Both the main **Add Transaction** form (`src/app/page.tsx`) and the **Edit Transaction** modal (`src/components/EditExpenseModal.tsx`) include an `<input type="date" />` field.
   - Defaults to today's local date (`YYYY-MM-DD`) when adding a new transaction, and pre-populates with `expense.date` when editing an existing transaction.
   - Saves the selected date to `public.expenses.date`, displays a human-friendly formatted date (e.g., `Oct 18, 2026`) on each transaction row in the ledger, and sorts the transaction ledger chronologically by `date` descending with `created_at` descending as tie-breaker.
+- **Custom Unequal Splits (`Equal | % Percentage | $ Exact`):**
+  - Both **Add Transaction** and **Edit Transaction** provide a 3-way split mode selector (`Equal` | `% Percentage` | `$ Exact`) for Group Expenses:
+    - **Equal:** Distributes integer cents via `splitAmountEqually(totalAmountCents, memberIds)`.
+    - **% Percentage:** Inline percentage inputs per member with live remaining-percentage validation and cent allocation via `splitAmountByPercentage(totalAmountCents, memberPercentages)` (Largest Remainder Method so `SUM(splitAmountCents) === totalAmountCents`).
+    - **$ Exact:** Inline dollar/euro inputs per member with live remaining-amount validation via `validateExactSplits(totalAmountCents, exactInputs)`.
 
-### 2.2 Database Tables
+### 2.2 Single Unified CSV Import & Export Format (`<slug>_<YYYY-MM-DD>_export.csv`)
+- **Standard CSV Structure (No JSON Import/Export):**
+  - **Header Row:** `Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,...` (where `<Member 1>...` are the exact `display_name`s of the group members).
+  - **Transaction Rows:** Each member column contains that member's net delta for the transaction (`+paid - share_owed`), formatted to 2 decimal places:
+    - For the payer: `(amount_cents - payer_split_amount_cents) / 100` (positive number).
+    - For all other participating members: `-split_amount_cents / 100` (negative number).
+    - For non-participating members: `0.00`.
+    - `Category` is `'Payment'` when `type === 'payment'`, and `'General'` when `type === 'expense'`.
+  - **Footer Row (after a blank line):** `<YYYY-MM-DD>,Total balance, , ,<Currency>,<Net 1 Balance Member>,<Net 2 Balance Member>,...`
+- **Export CSV Button (Available to All Users in Group Header):**
+  - Downloads `<slug>_<YYYY-MM-DD>_export.csv` via `generateGroupCsv()`.
+- **Import CSV Button & Modal (Super-Admin `murph@murphnduff.org` Only):**
+  - Allows Super-Admin to upload a `.csv` file in this format to either create a new group (deriving the default group name from the filename via `deriveGroupNameFromCsvFilename`, e.g., `orphans_2026-10-18_export.csv` -> `'orphans'`) or import into the currently active group.
+  - Reads member names from header index 5 onward, ensures all exist in `group_members`, skips blank lines and `'Total balance'` summary rows, identifies `paid_by_member_id` where `valCents > 0`, and reconstructs exact `expense_splits` (`Math.abs(valCents)` for `valCents < 0`, and `amount_cents - valCents` for the payer when `amount_cents - valCents > 0`).
+
+### 2.3 Privacy, Anti-Indexing & Anti-Discovery Shield (4 Layers)
+1. **`robots.txt` (`src/app/robots.ts`):** Sets `userAgent: '*'`, `disallow: '/'` to instruct all search engine and AI crawlers not to crawl any route on `split.murphnduff.org`.
+2. **HTML Meta Tags (`src/app/layout.tsx`):** Global `metadata.robots` configured with `{ index: false, follow: false, nocache: true, googleBot: { index: false, follow: false, noimageindex: true, 'max-snippet': -1 } }`.
+3. **Server-Level HTTP Header (`next.config.ts`):** Global `headers()` rule on `source: '/:path*'` returning `X-Robots-Tag: noindex, nofollow, noarchive, nosnippet, noimageindex` across all HTML, API, and static responses.
+4. **Root Group Enumeration Prevention (`src/app/page.tsx`):** Unauthenticated visitors (or anyone other than `murph@murphnduff.org`) NEVER execute an unfiltered `SELECT * FROM groups` query. On `/`, the client only queries `.in('id', recentIds)` for group IDs already stored in that browser's `localStorage` (`recent_groups`), and on `/[slug]` it only queries the specific group matching `slug`, `id`, or `name`.
+
+### 2.4 Database Tables
 - **`groups`**:
   - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `name` (TEXT NOT NULL), `slug` (TEXT UNIQUE case-insensitively), `created_by` (UUID Nullable FK to `auth.users`), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`group_members`**:
@@ -42,7 +68,7 @@
 - **`expense_splits`**:
   - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `expense_id` (UUID NOT NULL FK CASCADE), `member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 
-### 2.3 Simplified Row-Level Security (RLS) Rules
+### 2.5 Simplified Row-Level Security (RLS) Rules
 - **Admin Helper:** `public.is_super_admin()` returns `true` ONLY when `lower(coalesce(auth.jwt() ->> 'email', '')) = 'murph@murphnduff.org'`.
 - **`groups`**:
   - `SELECT`: Allowed for `anon` and `authenticated`.
@@ -54,7 +80,7 @@
 - **`expenses` & `expense_splits`**:
   - `SELECT / INSERT / UPDATE / DELETE`: Allowed for `anon` and `authenticated`.
 
-### 2.4 Supabase Heartbeat (`/api/heartbeat`)
+### 2.6 Supabase Heartbeat (`/api/heartbeat`)
 - **Route Handler (`src/app/api/heartbeat/route.ts`):** Executes `SELECT id FROM groups LIMIT 1` via Supabase and returns `{ status: 'ok', timestamp }` to prevent Supabase free-tier project pausing.
 - **Vercel Cron (`vercel.json`):** Configured with a scheduled cron job hitting `/api/heartbeat`.
 
@@ -65,18 +91,19 @@
 | Action | Super-Admin (`murph@murphnduff.org`) | Regular User (Via `/<slug>` Link) |
 | :--- | :--- | :--- |
 | **Sign-In Required?** | Yes (Google OAuth) | **No** (Instant access on Phone, Tablet, or PC) |
-| **Sidebar Group List** | Sees **ALL** groups in database | Sees groups visited on their device (`recent_groups` in `localStorage`) |
-| **Create / Delete Group** | Yes (Auto-generates `slug`; optional `"Add me as a member"` checkbox) | No (Hidden in UI, blocked by RLS) |
-| **Non-Participant View** | Yes (`Admin View (non-participant)` without identity nagging) | N/A |
+| **Sidebar Group List** | Sees **ALL** groups in database | Sees only groups visited on their device (`recent_groups` in `localStorage`) |
+| **Create / Delete Group** | Yes (`slug` auto-generated; `"Add me as a member"` checked by default) | No (Hidden in UI, blocked by RLS) |
+| **Import CSV** | Yes (Create new group from CSV or import into active group) | No (Hidden in UI) |
+| **Export CSV** | Yes (`<slug>_<YYYY-MM-DD>_export.csv`) | Yes (`<slug>_<YYYY-MM-DD>_export.csv`) |
 | **Manage Members (Add/Delete)**| Yes (Delete blocked if >0 txns) | No (Hidden in UI, blocked by RLS) |
 | **Share Group / Member Link** | Yes (`/<slug>` & `/<slug>?m=<display_name>`) | Yes (Can copy `/<slug>` group link) |
 | **Rename Members** | Yes (Any member) | Yes (Can rename own selected member profile) |
-| **Add / Edit / Delete Txns** | Yes (Any expense or payment, with custom `date` picker) | Yes (Any expense or payment in the group, with custom `date` picker) |
+| **Add / Edit / Delete Txns** | Yes (`Equal | % Percentage | $ Exact` splits & custom `date`) | Yes (`Equal | % Percentage | $ Exact` splits & custom `date`) |
 
 ---
 
 ## 4. Math Engine & Test Suite (`src/lib/reconciliation.test.ts`)
-All 7 core integer-cent math and reconciliation edge-case tests pass 100%:
+All 9 core integer-cent math, custom split, and CSV import/export edge-case tests pass 100%:
 1. Indivisible Penny (`$100.00 / 3` -> `3334, 3333, 3333` cents).
 2. Transitive Debt Simplification (`Murph -> Kev -> Fitz` collapses to 1 transfer).
 3. 1-to-1 Direct Payment Offset.
@@ -84,10 +111,10 @@ All 7 core integer-cent math and reconciliation edge-case tests pass 100%:
 5. Multi-Currency Isolation (`USD` vs `EUR` never cross-cancel).
 6. Member Deletion Guard (`canDeleteMember`).
 7. Transaction Mutation Recalculation.
+8. Custom Unequal Splits (`splitAmountByPercentage` & `validateExactSplits`).
+9. Unified CSV Parser & Exporter (`parseGroupCsv` & `generateGroupCsv` reconstructing odd-penny splits like `550.00,EUR,-78.57,-78.57,-78.57,-78.57,-78.57,-78.57,471.42` into `55000` cents paid by `Adele` with `7857 x 6 + 7858`).
 
 ---
 
 ## 5. Future Backlog
-1. **Automated `/browser` E2E Walkthrough:** End-to-end browser verification of Super-Admin group creation, member addition, `/<slug>?m=<display_name>` sharing, and zero-login transaction entry.
-2. **Full Group JSON Import/Export:** Support native group JSON backup/restore as well as legacy `ExpenseAppData.json` (`{ Users, Expenses }`) migration.
-3. **Custom Split Types:** Support Percentage splits (e.g., `70% / 30%`) and Exact Dollar splits alongside Equal splits.
+1. **Automated `/browser` E2E Walkthrough:** End-to-end browser verification of Super-Admin group creation, CSV import/export, member addition, `/<slug>?m=<display_name>` sharing, and zero-login transaction entry.

@@ -1,10 +1,16 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { createClient } from "@/lib/supabase";
-import { splitAmountEqually } from "@/lib/reconciliation";
+import {
+  splitAmountEqually,
+  splitAmountByPercentage,
+  validateExactSplits,
+} from "@/lib/reconciliation";
 import { GroupMember } from "@/components/MemberInviteModal";
-import { X, Sparkles, AlertCircle, Edit3 } from "lucide-react";
+import { X, Sparkles, AlertCircle, Edit3, CheckCircle2 } from "lucide-react";
+
+export type SplitMode = "equal" | "percentage" | "exact";
 
 export function getTodayLocalDate(): string {
   const now = new Date();
@@ -62,6 +68,26 @@ interface EditExpenseModalProps {
   onSaved: () => void;
 }
 
+function detectInitialSplitMode(expense: ExpenseItem | null): SplitMode {
+  if (!expense || expense.type === "payment" || expense.splits.length === 0) {
+    return "equal";
+  }
+  const memberIds = expense.splits.map((s) => s.memberId);
+  const equalReference = splitAmountEqually(expense.amountCents, memberIds);
+  if (equalReference.length !== expense.splits.length) return "exact";
+
+  const refCounts = new Map<number, number>();
+  for (const r of equalReference) {
+    refCounts.set(r.splitAmountCents, (refCounts.get(r.splitAmountCents) || 0) + 1);
+  }
+  for (const s of expense.splits) {
+    const count = refCounts.get(s.splitAmountCents) || 0;
+    if (count <= 0) return "exact";
+    refCounts.set(s.splitAmountCents, count - 1);
+  }
+  return "equal";
+}
+
 export default function EditExpenseModal({
   isOpen,
   onClose,
@@ -88,9 +114,36 @@ export default function EditExpenseModal({
   const [date, setDate] = useState(
     expense?.date ? expense.date.split("T")[0] : getTodayLocalDate()
   );
+  const [splitMode, setSplitMode] = useState<SplitMode>(() =>
+    detectInitialSplitMode(expense)
+  );
   const [selectedMembers, setSelectedMembers] = useState<string[]>(
     expense ? expense.splits.map((s) => s.memberId) : []
   );
+  const [percentageValues, setPercentageValues] = useState<
+    Record<string, string>
+  >(() => {
+    const init: Record<string, string> = {};
+    if (expense && expense.amountCents > 0) {
+      for (const s of expense.splits) {
+        init[s.memberId] = (
+          (s.splitAmountCents / expense.amountCents) *
+          100
+        ).toFixed(2);
+      }
+    }
+    return init;
+  });
+  const [exactValues, setExactValues] = useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {};
+    if (expense) {
+      for (const s of expense.splits) {
+        init[s.memberId] = (s.splitAmountCents / 100).toFixed(2);
+      }
+    }
+    return init;
+  });
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -132,17 +185,57 @@ export default function EditExpenseModal({
   };
 
   const parsedAmount = parseFloat(amount);
+  const totalCents =
+    !isNaN(parsedAmount) && parsedAmount > 0
+      ? Math.round(parsedAmount * 100)
+      : 0;
+
   const perPersonAmount =
-    !isNaN(parsedAmount) && parsedAmount > 0 && selectedMembers.length > 0
-      ? (parsedAmount / selectedMembers.length).toFixed(2)
+    totalCents > 0 && selectedMembers.length > 0
+      ? (totalCents / 100 / selectedMembers.length).toFixed(2)
       : null;
+
+  // Live percentage summary
+  const percentageSummary = useMemo(() => {
+    const inputs = members.map((m) => ({
+      memberId: m.id,
+      percentage: parseFloat(percentageValues[m.id] || "0") || 0,
+    }));
+    const totalPct = inputs.reduce((acc, i) => acc + i.percentage, 0);
+    const remainingPct = 100 - totalPct;
+    const isValid = Math.abs(remainingPct) <= 0.01 && inputs.some((i) => i.percentage > 0);
+    const splits =
+      isValid && totalCents > 0
+        ? splitAmountByPercentage(totalCents, inputs)
+        : [];
+    const splitMap = new Map(splits.map((s) => [s.memberId, s.splitAmountCents]));
+    return {
+      inputs,
+      totalPct,
+      remainingPct,
+      isValid,
+      splits,
+      splitMap,
+    };
+  }, [members, percentageValues, totalCents]);
+
+  // Live exact split validation
+  const exactSummary = useMemo(() => {
+    const inputs = members.map((m) => {
+      const val = parseFloat(exactValues[m.id] || "0");
+      return {
+        memberId: m.id,
+        splitAmountCents: !isNaN(val) && val > 0 ? Math.round(val * 100) : 0,
+      };
+    });
+    return validateExactSplits(totalCents, inputs);
+  }, [members, exactValues, totalCents]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!expense) return;
 
-    const parsed = parseFloat(amount);
-    if (isNaN(parsed) || parsed <= 0) {
+    if (totalCents <= 0) {
       setError("Please enter a valid amount greater than zero.");
       return;
     }
@@ -150,15 +243,47 @@ export default function EditExpenseModal({
       setError("Please select who paid.");
       return;
     }
-    if (selectedMembers.length === 0) {
-      setError("Please select at least one split participant.");
-      return;
+
+    let calculatedSplits: Array<{ memberId: string; splitAmountCents: number }> = [];
+
+    if (type === "payment") {
+      if (selectedMembers.length === 0) {
+        setError("Please select a recipient for the payment.");
+        return;
+      }
+      calculatedSplits = [
+        {
+          memberId: selectedMembers[0],
+          splitAmountCents: totalCents,
+        },
+      ];
+    } else if (splitMode === "equal") {
+      if (selectedMembers.length === 0) {
+        setError("Please select at least one split participant.");
+        return;
+      }
+      calculatedSplits = splitAmountEqually(totalCents, selectedMembers);
+    } else if (splitMode === "percentage") {
+      if (!percentageSummary.isValid || percentageSummary.splits.length === 0) {
+        setError(
+          `Percentages must add up to 100% (currently ${percentageSummary.totalPct.toFixed(2)}%).`
+        );
+        return;
+      }
+      calculatedSplits = percentageSummary.splits;
+    } else {
+      if (!exactSummary.valid) {
+        setError(
+          exactSummary.error ||
+            "Exact split amounts must equal the transaction total."
+        );
+        return;
+      }
+      calculatedSplits = exactSummary.splits;
     }
 
     setIsSubmitting(true);
     setError(null);
-
-    const totalCents = Math.round(parsed * 100);
 
     try {
       // 1. Update the expense record
@@ -209,24 +334,13 @@ export default function EditExpenseModal({
       }
 
       // 3. Insert newly calculated splits
-      let splitsPayload: Array<Record<string, unknown>> = [];
-
-      if (type === "payment") {
-        splitsPayload = [
-          {
-            expense_id: expense.id,
-            member_id: selectedMembers[0],
-            split_amount_cents: totalCents,
-          },
-        ];
-      } else {
-        const equalSplits = splitAmountEqually(totalCents, selectedMembers);
-        splitsPayload = equalSplits.map((s) => ({
+      let splitsPayload: Array<Record<string, unknown>> = calculatedSplits.map(
+        (s) => ({
           expense_id: expense.id,
           member_id: s.memberId,
           split_amount_cents: s.splitAmountCents,
-        }));
-      }
+        })
+      );
 
       let { error: insertSplitsError } = await supabase
         .from("expense_splits")
@@ -304,7 +418,7 @@ export default function EditExpenseModal({
                 Edit Transaction
               </h2>
               <p className="text-xs text-slate-500">
-                Update amount, payer, participants, or transaction type.
+                Update amount, payer, participants, or custom split shares.
               </p>
             </div>
           </div>
@@ -460,79 +574,259 @@ export default function EditExpenseModal({
           </div>
         </div>
 
-        {/* Participants / Recipient selection */}
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
+        {/* Split Mode & Participants selection */}
+        <div className="space-y-3">
+          <div className="flex items-center justify-between flex-wrap gap-2">
             <label className="text-xs font-semibold text-slate-600">
               {type === "expense"
-                ? `Split Among (${selectedMembers.length} selected)`
+                ? splitMode === "equal"
+                  ? `Split Among (${selectedMembers.length} selected)`
+                  : splitMode === "percentage"
+                    ? "Split by Percentage (%)"
+                    : `Split by Exact Amount (${currency})`
                 : "Paid To (Recipient)"}
             </label>
-            {type === "expense" && members.length > 0 && (
-              <div className="flex items-center gap-2 text-xs">
+
+            {type === "expense" && (
+              <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
                 <button
                   type="button"
-                  onClick={() => setSelectedMembers(members.map((m) => m.id))}
-                  className="text-blue-600 hover:text-blue-700 font-semibold cursor-pointer"
+                  onClick={() => setSplitMode("equal")}
+                  className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                    splitMode === "equal"
+                      ? "bg-white text-blue-700 shadow-2xs"
+                      : "text-slate-500 hover:text-slate-800"
+                  }`}
                 >
-                  Select All
+                  Equal
                 </button>
-                <span className="text-slate-300">•</span>
                 <button
                   type="button"
-                  onClick={() => setSelectedMembers([])}
-                  className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                  onClick={() => setSplitMode("percentage")}
+                  className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                    splitMode === "percentage"
+                      ? "bg-white text-blue-700 shadow-2xs"
+                      : "text-slate-500 hover:text-slate-800"
+                  }`}
                 >
-                  Clear
+                  % Percentage
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSplitMode("exact")}
+                  className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                    splitMode === "exact"
+                      ? "bg-white text-blue-700 shadow-2xs"
+                      : "text-slate-500 hover:text-slate-800"
+                  }`}
+                >
+                  $ Exact
                 </button>
               </div>
             )}
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            {members.map((m) => {
-              const isSelected = selectedMembers.includes(m.id);
-              return (
-                <button
-                  type="button"
-                  key={m.id}
-                  onClick={() => {
-                    if (type === "payment") {
-                      setSelectedMembers([m.id]);
-                    } else {
-                      setSelectedMembers((prev) =>
-                        prev.includes(m.id)
-                          ? prev.filter((id) => id !== m.id)
-                          : [...prev, m.id]
-                      );
-                    }
-                  }}
-                  className={`px-3 py-1.5 rounded-full text-xs font-medium border transition cursor-pointer flex items-center gap-1.5 ${
-                    isSelected
-                      ? "bg-blue-600 text-white border-blue-600 shadow-xs"
-                      : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
-                  }`}
-                >
-                  <span>{m.name}</span>
-                  {isSelected && <span className="text-[10px]">✓</span>}
-                </button>
-              );
-            })}
-          </div>
+          {type === "payment" || splitMode === "equal" ? (
+            <>
+              {type === "expense" && members.length > 0 && (
+                <div className="flex items-center justify-end gap-2 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMembers(members.map((m) => m.id))}
+                    className="text-blue-600 hover:text-blue-700 font-semibold cursor-pointer"
+                  >
+                    Select All
+                  </button>
+                  <span className="text-slate-300">•</span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMembers([])}
+                    className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
 
-          {perPersonAmount && type === "expense" && (
-            <div className="p-2.5 bg-blue-50/70 border border-blue-100 rounded-xl text-xs text-blue-800 flex items-center justify-between animate-in fade-in-50">
-              <span className="flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                <span>
-                  Equal split across {selectedMembers.length}{" "}
-                  {selectedMembers.length === 1 ? "person" : "people"}:
+              <div className="flex flex-wrap gap-2">
+                {members.map((m) => {
+                  const isSelected = selectedMembers.includes(m.id);
+                  return (
+                    <button
+                      type="button"
+                      key={m.id}
+                      onClick={() => {
+                        if (type === "payment") {
+                          setSelectedMembers([m.id]);
+                        } else {
+                          setSelectedMembers((prev) =>
+                            prev.includes(m.id)
+                              ? prev.filter((id) => id !== m.id)
+                              : [...prev, m.id]
+                          );
+                        }
+                      }}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium border transition cursor-pointer flex items-center gap-1.5 ${
+                        isSelected
+                          ? "bg-blue-600 text-white border-blue-600 shadow-xs"
+                          : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                      }`}
+                    >
+                      <span>{m.name}</span>
+                      {isSelected && <span className="text-[10px]">✓</span>}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {perPersonAmount && type === "expense" && (
+                <div className="p-2.5 bg-blue-50/70 border border-blue-100 rounded-xl text-xs text-blue-800 flex items-center justify-between animate-in fade-in-50">
+                  <span className="flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                    <span>
+                      Equal split across {selectedMembers.length}{" "}
+                      {selectedMembers.length === 1 ? "person" : "people"}:
+                    </span>
+                  </span>
+                  <span className="font-bold text-blue-900 text-sm">
+                    {currency}
+                    {perPersonAmount} each
+                  </span>
+                </div>
+              )}
+            </>
+          ) : splitMode === "percentage" ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto p-1">
+                {members.map((m) => {
+                  const allocCents = percentageSummary.splitMap.get(m.id) || 0;
+                  return (
+                    <div
+                      key={m.id}
+                      className="flex items-center justify-between gap-2 p-2 rounded-xl border border-slate-200 bg-slate-50/60"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <span className="text-xs font-semibold text-slate-800 block truncate">
+                          {m.name}
+                        </span>
+                        {totalCents > 0 && allocCents > 0 && (
+                          <span className="text-[11px] text-slate-500">
+                            {currency}
+                            {(allocCents / 100).toFixed(2)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="relative w-24 shrink-0">
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          max="100"
+                          placeholder="0"
+                          value={percentageValues[m.id] ?? ""}
+                          onChange={(e) =>
+                            setPercentageValues((prev) => ({
+                              ...prev,
+                              [m.id]: e.target.value,
+                            }))
+                          }
+                          className="w-full pr-6 pl-2 py-1 border border-slate-300 rounded-lg text-xs text-right text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                        <span className="absolute right-2 top-1.5 text-xs text-slate-400 font-semibold">
+                          %
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div
+                className={`p-2.5 rounded-xl text-xs flex items-center justify-between border ${
+                  percentageSummary.isValid
+                    ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                    : "bg-amber-50 border-amber-200 text-amber-800"
+                }`}
+              >
+                <span className="flex items-center gap-1.5 font-medium">
+                  {percentageSummary.isValid ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  )}
+                  <span>
+                    Total: {percentageSummary.totalPct.toFixed(2)}% / 100%
+                  </span>
                 </span>
-              </span>
-              <span className="font-bold text-blue-900 text-sm">
-                {currency}
-                {perPersonAmount} each
-              </span>
+                <span className="font-bold">
+                  {percentageSummary.isValid
+                    ? "100% Allocated"
+                    : `${percentageSummary.remainingPct > 0 ? percentageSummary.remainingPct.toFixed(2) + "% remaining" : Math.abs(percentageSummary.remainingPct).toFixed(2) + "% over"}`}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto p-1">
+                {members.map((m) => (
+                  <div
+                    key={m.id}
+                    className="flex items-center justify-between gap-2 p-2 rounded-xl border border-slate-200 bg-slate-50/60"
+                  >
+                    <span className="text-xs font-semibold text-slate-800 truncate flex-1">
+                      {m.name}
+                    </span>
+                    <div className="relative w-28 shrink-0">
+                      <span className="absolute left-2.5 top-1.5 text-xs text-slate-400 font-semibold">
+                        {currency}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        placeholder="0.00"
+                        value={exactValues[m.id] ?? ""}
+                        onChange={(e) =>
+                          setExactValues((prev) => ({
+                            ...prev,
+                            [m.id]: e.target.value,
+                          }))
+                        }
+                        className="w-full pl-6 pr-2 py-1 border border-slate-300 rounded-lg text-xs text-right text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div
+                className={`p-2.5 rounded-xl text-xs flex items-center justify-between border ${
+                  exactSummary.valid
+                    ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                    : "bg-amber-50 border-amber-200 text-amber-800"
+                }`}
+              >
+                <span className="flex items-center gap-1.5 font-medium">
+                  {exactSummary.valid ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  )}
+                  <span>
+                    Allocated: {currency}
+                    {(exactSummary.totalSplitCents / 100).toFixed(2)} of{" "}
+                    {currency}
+                    {(totalCents / 100).toFixed(2)}
+                  </span>
+                </span>
+                <span className="font-bold">
+                  {exactSummary.valid
+                    ? "Exact Match"
+                    : exactSummary.remainingCents > 0
+                      ? `${currency}${(exactSummary.remainingCents / 100).toFixed(2)} remaining`
+                      : `${currency}${(Math.abs(exactSummary.remainingCents) / 100).toFixed(2)} over`}
+                </span>
+              </div>
             </div>
           )}
         </div>

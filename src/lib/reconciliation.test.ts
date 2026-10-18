@@ -2,6 +2,11 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   splitAmountEqually,
+  splitAmountByPercentage,
+  validateExactSplits,
+  parseGroupCsv,
+  generateGroupCsv,
+  deriveGroupNameFromCsvFilename,
   calculateSettlements,
   calculateBalancesByCurrency,
   canDeleteMember,
@@ -338,4 +343,149 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     settlements = calculateSettlements(allMembers, expensesList);
     assert.strictEqual(settlements.length, 0);
   });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 8: Custom Unequal Splits (% Percentage & $ Exact)
+  // --------------------------------------------------------------------------
+  it('Edge Case 8: splitAmountByPercentage and validateExactSplits handle custom unequal splits accurately', () => {
+    // 70% / 30% split of $100.00 (10000 cents)
+    const pctSplits = splitAmountByPercentage(10000, [
+      { memberId: murph.id, percentage: 70 },
+      { memberId: kev.id, percentage: 30 },
+    ]);
+    assert.strictEqual(pctSplits.length, 2);
+    assert.strictEqual(pctSplits[0].splitAmountCents, 7000);
+    assert.strictEqual(pctSplits[1].splitAmountCents, 3000);
+
+    // Odd-penny percentage split: $10.00 (1000 cents) across 33.34%, 33.33%, 33.33%
+    const oddPctSplits = splitAmountByPercentage(1000, [
+      { memberId: murph.id, percentage: 33.34 },
+      { memberId: kev.id, percentage: 33.33 },
+      { memberId: fitz.id, percentage: 33.33 },
+    ]);
+    assert.strictEqual(oddPctSplits.length, 3);
+    assert.strictEqual(
+      oddPctSplits.reduce((acc, s) => acc + s.splitAmountCents, 0),
+      1000
+    );
+    assert.strictEqual(oddPctSplits[0].splitAmountCents, 334);
+    assert.strictEqual(oddPctSplits[1].splitAmountCents, 333);
+    assert.strictEqual(oddPctSplits[2].splitAmountCents, 333);
+
+    // Invalid percentage sum (90%) returns empty array
+    const invalidPct = splitAmountByPercentage(10000, [
+      { memberId: murph.id, percentage: 60 },
+      { memberId: kev.id, percentage: 30 },
+    ]);
+    assert.strictEqual(invalidPct.length, 0);
+
+    // Exact split validation: valid $100.00 = $65.25 + $34.75
+    const exactValid = validateExactSplits(10000, [
+      { memberId: murph.id, splitAmountCents: 6525 },
+      { memberId: kev.id, splitAmountCents: 3475 },
+    ]);
+    assert.strictEqual(exactValid.valid, true);
+    assert.strictEqual(exactValid.remainingCents, 0);
+    assert.strictEqual(exactValid.splits.length, 2);
+
+    // Exact split validation: $5.00 remaining
+    const exactUnder = validateExactSplits(10000, [
+      { memberId: murph.id, splitAmountCents: 6000 },
+      { memberId: kev.id, splitAmountCents: 3500 },
+    ]);
+    assert.strictEqual(exactUnder.valid, false);
+    assert.strictEqual(exactUnder.remainingCents, 500);
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 9: Unified CSV Parser & Exporter (Odd Penny Split & Round-Trip)
+  // --------------------------------------------------------------------------
+  it('Edge Case 9: parseGroupCsv reconstructs exact payer (Adele), total (55000 cents), and 7 splits (7857 x 6 + 7858 for Adele)', () => {
+    const csvSample = [
+      'Date,Description,Category,Cost,Currency,M1,M2,M3,M4,M5,M6,Adele',
+      '2026-10-18,Villa Rental,General,550.00,EUR,-78.57,-78.57,-78.57,-78.57,-78.57,-78.57,471.42',
+      '',
+      '2026-10-18,Total balance, , ,EUR,-78.57,-78.57,-78.57,-78.57,-78.57,-78.57,471.42',
+    ].join('\n');
+
+    const parsed = parseGroupCsv(csvSample);
+
+    assert.deepStrictEqual(parsed.memberNames, [
+      'M1',
+      'M2',
+      'M3',
+      'M4',
+      'M5',
+      'M6',
+      'Adele',
+    ]);
+    // Must skip blank line and 'Total balance' summary row
+    assert.strictEqual(parsed.transactions.length, 1);
+
+    const txn = parsed.transactions[0];
+    assert.strictEqual(txn.paidByMemberName, 'Adele');
+    assert.strictEqual(txn.amountCents, 55000);
+    assert.strictEqual(txn.currency, 'EUR');
+    assert.strictEqual(txn.type, 'expense');
+    assert.strictEqual(txn.splits.length, 7);
+
+    const adeleSplit = txn.splits.find((s) => s.memberName === 'Adele');
+    const otherSplits = txn.splits.filter((s) => s.memberName !== 'Adele');
+
+    assert.ok(adeleSplit);
+    assert.strictEqual(adeleSplit.splitAmountCents, 7858);
+    assert.strictEqual(otherSplits.length, 6);
+    for (const s of otherSplits) {
+      assert.strictEqual(s.splitAmountCents, 7857);
+    }
+
+    const totalSplitCents = txn.splits.reduce(
+      (acc, s) => acc + s.splitAmountCents,
+      0
+    );
+    assert.strictEqual(totalSplitCents, 55000);
+
+    // Verify filename group name derivation
+    assert.strictEqual(
+      deriveGroupNameFromCsvFilename('orphans_2026-10-18_export.csv'),
+      'orphans'
+    );
+
+    // Verify generateGroupCsv exports exact matching format
+    const sevenMembers: MemberRecord[] = [
+      { id: 'id-1', name: 'M1' },
+      { id: 'id-2', name: 'M2' },
+      { id: 'id-3', name: 'M3' },
+      { id: 'id-4', name: 'M4' },
+      { id: 'id-5', name: 'M5' },
+      { id: 'id-6', name: 'M6' },
+      { id: 'id-7', name: 'Adele' },
+    ];
+    const exportedCsv = generateGroupCsv(
+      sevenMembers,
+      [
+        {
+          id: 'exp-villa',
+          date: '2026-10-18',
+          description: 'Villa Rental',
+          amountCents: 55000,
+          currency: 'EUR',
+          type: 'expense',
+          paidByMemberId: 'id-7',
+          splits: [
+            { memberId: 'id-1', splitAmountCents: 7857 },
+            { memberId: 'id-2', splitAmountCents: 7857 },
+            { memberId: 'id-3', splitAmountCents: 7857 },
+            { memberId: 'id-4', splitAmountCents: 7857 },
+            { memberId: 'id-5', splitAmountCents: 7857 },
+            { memberId: 'id-6', splitAmountCents: 7857 },
+            { memberId: 'id-7', splitAmountCents: 7858 },
+          ],
+        },
+      ],
+      '2026-10-18'
+    );
+    assert.strictEqual(exportedCsv, csvSample);
+  });
 });
+
