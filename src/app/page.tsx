@@ -4,13 +4,16 @@ import { useEffect, useState, useTransition, useMemo, useCallback } from "react"
 import { createClient } from "@/lib/supabase";
 import {
   calculateSettlements,
+  splitAmountEqually,
   SettlementInstruction,
-  ExpenseRecord,
 } from "@/lib/reconciliation";
 import MemberInviteModal, {
   Group,
   GroupMember,
 } from "@/components/MemberInviteModal";
+import EditExpenseModal, {
+  ExpenseItem,
+} from "@/components/EditExpenseModal";
 import {
   UserPlus,
   Users,
@@ -22,14 +25,9 @@ import {
   ArrowRightLeft,
   Wallet,
   Sparkles,
+  Edit3,
 } from "lucide-react";
 import type { User } from "@supabase/supabase-js";
-
-interface ExpenseItem extends ExpenseRecord {
-  description: string;
-  date: string;
-  amount: number;
-}
 
 export default function App() {
   const supabase = useMemo(() => createClient(), []);
@@ -40,6 +38,7 @@ export default function App() {
   const [newGroupName, setNewGroupName] = useState("");
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
+  const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
   const [historyCurrencyFilter, setHistoryCurrencyFilter] = useState<
     "all" | "$" | "€"
   >("all");
@@ -53,11 +52,19 @@ export default function App() {
     if (typeof window === "undefined") return false;
     const params = new URLSearchParams(window.location.search);
     const joinId = params.get("join");
+    const token = params.get("token");
+    if (token) {
+      sessionStorage.setItem("settle_up_invite_token", token);
+      return true;
+    }
     if (joinId) {
       sessionStorage.setItem("settle_up_join_group", joinId);
       return true;
     }
-    return !!sessionStorage.getItem("settle_up_join_group");
+    return (
+      !!sessionStorage.getItem("settle_up_invite_token") ||
+      !!sessionStorage.getItem("settle_up_join_group")
+    );
   });
 
   // Form state
@@ -86,182 +93,36 @@ export default function App() {
     return () => authListener.subscription.unsubscribe();
   }, [supabase]);
 
-  // Load groups or handle join invite link when user is authenticated
-  useEffect(() => {
-    if (!user) return;
-
-    const params =
-      typeof window !== "undefined"
-        ? new URLSearchParams(window.location.search)
-        : null;
-    const joinId =
-      params?.get("join") ||
-      (typeof window !== "undefined"
-        ? sessionStorage.getItem("settle_up_join_group")
-        : null);
-
-    if (joinId) {
-      // Clear storage & URL parameter
-      if (typeof window !== "undefined") {
-        sessionStorage.removeItem("settle_up_join_group");
-        const url = new URL(window.location.href);
-        url.searchParams.delete("join");
-        window.history.replaceState(
-          {},
-          "",
-          url.pathname + (url.search ? url.search : "")
-        );
-      }
-
-      // Check and join group
-      supabase
-        .from("group_members")
-        .select("user_id")
-        .eq("group_id", joinId)
-        .eq("user_id", user.id)
-        .maybeSingle()
-        .then(async ({ data: existing }) => {
-          if (!existing) {
-            const { error } = await supabase.from("group_members").insert({
-              group_id: joinId,
-              user_id: user.id,
-              role: "member",
-            });
-            if (!error) {
-              setNotification({
-                type: "success",
-                message: "Welcome! You have successfully joined the group.",
-              });
-            }
-          }
-          const { data: userGroups } = await supabase
-            .from("groups")
-            .select("*");
-          if (userGroups && userGroups.length > 0) {
-            setGroups(userGroups);
-            setActiveGroupId(joinId);
-          }
-        });
-    } else {
-      supabase
-        .from("groups")
-        .select("*")
-        .then(({ data }) => {
-          if (data && data.length > 0) {
-            setGroups(data);
-            setActiveGroupId((prev) => {
-              if (prev && data.some((g: Group) => g.id === prev)) {
-                return prev;
-              }
-              return data[0].id;
-            });
-          } else {
-            setGroups([]);
-            setActiveGroupId("");
-          }
-        });
-    }
-  }, [user, supabase]);
-
-  // Load group members & expenses on active group change
-  useEffect(() => {
-    if (!activeGroupId) return;
-    let cancelled = false;
-
-    supabase
-      .from("group_members")
-      .select("user_id, role, profiles(id, full_name, email)")
-      .eq("group_id", activeGroupId)
-      .then(({ data }) => {
-        if (cancelled || !data) return;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const list: GroupMember[] = (data as any[]).map((m) => {
-          const profile = Array.isArray(m.profiles) ? m.profiles[0] : m.profiles;
-          return {
-            id: profile?.id || m.user_id,
-            name: profile?.full_name || profile?.email || "Unknown Member",
-            email: profile?.email,
-            role: m.role || "member",
-          };
-        });
-        setMembers(list);
-        setSelectedMembers(list.map((u) => u.id));
-      });
-
-    supabase
-      .from("expenses")
-      .select(
-        "id, payer_id, description, amount, currency, type, date, expense_splits(user_id, amount)"
-      )
-      .eq("group_id", activeGroupId)
-      .order("date", { ascending: false })
-      .then(({ data }) => {
-        if (cancelled || !data) return;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const formatted: ExpenseItem[] = (data as any[]).map((e) => {
-          const amt = Number(e.amount);
-          return {
-            id: e.id,
-            paidByMemberId: e.payer_id,
-            payerId: e.payer_id,
-            description: e.description,
-            amount: amt,
-            amountCents: Math.round(amt * 100),
-            currency: e.currency,
-            type: e.type,
-            date: e.date,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            splits: (e.expense_splits || []).map((s: any) => {
-              const splitAmt = Number(s.amount);
-              return {
-                memberId: s.user_id,
-                userId: s.user_id,
-                amount: splitAmt,
-                splitAmountCents: Math.round(splitAmt * 100),
-              };
-            }),
-          };
-        });
-        setExpenses(formatted);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeGroupId, supabase]);
-
-  // Effective payer defaults to current user or first group member
-  const effectivePayerId = useMemo(() => {
-    if (payerId && members.some((m) => m.id === payerId)) {
-      return payerId;
-    }
-    const userMember = members.find((m) => m.id === user?.id);
-    if (userMember) return userMember.id;
-    return members[0]?.id || "";
-  }, [payerId, members, user]);
-
-  // Refresh members callback for after invite modal adds a member
+  // Refresh members callback
   const refreshMembers = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
       const { data } = await supabase
         .from("group_members")
-        .select("user_id, role, profiles(id, full_name, email)")
+        .select("id, group_id, user_id, display_name, invited_email, invite_token, role")
         .eq("group_id", groupId);
 
       if (data) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const list: GroupMember[] = (data as any[]).map((m) => {
-          const profile = Array.isArray(m.profiles) ? m.profiles[0] : m.profiles;
-          return {
-            id: profile?.id || m.user_id,
-            name: profile?.full_name || profile?.email || "Unknown Member",
-            email: profile?.email,
-            role: m.role || "member",
-          };
-        });
+        const list: GroupMember[] = data.map((m) => ({
+          id: m.id,
+          groupId: m.group_id,
+          userId: m.user_id,
+          name: m.display_name || "Member",
+          displayName: m.display_name,
+          email: m.invited_email,
+          invitedEmail: m.invited_email,
+          inviteToken: m.invite_token,
+          role: m.role || "member",
+        }));
         setMembers(list);
-        setSelectedMembers(list.map((u) => u.id));
+        setSelectedMembers((prev) => {
+          if (prev.length === 0) {
+            return list.map((u) => u.id);
+          }
+          // retain currently selected members that still exist in the group
+          const valid = prev.filter((id) => list.some((u) => u.id === id));
+          return valid.length > 0 ? valid : list.map((u) => u.id);
+        });
       }
     },
     [supabase]
@@ -274,7 +135,7 @@ export default function App() {
       const { data } = await supabase
         .from("expenses")
         .select(
-          "id, payer_id, description, amount, currency, type, date, expense_splits(user_id, amount)"
+          "id, paid_by_member_id, description, amount_cents, currency, type, date, created_by, expense_splits(member_id, split_amount_cents)"
         )
         .eq("group_id", groupId)
         .order("date", { ascending: false });
@@ -282,25 +143,28 @@ export default function App() {
       if (data) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const formatted: ExpenseItem[] = (data as any[]).map((e) => {
-          const amt = Number(e.amount);
+          const amtCents = Number(e.amount_cents || 0);
+          const amt = amtCents / 100;
+          const curr = e.currency === "EUR" ? "€" : "$";
           return {
             id: e.id,
-            paidByMemberId: e.payer_id,
-            payerId: e.payer_id,
+            paidByMemberId: e.paid_by_member_id,
+            payerId: e.paid_by_member_id,
             description: e.description,
             amount: amt,
-            amountCents: Math.round(amt * 100),
-            currency: e.currency,
-            type: e.type,
+            amountCents: amtCents,
+            currency: curr,
+            type: (e.type === "payment" ? "payment" : "expense") as "expense" | "payment",
             date: e.date,
+            createdBy: e.created_by,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             splits: (e.expense_splits || []).map((s: any) => {
-              const splitAmt = Number(s.amount);
+              const splitCents = Number(s.split_amount_cents || 0);
               return {
-                memberId: s.user_id,
-                userId: s.user_id,
-                amount: splitAmt,
-                splitAmountCents: Math.round(splitAmt * 100),
+                memberId: s.member_id,
+                userId: s.member_id,
+                amount: splitCents / 100,
+                splitAmountCents: splitCents,
               };
             }),
           };
@@ -311,11 +175,202 @@ export default function App() {
     [supabase]
   );
 
+  // Load groups or handle invite token / join link when user is authenticated
+  useEffect(() => {
+    if (!user) return;
+
+    const params =
+      typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search)
+        : null;
+
+    const pendingToken =
+      params?.get("token") ||
+      (typeof window !== "undefined"
+        ? sessionStorage.getItem("settle_up_invite_token")
+        : null);
+
+    const joinId =
+      params?.get("join") ||
+      (typeof window !== "undefined"
+        ? sessionStorage.getItem("settle_up_join_group")
+        : null);
+
+    const targetGroupId = params?.get("groupId");
+
+    // Clean URL parameters
+    if (typeof window !== "undefined" && (pendingToken || joinId || targetGroupId)) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("token");
+      url.searchParams.delete("join");
+      url.searchParams.delete("groupId");
+      window.history.replaceState({}, "", url.pathname + (url.search ? url.search : ""));
+    }
+
+    async function initializeGroups() {
+      const currentUser = user;
+      if (!currentUser) return;
+
+      // 1. Process pending token invite
+      if (pendingToken) {
+        sessionStorage.removeItem("settle_up_invite_token");
+        try {
+          const { data, error } = await supabase.rpc("claim_invite_token", {
+            p_token: pendingToken,
+          });
+          if (!error && data?.group_id) {
+            setNotification({
+              type: "success",
+              message: "Welcome! You have successfully claimed your group member spot.",
+            });
+            setActiveGroupId(data.group_id);
+          }
+        } catch (err) {
+          console.error("Failed to claim token:", err);
+        }
+      } else if (joinId) {
+        // 2. Process legacy group join
+        sessionStorage.removeItem("settle_up_join_group");
+        const { data: existing } = await supabase
+          .from("group_members")
+          .select("id")
+          .eq("group_id", joinId)
+          .eq("user_id", currentUser.id)
+          .maybeSingle();
+
+        if (!existing) {
+          const { error } = await supabase.from("group_members").insert({
+            group_id: joinId,
+            user_id: currentUser.id,
+            display_name:
+              currentUser.user_metadata?.full_name ||
+              currentUser.email?.split("@")[0] ||
+              "Member",
+            role: "member",
+          });
+          if (!error) {
+            setNotification({
+              type: "success",
+              message: "Welcome! You have successfully joined the group.",
+            });
+          }
+        }
+        setActiveGroupId(joinId);
+      } else if (targetGroupId) {
+        setActiveGroupId(targetGroupId);
+      }
+
+      // 3. Fetch user groups
+      const { data: userGroups } = await supabase.from("groups").select("*");
+      if (userGroups && userGroups.length > 0) {
+        setGroups(userGroups);
+        setActiveGroupId((prev) => {
+          if (prev && userGroups.some((g: Group) => g.id === prev)) {
+            return prev;
+          }
+          return userGroups[0].id;
+        });
+      } else {
+        setGroups([]);
+        setActiveGroupId("");
+      }
+    }
+
+    initializeGroups();
+  }, [user, supabase]);
+
+  // Load group members & expenses on active group change
+  useEffect(() => {
+    if (!activeGroupId) return;
+    let cancelled = false;
+
+    supabase
+      .from("group_members")
+      .select("id, group_id, user_id, display_name, invited_email, invite_token, role")
+      .eq("group_id", activeGroupId)
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        const list: GroupMember[] = data.map((m) => ({
+          id: m.id,
+          groupId: m.group_id,
+          userId: m.user_id,
+          name: m.display_name || "Member",
+          displayName: m.display_name,
+          email: m.invited_email,
+          invitedEmail: m.invited_email,
+          inviteToken: m.invite_token,
+          role: m.role || "member",
+        }));
+        setMembers(list);
+        setSelectedMembers((prev) => {
+          if (prev.length === 0) {
+            return list.map((u) => u.id);
+          }
+          const valid = prev.filter((id) => list.some((u) => u.id === id));
+          return valid.length > 0 ? valid : list.map((u) => u.id);
+        });
+      });
+
+    supabase
+      .from("expenses")
+      .select(
+        "id, paid_by_member_id, description, amount_cents, currency, type, date, created_by, expense_splits(member_id, split_amount_cents)"
+      )
+      .eq("group_id", activeGroupId)
+      .order("date", { ascending: false })
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const formatted: ExpenseItem[] = (data as any[]).map((e) => {
+          const amtCents = Number(e.amount_cents || 0);
+          const amt = amtCents / 100;
+          const curr = e.currency === "EUR" ? "€" : "$";
+          return {
+            id: e.id,
+            paidByMemberId: e.paid_by_member_id,
+            payerId: e.paid_by_member_id,
+            description: e.description,
+            amount: amt,
+            amountCents: amtCents,
+            currency: curr,
+            type: (e.type === "payment" ? "payment" : "expense") as "expense" | "payment",
+            date: e.date,
+            createdBy: e.created_by,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            splits: (e.expense_splits || []).map((s: any) => {
+              const splitCents = Number(s.split_amount_cents || 0);
+              return {
+                memberId: s.member_id,
+                userId: s.member_id,
+                amount: splitCents / 100,
+                splitAmountCents: splitCents,
+              };
+            }),
+          };
+        });
+        setExpenses(formatted);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeGroupId, supabase]);
+
+  // Effective payer defaults to current user's member row or first group member
+  const effectivePayerId = useMemo(() => {
+    if (payerId && members.some((m) => m.id === payerId)) {
+      return payerId;
+    }
+    const userMember = members.find((m) => m.userId === user?.id);
+    if (userMember) return userMember.id;
+    return members[0]?.id || "";
+  }, [payerId, members, user]);
+
   // Currency totals
   const usdTotal = useMemo(
     () =>
       expenses
-        .filter((e) => e.currency === "$")
+        .filter((e) => e.currency === "$" || e.currency === "USD")
         .reduce((acc, e) => acc + e.amount, 0),
     [expenses]
   );
@@ -323,7 +378,7 @@ export default function App() {
   const eurTotal = useMemo(
     () =>
       expenses
-        .filter((e) => e.currency === "€")
+        .filter((e) => e.currency === "€" || e.currency === "EUR")
         .reduce((acc, e) => acc + e.amount, 0),
     [expenses]
   );
@@ -331,7 +386,12 @@ export default function App() {
   // Filtered transactions for the ledger
   const filteredExpenses = useMemo(() => {
     if (historyCurrencyFilter === "all") return expenses;
-    return expenses.filter((e) => e.currency === historyCurrencyFilter);
+    return expenses.filter(
+      (e) =>
+        e.currency === historyCurrencyFilter ||
+        (historyCurrencyFilter === "$" && e.currency === "USD") ||
+        (historyCurrencyFilter === "€" && e.currency === "EUR")
+    );
   }, [expenses, historyCurrencyFilter]);
 
   // Memoized settlement calculations
@@ -344,11 +404,17 @@ export default function App() {
 
   // Isolate settlements by currency
   const usdSettlements = useMemo(
-    () => settlements.filter((s) => s.currency === "$"),
+    () =>
+      settlements.filter(
+        (s) => s.currency === "$" || s.currency === "USD"
+      ),
     [settlements]
   );
   const eurSettlements = useMemo(
-    () => settlements.filter((s) => s.currency === "€"),
+    () =>
+      settlements.filter(
+        (s) => s.currency === "€" || s.currency === "EUR"
+      ),
     [settlements]
   );
 
@@ -359,11 +425,11 @@ export default function App() {
       ? (parsedAmount / selectedMembers.length).toFixed(2)
       : null;
 
+  // Create new group
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newGroupName.trim()) return;
 
-    // 1. Fetch latest user session
     const {
       data: { user: currentUser },
     } = await supabase.auth.getUser();
@@ -372,7 +438,7 @@ export default function App() {
       return;
     }
 
-    // 2. Create the Group
+    // 1. Create the Group
     const { data: newGroup, error: groupError } = await supabase
       .from("groups")
       .insert({ name: newGroupName.trim(), created_by: currentUser.id })
@@ -384,10 +450,16 @@ export default function App() {
       return;
     }
 
-    // 3. Add creator as Admin
+    // 2. Add creator as Admin with required display_name
+    const creatorDisplayName =
+      currentUser.user_metadata?.full_name ||
+      currentUser.email?.split("@")[0] ||
+      "Admin";
+
     const { error: memberError } = await supabase.from("group_members").insert({
       group_id: newGroup.id,
       user_id: currentUser.id,
+      display_name: creatorDisplayName,
       role: "admin",
     });
 
@@ -396,12 +468,12 @@ export default function App() {
       return;
     }
 
-    // 4. Update the UI
     setNewGroupName("");
     setGroups((prev) => [...prev, newGroup]);
     setActiveGroupId(newGroup.id);
   };
 
+  // Delete group
   const handleDeleteGroup = async (groupId: string, groupName: string) => {
     const confirmed = window.confirm(
       `Are you sure you want to delete the group "${groupName}"? This will remove all associated expenses and settlements.`
@@ -425,44 +497,100 @@ export default function App() {
     }
   };
 
+  // Add transaction with penny-split precision
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     const finalPayerId = payerId || effectivePayerId;
     if (!amount || !finalPayerId || selectedMembers.length === 0 || !user) return;
 
     const parsed = parseFloat(amount);
-    const splitAmount = Number((parsed / selectedMembers.length).toFixed(2));
+    if (isNaN(parsed) || parsed <= 0) return;
+    const totalCents = Math.round(parsed * 100);
 
-    const { data: newExp, error } = await supabase
+    // 1. Insert into expenses
+    const { data: newExp, error: expError } = await supabase
       .from("expenses")
       .insert({
         group_id: activeGroupId,
         created_by: user.id,
-        payer_id: finalPayerId,
-        description,
-        amount: parsed,
-        currency,
+        paid_by_member_id: finalPayerId,
+        description:
+          description.trim() ||
+          (type === "payment" ? "Direct Payment" : "Group Expense"),
+        amount_cents: totalCents,
+        currency: currency === "€" ? "EUR" : "USD",
         type,
+        date: new Date().toISOString().split("T")[0],
       })
       .select()
       .single();
 
-    if (error) {
-      alert(error.message);
+    if (expError) {
+      alert("Error adding transaction: " + expError.message);
       return;
     }
 
-    const splitsPayload = selectedMembers.map((uid) => ({
-      expense_id: newExp.id,
-      user_id: uid,
-      amount: splitAmount,
-    }));
+    // 2. Prepare splits with integer remainder distribution
+    let splitsPayload: Array<{
+      expense_id: string;
+      member_id: string;
+      split_amount_cents: number;
+    }> = [];
 
-    await supabase.from("expense_splits").insert(splitsPayload);
+    if (type === "payment") {
+      // Strictly 1-to-1 payment
+      const recipientId = selectedMembers[0];
+      splitsPayload = [
+        {
+          expense_id: newExp.id,
+          member_id: recipientId,
+          split_amount_cents: totalCents,
+        },
+      ];
+    } else {
+      // Group expense equal split with penny remainder distribution
+      const equalSplits = splitAmountEqually(totalCents, selectedMembers);
+      splitsPayload = equalSplits.map((s) => ({
+        expense_id: newExp.id,
+        member_id: s.memberId,
+        split_amount_cents: s.splitAmountCents,
+      }));
+    }
+
+    const { error: splitsError } = await supabase
+      .from("expense_splits")
+      .insert(splitsPayload);
+
+    if (splitsError) {
+      alert("Error adding splits: " + splitsError.message);
+      return;
+    }
 
     // Refresh UI
     setDescription("");
     setAmount("");
+    startTransition(() => {
+      refreshExpenses(activeGroupId);
+    });
+  };
+
+  // Delete transaction (Group-wide permission)
+  const handleDeleteExpense = async (expenseId: string, desc: string) => {
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${desc || "this transaction"}"?`
+    );
+    if (!confirmed) return;
+
+    const { error } = await supabase
+      .from("expenses")
+      .delete()
+      .eq("id", expenseId);
+
+    if (error) {
+      alert("Error deleting transaction: " + error.message);
+      return;
+    }
+
     startTransition(() => {
       refreshExpenses(activeGroupId);
     });
@@ -495,7 +623,7 @@ export default function App() {
             <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl text-xs text-blue-800 flex items-start gap-2 text-left">
               <Users className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
               <span>
-                You have been invited to join a group! Sign in with Google to accept and join.
+                You have been invited to join a group! Sign in with Google to claim your member spot.
               </span>
             </div>
           )}
@@ -631,7 +759,6 @@ export default function App() {
 
         {/* Expense Entry & Settlement Panel */}
         <section className="md:col-span-2 space-y-6">
-          {/* Active Group Header with Member Info, Summary Metrics, and Invite Trigger */}
           {activeGroup ? (
             <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -650,7 +777,11 @@ export default function App() {
                         key={m.id}
                         className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs bg-slate-50 border border-slate-200 text-slate-700"
                       >
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            m.userId ? "bg-emerald-500" : "bg-amber-400"
+                          }`}
+                        ></span>
                         <span className="font-medium">{m.name}</span>
                         {m.role === "admin" && (
                           <span className="text-[10px] text-indigo-600 font-bold uppercase tracking-wider ml-0.5">
@@ -667,7 +798,7 @@ export default function App() {
                   className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs shrink-0 cursor-pointer"
                 >
                   <UserPlus className="w-4 h-4" />
-                  Invite Members
+                  Manage Members
                 </button>
               </div>
 
@@ -732,7 +863,7 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         setType("payment");
-                        if (members.length > 0) {
+                        if (members.length > 0 && selectedMembers.length !== 1) {
                           setSelectedMembers([members[0].id]);
                         }
                       }}
@@ -761,7 +892,7 @@ export default function App() {
                       <option value="">Select Member</option>
                       {members.map((m) => (
                         <option key={m.id} value={m.id}>
-                          {m.name} {m.id === user.id ? "(You)" : ""}
+                          {m.name} {m.userId === user.id ? "(You)" : ""}
                         </option>
                       ))}
                     </select>
@@ -916,7 +1047,7 @@ export default function App() {
                 </button>
               </form>
 
-              {/* Ledger Table with Currency Isolation Filter */}
+              {/* Ledger Table with Currency Isolation Filter and Group-Wide Editing */}
               <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
                 <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div>
@@ -925,7 +1056,7 @@ export default function App() {
                     </h3>
                     <p className="text-xs text-slate-400">
                       Showing {filteredExpenses.length} of {expenses.length}{" "}
-                      records
+                      records • Group members can edit or delete any transaction
                     </p>
                   </div>
 
@@ -951,7 +1082,13 @@ export default function App() {
                           : "text-slate-500 hover:text-slate-800"
                       }`}
                     >
-                      $ USD ({expenses.filter((e) => e.currency === "$").length})
+                      $ USD (
+                      {
+                        expenses.filter(
+                          (e) => e.currency === "$" || e.currency === "USD"
+                        ).length
+                      }
+                      )
                     </button>
                     <button
                       type="button"
@@ -962,7 +1099,13 @@ export default function App() {
                           : "text-slate-500 hover:text-slate-800"
                       }`}
                     >
-                      € EUR ({expenses.filter((e) => e.currency === "€").length})
+                      € EUR (
+                      {
+                        expenses.filter(
+                          (e) => e.currency === "€" || e.currency === "EUR"
+                        ).length
+                      }
+                      )
                     </button>
                   </div>
                 </div>
@@ -973,56 +1116,99 @@ export default function App() {
                       No transactions recorded for this currency filter.
                     </div>
                   ) : (
-                    filteredExpenses.map((exp) => (
-                      <div
-                        key={exp.id}
-                        className="p-4 flex items-center justify-between text-sm hover:bg-slate-50/50 transition gap-3"
-                      >
-                        <div className="flex items-start gap-3 min-w-0">
-                          <div
-                            className={`p-2 rounded-xl shrink-0 mt-0.5 ${
-                              exp.type === "payment"
-                                ? "bg-emerald-50 text-emerald-600"
-                                : "bg-blue-50 text-blue-600"
-                            }`}
-                          >
-                            {exp.type === "payment" ? (
-                              <ArrowRightLeft className="w-4 h-4" />
-                            ) : (
-                              <Receipt className="w-4 h-4" />
-                            )}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="font-semibold text-slate-900 truncate">
-                              {exp.description}
+                    filteredExpenses.map((exp) => {
+                      const isPayment = exp.type === "payment";
+                      const payerMember = members.find(
+                        (m) => m.id === exp.paidByMemberId || m.id === exp.payerId
+                      );
+
+                      return (
+                        <div
+                          key={exp.id}
+                          className={`p-4 flex items-center justify-between text-sm hover:bg-slate-50/60 transition gap-3 border-l-4 ${
+                            isPayment
+                              ? "border-l-[#BDE0FF] bg-[#F8FBFF]"
+                              : "border-l-[#FFC4C4] bg-[#FFFBFB]"
+                          }`}
+                        >
+                          <div className="flex items-start gap-3 min-w-0">
+                            <div
+                              className={`p-2 rounded-xl shrink-0 mt-0.5 border ${
+                                isPayment
+                                  ? "bg-[#EBF5FF] text-[#1976D2] border-[#BDE0FF]"
+                                  : "bg-[#FFF0F0] text-[#D32F2F] border-[#FFC4C4]"
+                              }`}
+                            >
+                              {isPayment ? (
+                                <ArrowRightLeft className="w-4 h-4" />
+                              ) : (
+                                <Receipt className="w-4 h-4" />
+                              )}
                             </div>
-                            <div className="text-xs text-slate-500 mt-0.5">
-                              Paid by{" "}
-                              <span className="font-medium text-slate-700">
-                                {members.find((m) => m.id === exp.payerId)?.name ||
-                                  "Unknown"}
-                              </span>{" "}
-                              • {exp.date}
+                            <div className="min-w-0">
+                              <div className="font-semibold text-slate-900 truncate">
+                                {exp.description}
+                              </div>
+                              <div className="text-xs text-slate-500 mt-0.5">
+                                Paid by{" "}
+                                <span className="font-medium text-slate-700">
+                                  {payerMember?.name || "Unknown"}
+                                </span>{" "}
+                                • {exp.date}
+                                {isPayment && exp.splits.length > 0 && (
+                                  <span className="text-slate-400 ml-1">
+                                    → To{" "}
+                                    {members.find(
+                                      (m) => m.id === exp.splits[0].memberId
+                                    )?.name || "Member"}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-3 shrink-0">
+                            <div className="text-right">
+                              <span className="font-bold text-slate-900 text-sm">
+                                {exp.currency}
+                                {exp.amount.toFixed(2)}
+                              </span>
+                              <span
+                                className={`block text-[10px] uppercase font-bold tracking-wider mt-0.5 ${
+                                  isPayment
+                                    ? "text-blue-700"
+                                    : "text-rose-600"
+                                }`}
+                              >
+                                {exp.type}
+                              </span>
+                            </div>
+
+                            {/* Group-Wide Transaction Edit & Delete Actions */}
+                            <div className="flex items-center gap-1 pl-2 border-l border-slate-200">
+                              <button
+                                type="button"
+                                onClick={() => setEditingExpense(exp)}
+                                title="Edit transaction"
+                                className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition cursor-pointer"
+                              >
+                                <Edit3 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleDeleteExpense(exp.id, exp.description)
+                                }
+                                title="Delete transaction"
+                                className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
                             </div>
                           </div>
                         </div>
-                        <div className="text-right shrink-0">
-                          <span className="font-bold text-slate-900 text-sm">
-                            {exp.currency}
-                            {exp.amount.toFixed(2)}
-                          </span>
-                          <span
-                            className={`block text-[10px] uppercase font-bold tracking-wider mt-0.5 ${
-                              exp.type === "payment"
-                                ? "text-emerald-600"
-                                : "text-slate-400"
-                            }`}
-                          >
-                            {exp.type}
-                          </span>
-                        </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -1118,19 +1304,36 @@ export default function App() {
         </aside>
       </div>
 
-      {/* Member Invitation Modal */}
+      {/* Member Management Modal */}
       <MemberInviteModal
         isOpen={isInviteModalOpen}
         onClose={() => setIsInviteModalOpen(false)}
         group={activeGroup}
         currentMembers={members}
         currentUserId={user.id}
+        expenses={expenses}
         onMemberAdded={() => {
           if (activeGroupId) {
             refreshMembers(activeGroupId);
           }
         }}
       />
+
+      {/* Edit Transaction Modal */}
+      {editingExpense && (
+        <EditExpenseModal
+          key={editingExpense.id}
+          isOpen={true}
+          onClose={() => setEditingExpense(null)}
+          expense={editingExpense}
+          members={members}
+          onSaved={() => {
+            if (activeGroupId) {
+              refreshExpenses(activeGroupId);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
