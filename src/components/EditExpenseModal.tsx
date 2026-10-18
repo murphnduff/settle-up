@@ -160,11 +160,7 @@ export default function EditExpenseModal({
       }
 
       // 3. Insert newly calculated splits
-      let splitsPayload: Array<{
-        expense_id: string;
-        member_id: string;
-        split_amount_cents: number;
-      }> = [];
+      let splitsPayload: Array<Record<string, unknown>> = [];
 
       if (type === "payment") {
         splitsPayload = [
@@ -183,9 +179,37 @@ export default function EditExpenseModal({
         }));
       }
 
-      const { error: insertSplitsError } = await supabase
+      let { error: insertSplitsError } = await supabase
         .from("expense_splits")
         .insert(splitsPayload);
+
+      for (
+        let attempt = 0;
+        attempt < 2 && insertSplitsError && splitsPayload.length > 0;
+        attempt++
+      ) {
+        const msg = insertSplitsError.message?.toLowerCase() || "";
+        let updated = false;
+        if (msg.includes('"amount"') && !("amount" in splitsPayload[0])) {
+          splitsPayload = splitsPayload.map((s) => ({
+            ...s,
+            amount: Number(((s.split_amount_cents as number) / 100).toFixed(2)),
+          }));
+          updated = true;
+        }
+        if (msg.includes('"user_id"') && !("user_id" in splitsPayload[0])) {
+          splitsPayload = splitsPayload.map((s) => ({
+            ...s,
+            user_id: s.member_id,
+          }));
+          updated = true;
+        }
+        if (!updated) break;
+        const retrySplits = await supabase
+          .from("expense_splits")
+          .insert(splitsPayload);
+        insertSplitsError = retrySplits.error;
+      }
 
       if (insertSplitsError) {
         setError("Error saving new splits: " + insertSplitsError.message);

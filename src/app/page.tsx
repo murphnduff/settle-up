@@ -773,7 +773,7 @@ export function SettleUpDashboard({
     if (isNaN(parsed) || parsed <= 0) return;
     const totalCents = Math.round(parsed * 100);
 
-    const baseExpensePayload = {
+    const expensePayload: Record<string, unknown> = {
       group_id: activeGroupId,
       paid_by_member_id: finalPayerId,
       description:
@@ -785,28 +785,40 @@ export function SettleUpDashboard({
       date: new Date().toISOString().split("T")[0],
     };
 
-    // 1. Insert into expenses
+    // 1. Insert into expenses (auto-adapts if legacy NOT NULL columns still exist in DB)
     let { data: newExp, error: expError } = await supabase
       .from("expenses")
-      .insert(baseExpensePayload)
+      .insert(expensePayload)
       .select("id")
       .single();
 
-    // Fallback if legacy created_by NOT NULL constraint still exists in DB
-    if (expError && expError.message?.toLowerCase().includes("created_by")) {
-      const fallbackCreatedBy = user?.id || activeGroup?.created_by;
-      if (fallbackCreatedBy) {
-        const retry = await supabase
-          .from("expenses")
-          .insert({
-            ...baseExpensePayload,
-            created_by: fallbackCreatedBy,
-          })
-          .select("id")
-          .single();
-        newExp = retry.data;
-        expError = retry.error;
+    for (let attempt = 0; attempt < 3 && expError; attempt++) {
+      const msg = expError.message?.toLowerCase() || "";
+      let updated = false;
+      if (msg.includes('"amount"') && !("amount" in expensePayload)) {
+        expensePayload.amount = Number((totalCents / 100).toFixed(2));
+        updated = true;
       }
+      if (msg.includes('"created_by"') && !("created_by" in expensePayload)) {
+        const fallbackUser = user?.id || activeGroup?.created_by;
+        if (fallbackUser) {
+          expensePayload.created_by = fallbackUser;
+          updated = true;
+        }
+      }
+      if (msg.includes('"payer_id"') && !("payer_id" in expensePayload)) {
+        expensePayload.payer_id =
+          user?.id || activeGroup?.created_by || finalPayerId;
+        updated = true;
+      }
+      if (!updated) break;
+      const retry = await supabase
+        .from("expenses")
+        .insert(expensePayload)
+        .select("id")
+        .single();
+      newExp = retry.data;
+      expError = retry.error;
     }
 
     if (expError || !newExp) {
@@ -817,11 +829,7 @@ export function SettleUpDashboard({
     }
 
     // 2. Prepare splits with integer remainder distribution
-    let splitsPayload: Array<{
-      expense_id: string;
-      member_id: string;
-      split_amount_cents: number;
-    }> = [];
+    let splitsPayload: Array<Record<string, unknown>> = [];
 
     if (type === "payment") {
       const recipientId = selectedMembers[0];
@@ -841,9 +849,38 @@ export function SettleUpDashboard({
       }));
     }
 
-    const { error: splitsError } = await supabase
+    let { error: splitsError } = await supabase
       .from("expense_splits")
       .insert(splitsPayload);
+
+    for (
+      let attempt = 0;
+      attempt < 2 && splitsError && splitsPayload.length > 0;
+      attempt++
+    ) {
+      const msg = splitsError.message?.toLowerCase() || "";
+      let updated = false;
+      if (msg.includes('"amount"') && !("amount" in splitsPayload[0])) {
+        splitsPayload = splitsPayload.map((s) => ({
+          ...s,
+          amount: Number(((s.split_amount_cents as number) / 100).toFixed(2)),
+        }));
+        updated = true;
+      }
+      if (msg.includes('"user_id"') && !("user_id" in splitsPayload[0])) {
+        const fallbackUser = user?.id || activeGroup?.created_by;
+        splitsPayload = splitsPayload.map((s) => ({
+          ...s,
+          user_id: fallbackUser || s.member_id,
+        }));
+        updated = true;
+      }
+      if (!updated) break;
+      const retrySplits = await supabase
+        .from("expense_splits")
+        .insert(splitsPayload);
+      splitsError = retrySplits.error;
+    }
 
     if (splitsError) {
       alert("Error adding splits: " + splitsError.message);
