@@ -773,22 +773,41 @@ export function SettleUpDashboard({
     if (isNaN(parsed) || parsed <= 0) return;
     const totalCents = Math.round(parsed * 100);
 
+    const baseExpensePayload = {
+      group_id: activeGroupId,
+      paid_by_member_id: finalPayerId,
+      description:
+        description.trim() ||
+        (type === "payment" ? "Direct Payment" : "Group Expense"),
+      amount_cents: totalCents,
+      currency: currency === "€" ? "EUR" : "USD",
+      type,
+      date: new Date().toISOString().split("T")[0],
+    };
+
     // 1. Insert into expenses
-    const { data: newExp, error: expError } = await supabase
+    let { data: newExp, error: expError } = await supabase
       .from("expenses")
-      .insert({
-        group_id: activeGroupId,
-        paid_by_member_id: finalPayerId,
-        description:
-          description.trim() ||
-          (type === "payment" ? "Direct Payment" : "Group Expense"),
-        amount_cents: totalCents,
-        currency: currency === "€" ? "EUR" : "USD",
-        type,
-        date: new Date().toISOString().split("T")[0],
-      })
+      .insert(baseExpensePayload)
       .select("id")
       .single();
+
+    // Fallback if legacy created_by NOT NULL constraint still exists in DB
+    if (expError && expError.message?.toLowerCase().includes("created_by")) {
+      const fallbackCreatedBy = user?.id || activeGroup?.created_by;
+      if (fallbackCreatedBy) {
+        const retry = await supabase
+          .from("expenses")
+          .insert({
+            ...baseExpensePayload,
+            created_by: fallbackCreatedBy,
+          })
+          .select("id")
+          .single();
+        newExp = retry.data;
+        expError = retry.error;
+      }
+    }
 
     if (expError || !newExp) {
       alert(
