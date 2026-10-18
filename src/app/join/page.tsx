@@ -12,8 +12,8 @@ function JoinRedirectContent() {
   useEffect(() => {
     if (groupId) {
       const target = memberId
-        ? `/g/${groupId}?m=${encodeURIComponent(memberId)}`
-        : `/g/${groupId}`;
+        ? `/${groupId}?m=${encodeURIComponent(memberId)}`
+        : `/${groupId}`;
       router.replace(target);
     } else {
       router.replace("/");

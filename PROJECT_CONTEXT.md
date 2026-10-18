@@ -11,29 +11,31 @@
 
 ## 2. Core Data Model & High-Trust Security Architecture
 
-### 2.1 Philosophy: High-Trust Shared Group URLs + Single Super-Admin
+### 2.1 Philosophy: Root-Level Friendly Group URLs + Single Super-Admin
 - **Single Global Super-Admin (`murph@murphnduff.org`):**
-  - Admin status is determined EXCLUSIVELY by `user?.email?.toLowerCase() === 'murph@murphnduff.org'` (on the client) and `lower(auth.jwt() ->> 'email') = 'murph@murphnduff.org'` (in Supabase RLS).
-  - No other email or account is EVER an admin, even if they previously created a test group.
-  - Only `murph@murphnduff.org` can see the Master All-Groups list, Create Groups, Delete Groups, Import JSON backups, or Add/Remove members.
-- **Regular Group Users (Zero Sign-In Required):**
-  - Access any group directly via its unguessable UUID URL: `https://split.murphnduff.org/g/[group_id]` (or optional pre-selected member link `/g/[group_id]?m=[member_id]`).
-  - **No OAuth Wall:** Visiting `/g/[group_id]` on any phone, tablet, or computer loads the group immediately without requiring sign-in.
-  - **"Who Are You?" Identity Pill:** On first visit to `/g/[group_id]` (if `?m=[member_id]` is not in the URL), the user taps their name from the group's member pills (`"Who are you in this group?"`). This saves `active_member_id` for that `group_id` (plus adds the group to a `recent_groups` list) in `localStorage`.
-  - Regular users only see groups stored in their device's `localStorage` `recent_groups` (plus the currently open `/g/[group_id]`).
+  - The **ONLY** user who signs in via Google OAuth (`user?.email?.toLowerCase() === 'murph@murphnduff.org'` on the client, and `lower(coalesce(auth.jwt() ->> 'email', '')) = 'murph@murphnduff.org'` in Supabase RLS).
+  - Sees **ALL** groups in the database in the left sidebar.
+  - Is the **ONLY** user who can Create Groups, Delete Groups, or Manage Members (Add/Delete members).
+- **Root-Level Friendly Group URLs (`https://split.murphnduff.org/SoCal_2026`):**
+  - Groups have a `slug` column in `public.groups` derived from `name` (`name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')`, e.g., `'Test Group 1'` -> `'Test_Group_1'`, `'SoCal 2026'` -> `'SoCal_2026'`).
+  - Groups are served directly at the root dynamic route `src/app/[slug]/page.tsx` (matching `ilike(slug, slugParam)` or `id = slugParam` if a UUID is passed).
+  - Any legacy `/g/[slug]` requests automatically redirect to `/[slug]`.
+- **Zero-Login Regular Users & Cross-Device Recognition:**
+  - Anyone visiting `/<slug>` (or `/<slug>?m=<display_name>`) on a phone, tablet, or computer immediately sees and loads the group without logging in.
+  - Visiting `/<slug>` immediately loads the group, sets it as the active group, adds it to `recent_groups` in `localStorage` so it appears under **"Your Groups"** in the sidebar, and loads its `group_members`, `expenses`, and `expense_splits`.
+  - **"Who Are You?" Identity Pill:** Tapping a member pill (`"Who are you in this group?"`) saves `active_member_id` and adds the group to `recent_groups` in `localStorage`, defaults the **"Paid By"** selector to that member, and updates the URL query param to `?m=<display_name>` via `window.history.replaceState` so the user can bookmark or share their pre-selected link across devices.
 
-### 2.2 Database Tables (Cleaned of Legacy Columns)
+### 2.2 Database Tables
 - **`groups`**:
-  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `name` (TEXT NOT NULL), `created_by` (UUID Nullable FK to `auth.users`), `created_at` (TIMESTAMPTZ).
+  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `name` (TEXT NOT NULL), `slug` (TEXT UNIQUE case-insensitively), `created_by` (UUID Nullable FK to `auth.users`), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`group_members`**:
-  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ).
-  - *Uniqueness:* `UNIQUE (group_id, lower(display_name))` to prevent duplicate member pills in the same group.
+  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `group_id` (UUID NOT NULL FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
+  - *Uniqueness:* Case-insensitive unique index on `(group_id, lower(display_name))` to prevent duplicate member names in the same group.
   - *Deletion Guard:* `ON DELETE RESTRICT` when referenced in `expenses` or `expense_splits`.
 - **`expenses`**:
-  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`, default `'USD'`), `date` (DATE), `paid_by_member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `created_by_member_id` (UUID Nullable FK to `group_members.id` ON DELETE SET NULL), `created_at` (TIMESTAMPTZ).
-  - *Legacy Cleanup:* Legacy columns (`payer_id`, `paid_by`, `user_id`) MUST be dropped so `INSERT` never fails with `null value in column "payer_id" violates not-null constraint`.
+  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `group_id` (UUID NOT NULL FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`, default `'USD'`), `date` (DATE), `paid_by_member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `created_by_member_id` (UUID Nullable FK to `group_members.id` ON DELETE SET NULL), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`expense_splits`**:
-  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `expense_id` (UUID FK CASCADE), `member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
+  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `expense_id` (UUID NOT NULL FK CASCADE), `member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 
 ### 2.3 Simplified Row-Level Security (RLS) Rules
 - **Admin Helper:** `public.is_super_admin()` returns `true` ONLY when `lower(coalesce(auth.jwt() ->> 'email', '')) = 'murph@murphnduff.org'`.
@@ -42,47 +44,44 @@
   - `INSERT / UPDATE / DELETE`: Allowed strictly for `public.is_super_admin()`.
 - **`group_members`**:
   - `SELECT`: Allowed for `anon` and `authenticated`.
-  - `UPDATE`: Allowed for `anon` and `authenticated` (renaming display_name).
+  - `UPDATE`: Allowed for `anon` and `authenticated` (renaming `display_name`).
   - `INSERT / DELETE`: Allowed strictly for `public.is_super_admin()`.
 - **`expenses` & `expense_splits`**:
   - `SELECT / INSERT / UPDATE / DELETE`: Allowed for `anon` and `authenticated`.
+
+### 2.4 Supabase Heartbeat (`/api/heartbeat`)
+- **Route Handler (`src/app/api/heartbeat/route.ts`):** Executes `SELECT id FROM groups LIMIT 1` via Supabase and returns `{ status: 'ok', timestamp }` to prevent Supabase free-tier project pausing.
+- **Vercel Cron (`vercel.json`):** Configured with a scheduled cron job hitting `/api/heartbeat`.
 
 ---
 
 ## 3. Permissions & Roles Matrix
 
-| Action | Super-Admin (`murph@murphnduff.org`) | Regular User (Via `/g/[group_id]` Link) |
+| Action | Super-Admin (`murph@murphnduff.org`) | Regular User (Via `/<slug>` Link) |
 | :--- | :--- | :--- |
 | **Sign-In Required?** | Yes (Google OAuth) | **No** (Instant access on Phone, Tablet, or PC) |
-| **Sidebar Group List** | Sees **ALL** groups in database | Sees only groups visited on their device (`localStorage`) |
-| **Create / Delete Group** | Yes | No (Hidden in UI, blocked by RLS) |
+| **Sidebar Group List** | Sees **ALL** groups in database | Sees groups visited on their device (`recent_groups` in `localStorage`) |
+| **Create / Delete Group** | Yes (Auto-generates `slug` from `name`) | No (Hidden in UI, blocked by RLS) |
 | **Manage Members (Add/Delete)**| Yes (Delete blocked if >0 txns) | No (Hidden in UI, blocked by RLS) |
-| **Share Group Link** | Yes (`/g/[id]` or `/g/[id]?m=[mid]`) | Yes (Can copy `/g/[id]` group link) |
+| **Share Group / Member Link** | Yes (`/<slug>` & `/<slug>?m=<display_name>`) | Yes (Can copy `/<slug>` group link) |
 | **Rename Members** | Yes (Any member) | Yes (Can rename own selected member profile) |
 | **Add / Edit / Delete Txns** | Yes (Any expense or payment) | Yes (Any expense or payment in the group) |
-| **Import / Export Group JSON** | Yes (Full Import & Export) | Export only |
 
 ---
 
 ## 4. Math Engine & Test Suite (`src/lib/reconciliation.test.ts`)
-All 7 core integer-cent math and reconciliation tests pass 100%.
+All 7 core integer-cent math and reconciliation edge-case tests pass 100%:
+1. Indivisible Penny (`$100.00 / 3` -> `3334, 3333, 3333` cents).
+2. Transitive Debt Simplification (`Murph -> Kev -> Fitz` collapses to 1 transfer).
+3. 1-to-1 Direct Payment Offset.
+4. Partial & Subset Member Splits.
+5. Multi-Currency Isolation (`USD` vs `EUR` never cross-cancel).
+6. Member Deletion Guard (`canDeleteMember`).
+7. Transaction Mutation Recalculation.
 
 ---
 
-## 5. Active Sprint Tasks
-
-### Phase A: Fix Current Bugs & Pivot to Group URL + Super-Admin Model (Immediate)
-1. **Fix `payer_id` NULL Constraint Crash:** Drop legacy `payer_id` (and any other obsolete columns) on `expenses` and `expense_splits` so adding transactions works reliably.
-2. **Enforce Strict Super-Admin (`murph@murphnduff.org`):**
-   - `murph@murphnduff.org` must see ALL groups in the database.
-   - Non-admin accounts (like `murphmurphy@gmail.com`) or anonymous visitors must NEVER see "Create Group", "Delete Group", or "Manage Members".
-3. **Deduplicate Members & Remove Confusing Email Check:**
-   - Remove the email input from "Add Member" (we only need `display_name`).
-   - Clean up duplicate member rows (e.g., duplicate "Andrew Murphy" in the same group) and prevent duplicate names within the same group.
-4. **Implement `/g/[group_id]` Route & Zero-Login Member Selector:**
-   - Create `/g/[group_id]` (or handle via shared view) so anyone with the link can open the group without logging in, tap their name ("Who are you?"), and add/edit/delete transactions.
-   - Provide a 1-click **"Copy Group Link"** button (plus optional per-member link `/g/[group_id]?m=[member_id]` in Manage Members).
-
-### Phase B: Next Features
-5. **Full Group Historical Data Import & Export (JSON + CSV):** Support native JSON backups and legacy `ExpenseAppData.json` (`{ Users, Expenses }`) files.
-6. **Custom Split Types:** Equal, Percentage (70/30), and Exact Dollar splits.
+## 5. Future Backlog
+1. **Automated `/browser` E2E Walkthrough:** End-to-end browser verification of Super-Admin group creation, member addition, `/<slug>?m=<display_name>` sharing, and zero-login transaction entry.
+2. **Full Group JSON Import/Export:** Support native group JSON backup/restore as well as legacy `ExpenseAppData.json` (`{ Users, Expenses }`) migration.
+3. **Custom Split Types:** Support Percentage splits (e.g., `70% / 30%`) and Exact Dollar splits alongside Equal splits.

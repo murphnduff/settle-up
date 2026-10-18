@@ -17,6 +17,7 @@ import {
 import MemberInviteModal, {
   Group,
   GroupMember,
+  generateGroupSlug,
 } from "@/components/MemberInviteModal";
 import EditExpenseModal, {
   ExpenseItem,
@@ -39,11 +40,29 @@ import {
   Shield,
   UserCheck,
 } from "lucide-react";
-import type { User } from "@supabase/supabase-js";
+import type { User, SupabaseClient } from "@supabase/supabase-js";
 
 const SUPER_ADMIN_EMAIL = "murph@murphnduff.org";
 const RECENT_GROUPS_STORAGE_KEY = "settle_up_recent_groups";
 const memberStorageKey = (groupId: string) => `settle_up_member_${groupId}`;
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function normalizeGroup(row: any): Group {
+  const name = typeof row?.name === "string" ? row.name : "Group";
+  const slug =
+    typeof row?.slug === "string" && row.slug.trim().length > 0
+      ? row.slug.trim()
+      : generateGroupSlug(name) || row.id;
+  return {
+    id: row.id,
+    name,
+    slug,
+    created_by: row.created_by ?? null,
+    created_at: row.created_at,
+  };
+}
 
 function getRecentGroupIds(): string[] {
   if (typeof window === "undefined") return [];
@@ -52,7 +71,9 @@ function getRecentGroupIds(): string[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
-      ? parsed.filter((id): id is string => typeof id === "string" && id.length > 0)
+      ? parsed.filter(
+          (id): id is string => typeof id === "string" && id.length > 0
+        )
       : [];
   } catch {
     return [];
@@ -82,18 +103,90 @@ function removeRecentGroupId(groupId: string): void {
   }
 }
 
+async function resolveGroupBySlugOrId(
+  supabase: SupabaseClient,
+  rawSlugOrId: string
+): Promise<Group | null> {
+  const cleanParam = decodeURIComponent(rawSlugOrId).trim();
+  if (!cleanParam) return null;
+
+  const isUuid = UUID_REGEX.test(cleanParam);
+
+  // 1. Try direct query using ilike(slug, cleanParam) or id = cleanParam
+  if (isUuid) {
+    const { data, error } = await supabase
+      .from("groups")
+      .select("*")
+      .or(`slug.ilike.${cleanParam},id.eq.${cleanParam}`)
+      .maybeSingle();
+
+    if (!error && data) {
+      return normalizeGroup(data);
+    }
+
+    // Fallback if slug column does not exist yet on public.groups
+    const { data: byId } = await supabase
+      .from("groups")
+      .select("*")
+      .eq("id", cleanParam)
+      .maybeSingle();
+
+    if (byId) {
+      return normalizeGroup(byId);
+    }
+  } else {
+    const { data, error } = await supabase
+      .from("groups")
+      .select("*")
+      .ilike("slug", cleanParam)
+      .maybeSingle();
+
+    if (!error && data) {
+      return normalizeGroup(data);
+    }
+  }
+
+  // 2. Fallback: scan groups by derived slug or case-insensitive name match
+  const { data: allGroups } = await supabase.from("groups").select("*");
+  if (allGroups && allGroups.length > 0) {
+    const lowerTarget = cleanParam.toLowerCase();
+    const spaceNormalizedTarget = cleanParam
+      .replace(/_/g, " ")
+      .trim()
+      .toLowerCase();
+
+    const found = allGroups.find((g) => {
+      const normalized = normalizeGroup(g);
+      return (
+        normalized.id.toLowerCase() === lowerTarget ||
+        (normalized.slug && normalized.slug.toLowerCase() === lowerTarget) ||
+        generateGroupSlug(normalized.name).toLowerCase() === lowerTarget ||
+        normalized.name.trim().toLowerCase() === spaceNormalizedTarget
+      );
+    });
+
+    if (found) {
+      return normalizeGroup(found);
+    }
+  }
+
+  return null;
+}
+
 export function SettleUpDashboard({
+  initialSlug,
   initialGroupId,
 }: {
+  initialSlug?: string;
   initialGroupId?: string;
 }) {
   const supabase = useMemo(() => createClient(), []);
+  const routeTarget = initialSlug || initialGroupId || "";
+
   const [user, setUser] = useState<User | null>(null);
   const [authInitialized, setAuthInitialized] = useState(false);
   const [groups, setGroups] = useState<Group[]>([]);
-  const [activeGroupId, setActiveGroupId] = useState<string>(
-    initialGroupId || ""
-  );
+  const [activeGroupId, setActiveGroupId] = useState<string>("");
   const [members, setMembers] = useState<GroupMember[]>([]);
   const [activeMemberId, setActiveMemberId] = useState<string>("");
   const [newGroupName, setNewGroupName] = useState("");
@@ -145,22 +238,26 @@ export function SettleUpDashboard({
     return () => authListener.subscription.unsubscribe();
   }, [supabase]);
 
-  // Refresh members callback (queries only valid schema columns)
+  // Refresh members callback (queries ONLY id, group_id, display_name so it never fails on missing columns)
   const refreshMembers = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("group_members")
-        .select("id, group_id, display_name, created_at")
-        .eq("group_id", groupId)
-        .order("created_at", { ascending: true });
+        .select("id, group_id, display_name")
+        .eq("group_id", groupId);
+
+      if (error) {
+        console.error("Failed to fetch group_members:", error.message);
+        return;
+      }
 
       if (data) {
         const list: GroupMember[] = data.map((m) => ({
           id: m.id,
           groupId: m.group_id,
           name: m.display_name || "Member",
-          displayName: m.display_name,
+          displayName: m.display_name || "Member",
         }));
         setMembers(list);
         setSelectedMembers((prev) => {
@@ -175,17 +272,22 @@ export function SettleUpDashboard({
     [supabase]
   );
 
-  // Refresh expenses callback (queries only valid schema columns)
+  // Refresh expenses callback (queries ONLY guaranteed core columns)
   const refreshExpenses = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("expenses")
         .select(
-          "id, paid_by_member_id, created_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
+          "id, paid_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
         )
         .eq("group_id", groupId)
         .order("date", { ascending: false });
+
+      if (error) {
+        console.error("Failed to fetch expenses:", error.message);
+        return;
+      }
 
       if (data) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -223,53 +325,68 @@ export function SettleUpDashboard({
     [supabase]
   );
 
-  // Load groups based on Super-Admin status or localStorage recent groups + URL group
+  // Load target group from URL (/[slug]) and sidebar groups list
   useEffect(() => {
-    if (!authInitialized) return;
     let cancelled = false;
 
     const params =
       typeof window !== "undefined"
         ? new URLSearchParams(window.location.search)
         : null;
-    const queryGroupId = params?.get("groupId") || params?.get("join") || "";
-    const preselectedMemberParam = params?.get("m") || "";
-    const targetGroupId = initialGroupId || queryGroupId;
+    const queryGroupParam = params?.get("groupId") || params?.get("join") || "";
+    const targetSlugOrId = routeTarget || queryGroupParam;
 
-    // Persist target group and ?m= member in localStorage
-    if (targetGroupId) {
-      addRecentGroupId(targetGroupId);
-      if (preselectedMemberParam && typeof window !== "undefined") {
-        localStorage.setItem(
-          memberStorageKey(targetGroupId),
-          preselectedMemberParam
+    async function loadGroupsAndActiveTarget() {
+      // 1. If a URL slug or group ID was visited, resolve it immediately (regardless of auth status!)
+      let resolvedTargetGroup: Group | null = null;
+      if (targetSlugOrId) {
+        resolvedTargetGroup = await resolveGroupBySlugOrId(
+          supabase,
+          targetSlugOrId
         );
-      }
-    }
-
-    async function loadGroups() {
-      if (isSuperAdmin) {
-        // Super-Admin sees ALL groups
-        const { data: allGroups } = await supabase
-          .from("groups")
-          .select("id, name, created_by, created_at")
-          .order("created_at", { ascending: false });
-
         if (cancelled) return;
-        const list = allGroups || [];
-        setGroups(list);
+
+        if (resolvedTargetGroup) {
+          addRecentGroupId(resolvedTargetGroup.id);
+          setActiveGroupId(resolvedTargetGroup.id);
+          // Immediately ensure the resolved group is in groups state so the UI never flashes "No active group selected"
+          setGroups((prev) => {
+            if (prev.some((g) => g.id === resolvedTargetGroup!.id)) {
+              return prev;
+            }
+            return [resolvedTargetGroup!, ...prev];
+          });
+        }
+      }
+
+      // 2. Load the full sidebar list based on Super-Admin status vs recent_groups in localStorage
+      if (isSuperAdmin) {
+        const { data: allRows } = await supabase.from("groups").select("*");
+        if (cancelled) return;
+
+        const normalizedList = (allRows || []).map(normalizeGroup);
+        if (
+          resolvedTargetGroup &&
+          !normalizedList.some((g) => g.id === resolvedTargetGroup!.id)
+        ) {
+          normalizedList.unshift(resolvedTargetGroup);
+        }
+
+        setGroups(normalizedList);
         setActiveGroupId((prev) => {
-          if (targetGroupId && list.some((g) => g.id === targetGroupId)) {
-            return targetGroupId;
-          }
-          if (prev && list.some((g) => g.id === prev)) {
-            return prev;
-          }
-          return list[0]?.id || "";
+          if (resolvedTargetGroup) return resolvedTargetGroup.id;
+          if (prev && normalizedList.some((g) => g.id === prev)) return prev;
+          return normalizedList[0]?.id || "";
         });
       } else {
-        // Regular visitors / non-admin users ONLY see groups from their recent_groups localStorage or URL
         const recentIds = getRecentGroupIds();
+        if (
+          resolvedTargetGroup &&
+          !recentIds.includes(resolvedTargetGroup.id)
+        ) {
+          recentIds.unshift(resolvedTargetGroup.id);
+        }
+
         if (recentIds.length === 0) {
           if (!cancelled) {
             setGroups([]);
@@ -278,37 +395,41 @@ export function SettleUpDashboard({
           return;
         }
 
-        const { data: recentGroups } = await supabase
+        const { data: recentRows } = await supabase
           .from("groups")
-          .select("id, name, created_by, created_at")
+          .select("*")
           .in("id", recentIds);
 
         if (cancelled) return;
-        // Order according to recentIds order
-        const list = (recentGroups || []).sort(
-          (a, b) => recentIds.indexOf(a.id) - recentIds.indexOf(b.id)
-        );
-        setGroups(list);
+
+        const normalizedList = (recentRows || [])
+          .map(normalizeGroup)
+          .sort((a, b) => recentIds.indexOf(a.id) - recentIds.indexOf(b.id));
+
+        if (
+          resolvedTargetGroup &&
+          !normalizedList.some((g) => g.id === resolvedTargetGroup!.id)
+        ) {
+          normalizedList.unshift(resolvedTargetGroup);
+        }
+
+        setGroups(normalizedList);
         setActiveGroupId((prev) => {
-          if (targetGroupId && list.some((g) => g.id === targetGroupId)) {
-            return targetGroupId;
-          }
-          if (prev && list.some((g) => g.id === prev)) {
-            return prev;
-          }
-          return list[0]?.id || "";
+          if (resolvedTargetGroup) return resolvedTargetGroup.id;
+          if (prev && normalizedList.some((g) => g.id === prev)) return prev;
+          return normalizedList[0]?.id || "";
         });
       }
     }
 
-    loadGroups();
+    loadGroupsAndActiveTarget();
 
     return () => {
       cancelled = true;
     };
-  }, [authInitialized, isSuperAdmin, initialGroupId, supabase]);
+  }, [authInitialized, isSuperAdmin, routeTarget, supabase]);
 
-  // Load group members & expenses when activeGroupId changes, and restore activeMemberId
+  // Load group members & expenses when activeGroupId changes, and resolve ?m=<display_name> or localStorage identity
   useEffect(() => {
     if (!activeGroupId) return;
     let cancelled = false;
@@ -316,41 +437,67 @@ export function SettleUpDashboard({
     // Save activeGroupId to recent groups in localStorage
     addRecentGroupId(activeGroupId);
 
-    // Check URL ?m= or localStorage for active member identity
     const params =
       typeof window !== "undefined"
         ? new URLSearchParams(window.location.search)
         : null;
-    const urlMemberId = params?.get("m") || "";
-    const storedMemberId =
+    const urlMemberParam = params?.get("m")?.trim() || "";
+    const storedMemberValue =
       typeof window !== "undefined"
         ? localStorage.getItem(memberStorageKey(activeGroupId)) || ""
         : "";
-    const preferredMemberId = urlMemberId || storedMemberId;
-
-    if (urlMemberId && typeof window !== "undefined") {
-      localStorage.setItem(memberStorageKey(activeGroupId), urlMemberId);
-    }
 
     supabase
       .from("group_members")
-      .select("id, group_id, display_name, created_at")
+      .select("id, group_id, display_name")
       .eq("group_id", activeGroupId)
-      .order("created_at", { ascending: true })
-      .then(({ data }) => {
-        if (cancelled || !data) return;
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error("Error loading group_members:", error.message);
+          return;
+        }
+        if (!data) return;
+
         const list: GroupMember[] = data.map((m) => ({
           id: m.id,
           groupId: m.group_id,
           name: m.display_name || "Member",
-          displayName: m.display_name,
+          displayName: m.display_name || "Member",
         }));
         setMembers(list);
         setSelectedMembers(list.map((u) => u.id));
 
-        if (preferredMemberId && list.some((m) => m.id === preferredMemberId)) {
-          setActiveMemberId(preferredMemberId);
-          setPayerId(preferredMemberId);
+        // Match member by ?m=<display_name> (case-insensitive) or ?m=<member_id>, or fallback to localStorage
+        let matchedMember: GroupMember | undefined;
+
+        if (urlMemberParam) {
+          const lowerUrlParam = urlMemberParam.toLowerCase();
+          matchedMember = list.find(
+            (m) =>
+              m.name.trim().toLowerCase() === lowerUrlParam ||
+              m.id.toLowerCase() === lowerUrlParam
+          );
+        }
+
+        if (!matchedMember && storedMemberValue) {
+          const lowerStored = storedMemberValue.toLowerCase();
+          matchedMember = list.find(
+            (m) =>
+              m.id.toLowerCase() === lowerStored ||
+              m.name.trim().toLowerCase() === lowerStored
+          );
+        }
+
+        if (matchedMember) {
+          setActiveMemberId(matchedMember.id);
+          setPayerId(matchedMember.id);
+          if (typeof window !== "undefined") {
+            localStorage.setItem(
+              memberStorageKey(activeGroupId),
+              matchedMember.id
+            );
+          }
         } else {
           setActiveMemberId("");
           setPayerId(list[0]?.id || "");
@@ -360,12 +507,17 @@ export function SettleUpDashboard({
     supabase
       .from("expenses")
       .select(
-        "id, paid_by_member_id, created_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
+        "id, paid_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
       )
       .eq("group_id", activeGroupId)
       .order("date", { ascending: false })
-      .then(({ data }) => {
-        if (cancelled || !data) return;
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error("Error loading expenses:", error.message);
+          return;
+        }
+        if (!data) return;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const formatted: ExpenseItem[] = (data as any[]).map((e) => {
           const amtCents = Number(e.amount_cents || 0);
@@ -404,31 +556,47 @@ export function SettleUpDashboard({
   }, [activeGroupId, supabase]);
 
   // Select member identity ("Who are you in this group?")
-  const handleSelectIdentity = (memberId: string) => {
-    setActiveMemberId(memberId);
-    setPayerId(memberId);
+  const handleSelectIdentity = (member: GroupMember) => {
+    setActiveMemberId(member.id);
+    setPayerId(member.id);
     if (activeGroupId && typeof window !== "undefined") {
-      localStorage.setItem(memberStorageKey(activeGroupId), memberId);
+      localStorage.setItem(memberStorageKey(activeGroupId), member.id);
+      addRecentGroupId(activeGroupId);
+
+      const slugOrId = activeGroup
+        ? activeGroup.slug ||
+          generateGroupSlug(activeGroup.name) ||
+          activeGroup.id
+        : activeGroupId;
+
+      window.history.replaceState(
+        null,
+        "",
+        `/${slugOrId}?m=${encodeURIComponent(member.name)}`
+      );
     }
   };
 
-  // Switch active group and sync browser URL to /g/[group_id]
-  const handleSelectGroup = (groupId: string) => {
-    setActiveGroupId(groupId);
-    addRecentGroupId(groupId);
+  // Switch active group and sync browser URL to /<slug>
+  const handleSelectGroup = (group: Group) => {
+    setActiveGroupId(group.id);
+    addRecentGroupId(group.id);
     if (typeof window !== "undefined") {
-      window.history.pushState(null, "", `/g/${groupId}`);
+      const slugOrId = group.slug || generateGroupSlug(group.name) || group.id;
+      window.history.pushState(null, "", `/${slugOrId}`);
     }
   };
 
-  // Copy Main Group Link
+  // Copy Main Group Link (https://split.murphnduff.org/<group.slug>)
   const handleCopyGroupLink = async () => {
     if (!activeGroup) return;
     const origin =
-      typeof window !== "undefined"
+      typeof window !== "undefined" && window.location?.origin
         ? window.location.origin
         : "https://split.murphnduff.org";
-    const url = `${origin}/g/${activeGroup.id}`;
+    const slugOrId =
+      activeGroup.slug || generateGroupSlug(activeGroup.name) || activeGroup.id;
+    const url = `${origin}/${slugOrId}`;
     try {
       await navigator.clipboard.writeText(url);
       setCopiedGroupLink(true);
@@ -504,25 +672,54 @@ export function SettleUpDashboard({
       ? (parsedAmount / selectedMembers.length).toFixed(2)
       : null;
 
-  // Create new group (Strictly Super-Admin only)
+  // Create new group (Strictly Super-Admin only, generates friendly slug from name)
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isSuperAdmin || !newGroupName.trim() || !user) return;
 
-    const { data: newGroup, error: groupError } = await supabase
+    const trimmedName = newGroupName.trim();
+    const generatedSlug = generateGroupSlug(trimmedName);
+
+    // 1. Try inserting with slug column included
+    let { data: newGroupRow, error: groupError } = await supabase
       .from("groups")
-      .insert({ name: newGroupName.trim(), created_by: user.id })
-      .select("id, name, created_by, created_at")
+      .insert({
+        name: trimmedName,
+        slug: generatedSlug,
+        created_by: user.id,
+      })
+      .select("*")
       .single();
 
-    if (groupError || !newGroup) {
-      alert("Error creating group: " + (groupError?.message || "Unknown error"));
+    // Fallback if slug column has not yet been added in Supabase SQL
+    if (groupError && groupError.message?.toLowerCase().includes("slug")) {
+      const retry = await supabase
+        .from("groups")
+        .insert({
+          name: trimmedName,
+          created_by: user.id,
+        })
+        .select("*")
+        .single();
+      newGroupRow = retry.data;
+      groupError = retry.error;
+    }
+
+    if (groupError || !newGroupRow) {
+      alert(
+        "Error creating group: " + (groupError?.message || "Unknown error")
+      );
       return;
     }
 
+    const normalizedNewGroup = normalizeGroup({
+      ...newGroupRow,
+      slug: newGroupRow.slug || generatedSlug,
+    });
+
     setNewGroupName("");
-    setGroups((prev) => [newGroup, ...prev]);
-    handleSelectGroup(newGroup.id);
+    setGroups((prev) => [normalizedNewGroup, ...prev]);
+    handleSelectGroup(normalizedNewGroup);
     setIsInviteModalOpen(true);
   };
 
@@ -548,10 +745,13 @@ export function SettleUpDashboard({
     const remaining = groups.filter((g) => g.id !== groupId);
     setGroups(remaining);
     if (activeGroupId === groupId) {
-      const nextId = remaining.length > 0 ? remaining[0].id : "";
-      setActiveGroupId(nextId);
+      const nextGroup = remaining[0] || null;
+      setActiveGroupId(nextGroup ? nextGroup.id : "");
       if (typeof window !== "undefined") {
-        window.history.pushState(null, "", nextId ? `/g/${nextId}` : "/");
+        const nextPath = nextGroup
+          ? `/${nextGroup.slug || generateGroupSlug(nextGroup.name) || nextGroup.id}`
+          : "/";
+        window.history.pushState(null, "", nextPath);
       }
     }
   };
@@ -573,13 +773,12 @@ export function SettleUpDashboard({
     if (isNaN(parsed) || parsed <= 0) return;
     const totalCents = Math.round(parsed * 100);
 
-    // 1. Insert into expenses (using paid_by_member_id and created_by_member_id)
+    // 1. Insert into expenses
     const { data: newExp, error: expError } = await supabase
       .from("expenses")
       .insert({
         group_id: activeGroupId,
         paid_by_member_id: finalPayerId,
-        created_by_member_id: activeMemberId || finalPayerId,
         description:
           description.trim() ||
           (type === "payment" ? "Direct Payment" : "Group Expense"),
@@ -764,7 +963,7 @@ export function SettleUpDashboard({
                 <p className="text-xs text-slate-400 italic py-2">
                   {isSuperAdmin
                     ? "No groups yet. Create one below!"
-                    : "Open a shared group link (/g/...) to access your group."}
+                    : "Open a shared group link (e.g. /SoCal_2026) to access your group."}
                 </p>
               ) : (
                 groups.map((g) => (
@@ -778,7 +977,7 @@ export function SettleUpDashboard({
                   >
                     <button
                       type="button"
-                      onClick={() => handleSelectGroup(g.id)}
+                      onClick={() => handleSelectGroup(g)}
                       className="flex-1 text-left truncate mr-2 cursor-pointer"
                     >
                       {g.name}
@@ -811,12 +1010,17 @@ export function SettleUpDashboard({
                 </label>
                 <input
                   type="text"
-                  placeholder="Group Name (e.g. Ireland Golf)"
+                  placeholder="Group Name (e.g. SoCal 2026)"
                   value={newGroupName}
                   onChange={(e) => setNewGroupName(e.target.value)}
                   className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                   required
                 />
+                {newGroupName.trim() && (
+                  <span className="text-[11px] text-slate-400 font-mono truncate">
+                    URL: /{generateGroupSlug(newGroupName)}
+                  </span>
+                )}
                 <button
                   type="submit"
                   className="w-full bg-blue-600 text-white py-2 rounded-lg text-xs font-semibold hover:bg-blue-700 transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
@@ -901,7 +1105,7 @@ export function SettleUpDashboard({
                         <button
                           key={m.id}
                           type="button"
-                          onClick={() => handleSelectIdentity(m.id)}
+                          onClick={() => handleSelectIdentity(m)}
                           className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold transition cursor-pointer border ${
                             isMe
                               ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
@@ -921,9 +1125,7 @@ export function SettleUpDashboard({
                 </div>
               ) : (
                 <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between">
-                  <span>
-                    No members have been added to this group yet.
-                  </span>
+                  <span>No members have been added to this group yet.</span>
                   {isSuperAdmin && (
                     <button
                       type="button"
@@ -978,7 +1180,7 @@ export function SettleUpDashboard({
                 <p className="text-xs text-slate-500 max-w-md mx-auto">
                   {isSuperAdmin
                     ? "Choose a group from the left sidebar or create a new group to start adding members and transactions."
-                    : "Open your shared group link (e.g. split.murphnduff.org/g/...) to immediately view and add expenses without needing to log in."}
+                    : "Open your shared group link (e.g. split.murphnduff.org/SoCal_2026) to immediately view and add expenses without needing to log in."}
                 </p>
               </div>
             </div>
@@ -1472,9 +1674,20 @@ export function SettleUpDashboard({
         isSuperAdmin={isSuperAdmin}
         activeMemberId={activeMemberId}
         expenses={expenses}
-        onMemberAdded={() => {
+        onMemberAdded={async (newMember) => {
+          if (newMember) {
+            setMembers((prev) =>
+              prev.some((m) => m.id === newMember.id)
+                ? prev
+                : [...prev, newMember]
+            );
+            setSelectedMembers((prev) =>
+              prev.includes(newMember.id) ? prev : [...prev, newMember.id]
+            );
+            setPayerId((prev) => prev || newMember.id);
+          }
           if (activeGroupId) {
-            refreshMembers(activeGroupId);
+            await refreshMembers(activeGroupId);
           }
         }}
       />

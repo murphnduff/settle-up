@@ -39,9 +39,20 @@ DROP FUNCTION IF EXISTS public.is_group_admin(UUID, UUID);
 CREATE TABLE IF NOT EXISTS public.groups (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
+    slug TEXT,
     created_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.groups ADD COLUMN IF NOT EXISTS slug TEXT;
+
+UPDATE public.groups
+SET slug = regexp_replace(regexp_replace(trim(name), '[^a-zA-Z0-9]+', '_', 'g'), '^_+|_+$', '', 'g')
+WHERE slug IS NULL OR trim(slug) = '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_unique_lower_slug
+ON public.groups (lower(slug))
+WHERE slug IS NOT NULL AND trim(slug) <> '';
 
 CREATE TABLE IF NOT EXISTS public.group_members (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -49,6 +60,8 @@ CREATE TABLE IF NOT EXISTS public.group_members (
     display_name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.group_members ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now());
 
 CREATE TABLE IF NOT EXISTS public.expenses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

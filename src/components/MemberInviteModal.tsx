@@ -17,6 +17,13 @@ import {
   Link2,
 } from "lucide-react";
 
+export function generateGroupSlug(name: string): string {
+  return name
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 export interface GroupMember {
   id: string; // group_members.id
   groupId?: string;
@@ -27,6 +34,7 @@ export interface GroupMember {
 export interface Group {
   id: string;
   name: string;
+  slug?: string | null;
   created_by?: string | null;
   created_at?: string;
 }
@@ -39,7 +47,7 @@ interface MemberInviteModalProps {
   isSuperAdmin: boolean;
   activeMemberId?: string;
   expenses: ExpenseRecord[];
-  onMemberAdded: () => void;
+  onMemberAdded: (newMember?: GroupMember) => Promise<void> | void;
 }
 
 export default function MemberInviteModal({
@@ -133,10 +141,11 @@ export default function MemberInviteModal({
   const getGroupShareUrl = () => {
     if (!group) return "";
     const origin =
-      typeof window !== "undefined"
+      typeof window !== "undefined" && window.location?.origin
         ? window.location.origin
         : "https://split.murphnduff.org";
-    return `${origin}/g/${group.id}`;
+    const slugOrId = group.slug || generateGroupSlug(group.name) || group.id;
+    return `${origin}/${slugOrId}`;
   };
 
   const handleCopyGroupLink = async () => {
@@ -151,7 +160,8 @@ export default function MemberInviteModal({
 
   const handleCopyMemberLink = async (member: GroupMember) => {
     if (!group) return;
-    const url = `${getGroupShareUrl()}?m=${member.id}`;
+    const memberDisplayName = member.displayName || member.name;
+    const url = `${getGroupShareUrl()}?m=${encodeURIComponent(memberDisplayName)}`;
     const ok = await copyToClipboard(url);
     if (ok) {
       setCopiedMemberId(member.id);
@@ -159,7 +169,7 @@ export default function MemberInviteModal({
     }
   };
 
-  // Add member (Super-Admin only, display_name only)
+  // Add member (Super-Admin only, sends strictly group_id and display_name)
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!group) return;
@@ -198,27 +208,37 @@ export default function MemberInviteModal({
     setStatusMessage(null);
 
     try {
-      const { error: insertError } = await supabase
+      const { data: insertedRow, error: insertError } = await supabase
         .from("group_members")
         .insert({
           group_id: group.id,
           display_name: trimmedName,
-        });
+        })
+        .select("id, group_id, display_name")
+        .single();
 
-      if (insertError) {
+      if (insertError || !insertedRow) {
         setStatusMessage({
           type: "error",
-          text: `Failed to add member: ${insertError.message}`,
+          text: `Failed to add member: ${insertError?.message || "Unknown database error"}`,
         });
         return;
       }
+
+      const addedMember: GroupMember = {
+        id: insertedRow.id,
+        groupId: insertedRow.group_id,
+        name: insertedRow.display_name || trimmedName,
+        displayName: insertedRow.display_name || trimmedName,
+      };
+
+      setDisplayName("");
+      await onMemberAdded(addedMember);
 
       setStatusMessage({
         type: "success",
         text: `Added "${trimmedName}"! Share the group link or their direct link below.`,
       });
-      setDisplayName("");
-      onMemberAdded();
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : "An unexpected error occurred.";
@@ -262,7 +282,7 @@ export default function MemberInviteModal({
     } else {
       setEditingMemberId(null);
       setEditingName("");
-      onMemberAdded();
+      await onMemberAdded();
     }
   };
 
@@ -298,7 +318,7 @@ export default function MemberInviteModal({
         type: "success",
         text: `Removed "${member.name}" from the group.`,
       });
-      onMemberAdded();
+      await onMemberAdded();
     }
   };
 
@@ -335,7 +355,7 @@ export default function MemberInviteModal({
               </h2>
               <p className="text-xs text-slate-500">
                 {isSuperAdmin
-                  ? "Add member profiles and share no-login group or member links."
+                  ? "Add member profiles and share friendly group or per-member links."
                   : "Copy the group link or your direct member link to share."}
               </p>
             </div>
@@ -441,7 +461,8 @@ export default function MemberInviteModal({
           <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 flex items-center gap-2">
             <Shield className="w-4 h-4 text-slate-400 shrink-0" />
             <span>
-              Anyone with the group link can add or edit transactions. Only the Super-Admin can add or remove group members.
+              Anyone with the group link can add or edit transactions. Only the
+              Super-Admin can add or remove group members.
             </span>
           </div>
         )}
@@ -454,7 +475,7 @@ export default function MemberInviteModal({
               Members ({currentMembers.length})
             </h3>
             <span className="text-[11px] text-slate-400">
-              Direct links auto-select that member
+              Direct links auto-select that member (?m=Name)
             </span>
           </div>
 
