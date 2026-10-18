@@ -6,6 +6,34 @@ import { splitAmountEqually } from "@/lib/reconciliation";
 import { GroupMember } from "@/components/MemberInviteModal";
 import { X, Sparkles, AlertCircle, Edit3 } from "lucide-react";
 
+export function getTodayLocalDate(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export function formatTransactionDate(dateStr?: string): string {
+  if (!dateStr) return "";
+  const clean = dateStr.split("T")[0];
+  const parts = clean.split("-");
+  if (parts.length === 3) {
+    const year = Number(parts[0]);
+    const month = Number(parts[1]) - 1;
+    const day = Number(parts[2]);
+    const localDate = new Date(year, month, day);
+    if (!isNaN(localDate.getTime())) {
+      return localDate.toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+    }
+  }
+  return clean;
+}
+
 export interface ExpenseItem {
   id: string;
   paidByMemberId?: string;
@@ -16,6 +44,7 @@ export interface ExpenseItem {
   currency: string;
   type: "expense" | "payment";
   date: string;
+  createdAt?: string;
   createdBy?: string;
   splits: Array<{
     memberId: string;
@@ -55,6 +84,9 @@ export default function EditExpenseModal({
   );
   const [payerId, setPayerId] = useState(
     expense?.paidByMemberId || expense?.payerId || ""
+  );
+  const [date, setDate] = useState(
+    expense?.date ? expense.date.split("T")[0] : getTodayLocalDate()
   );
   const [selectedMembers, setSelectedMembers] = useState<string[]>(
     expense ? expense.splits.map((s) => s.memberId) : []
@@ -137,6 +169,7 @@ export default function EditExpenseModal({
         currency,
         type,
         paid_by_member_id: payerId,
+        date: date || getTodayLocalDate(),
       };
 
       let { error: updateError } = await supabase
@@ -397,19 +430,34 @@ export default function EditExpenseModal({
           </div>
         </div>
 
-        {/* Description */}
-        <div>
-          <label className="text-xs font-semibold text-slate-600 block mb-1">
-            Description
-          </label>
-          <input
-            type="text"
-            placeholder="e.g. Dinner, Fuel, Groceries, Hotel"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-            required
-          />
+        {/* Description & Date */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="sm:col-span-2">
+            <label className="text-xs font-semibold text-slate-600 block mb-1">
+              Description
+            </label>
+            <input
+              type="text"
+              placeholder="e.g. Dinner, Fuel, Groceries, Hotel"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+              required
+            />
+          </div>
+
+          <div>
+            <label className="text-xs font-semibold text-slate-600 block mb-1">
+              Date
+            </label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+              required
+            />
+          </div>
         </div>
 
         {/* Participants / Recipient selection */}

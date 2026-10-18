@@ -16,6 +16,7 @@
   - The **ONLY** user who signs in via Google OAuth (`user?.email?.toLowerCase() === 'murph@murphnduff.org'` on the client, and `lower(coalesce(auth.jwt() ->> 'email', '')) = 'murph@murphnduff.org'` in Supabase RLS).
   - Sees **ALL** groups in the database in the left sidebar.
   - Is the **ONLY** user who can Create Groups, Delete Groups, or Manage Members (Add/Delete members).
+  - **Non-Participant Super-Admin Support:** When creating a new group, the Super-Admin is **not** automatically added to `public.group_members` unless they explicitly check the optional `"Add me as a member"` checkbox (unchecked by default). This allows creating and managing groups for other people without polluting their participant list. When viewing a group as a non-participant, the UI displays `"Admin View (non-participant)"` instead of nagging with `"Who are you in this group?"`, while still allowing the Admin to add/edit transactions on behalf of any group member or optionally tap a member pill to act as them.
 - **Root-Level Friendly Group URLs (`https://split.murphnduff.org/SoCal_2026`):**
   - Groups have a `slug` column in `public.groups` derived from `name` (`name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')`, e.g., `'Test Group 1'` -> `'Test_Group_1'`, `'SoCal 2026'` -> `'SoCal_2026'`).
   - Groups are served directly at the root dynamic route `src/app/[slug]/page.tsx` (matching `ilike(slug, slugParam)` or `id = slugParam` if a UUID is passed).
@@ -24,6 +25,10 @@
   - Anyone visiting `/<slug>` (or `/<slug>?m=<display_name>`) on a phone, tablet, or computer immediately sees and loads the group without logging in.
   - Visiting `/<slug>` immediately loads the group, sets it as the active group, adds it to `recent_groups` in `localStorage` so it appears under **"Your Groups"** in the sidebar, and loads its `group_members`, `expenses`, and `expense_splits`.
   - **"Who Are You?" Identity Pill:** Tapping a member pill (`"Who are you in this group?"`) saves `active_member_id` and adds the group to `recent_groups` in `localStorage`, defaults the **"Paid By"** selector to that member, and updates the URL query param to `?m=<display_name>` via `window.history.replaceState` so the user can bookmark or share their pre-selected link across devices.
+- **Transaction Date Picker & Chronological Ledger Sorting:**
+  - Both the main **Add Transaction** form (`src/app/page.tsx`) and the **Edit Transaction** modal (`src/components/EditExpenseModal.tsx`) include an `<input type="date" />` field.
+  - Defaults to today's local date (`YYYY-MM-DD`) when adding a new transaction, and pre-populates with `expense.date` when editing an existing transaction.
+  - Saves the selected date to `public.expenses.date`, displays a human-friendly formatted date (e.g., `Oct 18, 2026`) on each transaction row in the ledger, and sorts the transaction ledger chronologically by `date` descending with `created_at` descending as tie-breaker.
 
 ### 2.2 Database Tables
 - **`groups`**:
@@ -33,7 +38,7 @@
   - *Uniqueness:* Case-insensitive unique index on `(group_id, lower(display_name))` to prevent duplicate member names in the same group.
   - *Deletion Guard:* `ON DELETE RESTRICT` when referenced in `expenses` or `expense_splits`.
 - **`expenses`**:
-  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `group_id` (UUID NOT NULL FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`, default `'USD'`), `date` (DATE), `paid_by_member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `created_by_member_id` (UUID Nullable FK to `group_members.id` ON DELETE SET NULL), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
+  - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `group_id` (UUID NOT NULL FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'` or `'$'` | `'€'`), `date` (DATE), `paid_by_member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `created_by_member_id` (UUID Nullable FK to `group_members.id` ON DELETE SET NULL), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`expense_splits`**:
   - Columns: `id` (UUID PK DEFAULT `gen_random_uuid()`), `expense_id` (UUID NOT NULL FK CASCADE), `member_id` (UUID NOT NULL FK to `group_members.id` ON DELETE RESTRICT), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 
@@ -61,11 +66,12 @@
 | :--- | :--- | :--- |
 | **Sign-In Required?** | Yes (Google OAuth) | **No** (Instant access on Phone, Tablet, or PC) |
 | **Sidebar Group List** | Sees **ALL** groups in database | Sees groups visited on their device (`recent_groups` in `localStorage`) |
-| **Create / Delete Group** | Yes (Auto-generates `slug` from `name`) | No (Hidden in UI, blocked by RLS) |
+| **Create / Delete Group** | Yes (Auto-generates `slug`; optional `"Add me as a member"` checkbox) | No (Hidden in UI, blocked by RLS) |
+| **Non-Participant View** | Yes (`Admin View (non-participant)` without identity nagging) | N/A |
 | **Manage Members (Add/Delete)**| Yes (Delete blocked if >0 txns) | No (Hidden in UI, blocked by RLS) |
 | **Share Group / Member Link** | Yes (`/<slug>` & `/<slug>?m=<display_name>`) | Yes (Can copy `/<slug>` group link) |
 | **Rename Members** | Yes (Any member) | Yes (Can rename own selected member profile) |
-| **Add / Edit / Delete Txns** | Yes (Any expense or payment) | Yes (Any expense or payment in the group) |
+| **Add / Edit / Delete Txns** | Yes (Any expense or payment, with custom `date` picker) | Yes (Any expense or payment in the group, with custom `date` picker) |
 
 ---
 

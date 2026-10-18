@@ -21,6 +21,8 @@ import MemberInviteModal, {
 } from "@/components/MemberInviteModal";
 import EditExpenseModal, {
   ExpenseItem,
+  getTodayLocalDate,
+  formatTransactionDate,
 } from "@/components/EditExpenseModal";
 import {
   UserPlus,
@@ -62,6 +64,55 @@ function normalizeGroup(row: any): Group {
     created_by: row.created_by ?? null,
     created_at: row.created_at,
   };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mapped: ExpenseItem[] = rows.map((e: any) => {
+    const amtCents = Number(
+      e.amount_cents ?? Math.round(Number(e.amount || 0) * 100)
+    );
+    const amt = amtCents / 100;
+    const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
+    const cleanDate =
+      typeof e.date === "string" ? e.date.split("T")[0] : getTodayLocalDate();
+    return {
+      id: e.id,
+      paidByMemberId: e.paid_by_member_id,
+      payerId: e.paid_by_member_id,
+      description: e.description,
+      amount: amt,
+      amountCents: amtCents,
+      currency: curr,
+      type: (e.type === "payment" ? "payment" : "expense") as
+        | "expense"
+        | "payment",
+      date: cleanDate,
+      createdAt: typeof e.created_at === "string" ? e.created_at : "",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      splits: (e.expense_splits || []).map((s: any) => {
+        const splitCents = Number(
+          s.split_amount_cents ?? Math.round(Number(s.amount || 0) * 100)
+        );
+        return {
+          memberId: s.member_id,
+          userId: s.member_id,
+          amount: splitCents / 100,
+          splitAmountCents: splitCents,
+        };
+      }),
+    };
+  });
+
+  // Sort chronologically by date descending, with created_at descending as tie-breaker
+  return mapped.sort((a, b) => {
+    const dateCmp = (b.date || "").localeCompare(a.date || "");
+    if (dateCmp !== 0) return dateCmp;
+    const createdCmp = (b.createdAt || "").localeCompare(a.createdAt || "");
+    if (createdCmp !== 0) return createdCmp;
+    return b.id.localeCompare(a.id);
+  });
 }
 
 function getRecentGroupIds(): string[] {
@@ -190,6 +241,7 @@ export function SettleUpDashboard({
   const [members, setMembers] = useState<GroupMember[]>([]);
   const [activeMemberId, setActiveMemberId] = useState<string>("");
   const [newGroupName, setNewGroupName] = useState("");
+  const [addAdminAsMember, setAddAdminAsMember] = useState<boolean>(false);
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
@@ -207,6 +259,9 @@ export function SettleUpDashboard({
   const [amount, setAmount] = useState("");
   const [currency, setCurrency] = useState<"$" | "€">("$");
   const [payerId, setPayerId] = useState("");
+  const [transactionDate, setTransactionDate] = useState<string>(() =>
+    getTodayLocalDate()
+  );
   const [type, setType] = useState<"expense" | "payment">("expense");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [, startTransition] = useTransition();
@@ -272,15 +327,13 @@ export function SettleUpDashboard({
     [supabase]
   );
 
-  // Refresh expenses callback (queries ONLY guaranteed core columns)
+  // Refresh expenses callback (sorted by date descending, with created_at descending as tie-breaker)
   const refreshExpenses = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
       const { data, error } = await supabase
         .from("expenses")
-        .select(
-          "id, paid_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
-        )
+        .select("*, expense_splits(member_id, split_amount_cents)")
         .eq("group_id", groupId)
         .order("date", { ascending: false });
 
@@ -290,36 +343,7 @@ export function SettleUpDashboard({
       }
 
       if (data) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const formatted: ExpenseItem[] = (data as any[]).map((e) => {
-          const amtCents = Number(e.amount_cents || 0);
-          const amt = amtCents / 100;
-          const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
-          return {
-            id: e.id,
-            paidByMemberId: e.paid_by_member_id,
-            payerId: e.paid_by_member_id,
-            description: e.description,
-            amount: amt,
-            amountCents: amtCents,
-            currency: curr,
-            type: (e.type === "payment" ? "payment" : "expense") as
-              | "expense"
-              | "payment",
-            date: e.date,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            splits: (e.expense_splits || []).map((s: any) => {
-              const splitCents = Number(s.split_amount_cents || 0);
-              return {
-                memberId: s.member_id,
-                userId: s.member_id,
-                amount: splitCents / 100,
-                splitAmountCents: splitCents,
-              };
-            }),
-          };
-        });
-        setExpenses(formatted);
+        setExpenses(mapAndSortExpenses(data));
       }
     },
     [supabase]
@@ -506,9 +530,7 @@ export function SettleUpDashboard({
 
     supabase
       .from("expenses")
-      .select(
-        "id, paid_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
-      )
+      .select("*, expense_splits(member_id, split_amount_cents)")
       .eq("group_id", activeGroupId)
       .order("date", { ascending: false })
       .then(({ data, error }) => {
@@ -519,35 +541,7 @@ export function SettleUpDashboard({
         }
         if (!data) return;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const formatted: ExpenseItem[] = (data as any[]).map((e) => {
-          const amtCents = Number(e.amount_cents || 0);
-          const amt = amtCents / 100;
-          const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
-          return {
-            id: e.id,
-            paidByMemberId: e.paid_by_member_id,
-            payerId: e.paid_by_member_id,
-            description: e.description,
-            amount: amt,
-            amountCents: amtCents,
-            currency: curr,
-            type: (e.type === "payment" ? "payment" : "expense") as
-              | "expense"
-              | "payment",
-            date: e.date,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            splits: (e.expense_splits || []).map((s: any) => {
-              const splitCents = Number(s.split_amount_cents || 0);
-              return {
-                memberId: s.member_id,
-                userId: s.member_id,
-                amount: splitCents / 100,
-                splitAmountCents: splitCents,
-              };
-            }),
-          };
-        });
-        setExpenses(formatted);
+        setExpenses(mapAndSortExpenses(data as any[]));
       });
 
     return () => {
@@ -717,7 +711,15 @@ export function SettleUpDashboard({
       slug: newGroupRow.slug || generatedSlug,
     });
 
+    if (addAdminAsMember) {
+      await supabase.from("group_members").insert({
+        group_id: normalizedNewGroup.id,
+        display_name: "Murph",
+      });
+    }
+
     setNewGroupName("");
+    setAddAdminAsMember(false);
     setGroups((prev) => [normalizedNewGroup, ...prev]);
     handleSelectGroup(normalizedNewGroup);
     setIsInviteModalOpen(true);
@@ -782,7 +784,7 @@ export function SettleUpDashboard({
       amount_cents: totalCents,
       currency,
       type,
-      date: new Date().toISOString().split("T")[0],
+      date: transactionDate || getTodayLocalDate(),
     };
 
     // 1. Insert into expenses (auto-adapts if legacy NOT NULL or currency check constraints exist in DB)
@@ -1085,6 +1087,15 @@ export function SettleUpDashboard({
                     URL: /{generateGroupSlug(newGroupName)}
                   </span>
                 )}
+                <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer select-none py-0.5">
+                  <input
+                    type="checkbox"
+                    checked={addAdminAsMember}
+                    onChange={(e) => setAddAdminAsMember(e.target.checked)}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                  />
+                  <span>Add me as a member</span>
+                </label>
                 <button
                   type="submit"
                   className="w-full bg-blue-600 text-white py-2 rounded-lg text-xs font-semibold hover:bg-blue-700 transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
@@ -1151,16 +1162,47 @@ export function SettleUpDashboard({
                 </div>
               </div>
 
-              {/* Zero-Login "Who Are You in This Group?" Identity Pill Selector */}
+              {/* Zero-Login Identity Pill Selector (Non-nagging for non-participant Super-Admin) */}
               {members.length > 0 ? (
                 <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-xl space-y-2">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
                     <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
-                      <UserCheck className="w-3.5 h-3.5 text-blue-600" />
+                      {isSuperAdmin && !activeMemberObj ? (
+                        <Shield className="w-3.5 h-3.5 text-indigo-600" />
+                      ) : (
+                        <UserCheck className="w-3.5 h-3.5 text-blue-600" />
+                      )}
                       {activeMemberObj
                         ? `Viewing as ${activeMemberObj.name} (tap another name to switch):`
-                        : "Who are you in this group? Tap your name:"}
+                        : isSuperAdmin
+                          ? "Admin View (non-participant) — optionally tap a member to act as them:"
+                          : "Who are you in this group? Tap your name:"}
                     </span>
+                    {isSuperAdmin && activeMemberObj && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveMemberId("");
+                          if (activeGroupId && typeof window !== "undefined") {
+                            localStorage.removeItem(
+                              memberStorageKey(activeGroupId)
+                            );
+                            const slugOrId =
+                              activeGroup.slug ||
+                              generateGroupSlug(activeGroup.name) ||
+                              activeGroup.id;
+                            window.history.replaceState(
+                              null,
+                              "",
+                              `/${slugOrId}`
+                            );
+                          }
+                        }}
+                        className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+                      >
+                        Reset to Admin View
+                      </button>
+                    )}
                   </div>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     {members.map((m) => {
@@ -1365,18 +1407,32 @@ export function SettleUpDashboard({
                   </div>
                 </div>
 
-                <div>
-                  <label className="text-xs font-semibold text-slate-600 block mb-1">
-                    Description
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Dinner, Fuel, Groceries, Green Fees"
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                    required
-                  />
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="sm:col-span-2">
+                    <label className="text-xs font-semibold text-slate-600 block mb-1">
+                      Description
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Dinner, Fuel, Groceries, Green Fees"
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 block mb-1">
+                      Date
+                    </label>
+                    <input
+                      type="date"
+                      value={transactionDate}
+                      onChange={(e) => setTransactionDate(e.target.value)}
+                      className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                      required
+                    />
+                  </div>
                 </div>
 
                 {/* Split Among with Live Preview and Select All */}
@@ -1576,7 +1632,7 @@ export function SettleUpDashboard({
                                 <span className="font-medium text-slate-700">
                                   {payerMember?.name || "Unknown"}
                                 </span>{" "}
-                                • {exp.date}
+                                • {formatTransactionDate(exp.date)}
                                 {isPayment && exp.splits.length > 0 && (
                                   <span className="text-slate-400 ml-1">
                                     → To{" "}
