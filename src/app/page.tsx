@@ -675,12 +675,46 @@ export function SettleUpDashboard({
     [settlements]
   );
 
-  // Live split computation
+  // Live exact split calculation & auto-summed total for Add Transaction form
+  const exactSummary = useMemo(() => {
+    const centsRecord: Record<string, number> = {};
+    let totalSplitCents = 0;
+    for (const m of members) {
+      const val = parseFloat(exactValues[m.id] || "0");
+      const cents = !isNaN(val) && val > 0 ? Math.round(val * 100) : 0;
+      centsRecord[m.id] = cents;
+      if (cents > 0) {
+        totalSplitCents += cents;
+      }
+    }
+    const valid = validateExactSplits(totalSplitCents, centsRecord);
+    const splits = Object.entries(centsRecord)
+      .filter(([, cents]) => cents > 0)
+      .map(([memberId, splitAmountCents]) => ({
+        memberId,
+        splitAmountCents,
+      }));
+    const error = valid
+      ? undefined
+      : "Please enter at least one member amount greater than $0.00.";
+    return {
+      valid,
+      totalSplitCents,
+      splits,
+      error,
+    };
+  }, [members, exactValues]);
+
+  // Live split computation (in $ Exact mode, totalCents is automatically summed from member amounts)
+  const isExactMode = type === "expense" && splitMode === "exact";
   const parsedAmount = parseFloat(amount);
-  const totalCents =
+  const manualTotalCents =
     !isNaN(parsedAmount) && parsedAmount > 0
       ? Math.round(parsedAmount * 100)
       : 0;
+  const totalCents = isExactMode
+    ? exactSummary.totalSplitCents
+    : manualTotalCents;
   const perPersonAmount =
     totalCents > 0 && selectedMembers.length > 0
       ? (totalCents / 100 / selectedMembers.length).toFixed(2)
@@ -720,41 +754,6 @@ export function SettleUpDashboard({
       splitMap,
     };
   }, [members, percentageValues, totalCents]);
-
-  // Live exact split validation for Add Transaction form
-  const exactSummary = useMemo(() => {
-    const centsRecord: Record<string, number> = {};
-    let totalSplitCents = 0;
-    for (const m of members) {
-      const val = parseFloat(exactValues[m.id] || "0");
-      const cents = !isNaN(val) ? Math.round(val * 100) : 0;
-      centsRecord[m.id] = cents;
-      if (cents > 0) {
-        totalSplitCents += cents;
-      }
-    }
-    const remainingCents = totalCents - totalSplitCents;
-    const valid = validateExactSplits(totalCents, centsRecord);
-    const splits = Object.entries(centsRecord)
-      .filter(([, cents]) => cents > 0)
-      .map(([memberId, splitAmountCents]) => ({
-        memberId,
-        splitAmountCents,
-      }));
-    const absDiff = (Math.abs(remainingCents) / 100).toFixed(2);
-    const error = valid
-      ? undefined
-      : remainingCents > 0
-        ? `${absDiff} remaining to allocate.`
-        : `Allocated ${absDiff} over the total amount.`;
-    return {
-      valid,
-      remainingCents,
-      totalSplitCents,
-      splits,
-      error,
-    };
-  }, [members, exactValues, totalCents]);
 
   // Export CSV (<slug>_<YYYY-MM-DD>_export.csv) — Available to all users in group header
   const handleExportCsv = () => {
@@ -815,7 +814,7 @@ export function SettleUpDashboard({
     }
   };
 
-  // Execute CSV Import into a New Group or Active Group (Super-Admin only)
+  // Execute CSV Import into a New Group or Active Group using Bulk Batch Inserts (Super-Admin only)
   const handleImportCsv = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isSuperAdmin || !user || !parsedCsv) return;
@@ -872,7 +871,7 @@ export function SettleUpDashboard({
         targetGroup = activeGroup;
       }
 
-      // 1. Ensure all CSV header member names exist in group_members
+      // 1. Batch-insert all missing CSV header member names in a single call and build name -> id map
       const { data: existingMemberRows } = await supabase
         .from("group_members")
         .select("id, group_id, display_name")
@@ -885,41 +884,74 @@ export function SettleUpDashboard({
         }
       }
 
+      const missingMembersToInsert: Array<{
+        group_id: string;
+        display_name: string;
+      }> = [];
+      const seenMissingLower = new Set<string>();
+
       for (const rawName of parsedCsv.memberNames) {
         const cleanName = rawName.trim();
         if (!cleanName) continue;
         const lower = cleanName.toLowerCase();
-        if (!memberIdByLowerName.has(lower)) {
-          const { data: insertedMem, error: memErr } = await supabase
-            .from("group_members")
-            .insert({
-              group_id: targetGroup.id,
-              display_name: cleanName,
-            })
-            .select("id, display_name")
-            .single();
+        if (!memberIdByLowerName.has(lower) && !seenMissingLower.has(lower)) {
+          seenMissingLower.add(lower);
+          missingMembersToInsert.push({
+            group_id: targetGroup.id,
+            display_name: cleanName,
+          });
+        }
+      }
 
-          if (memErr) {
-            setCsvError(
-              `Error adding member "${cleanName}": ${memErr.message}`
-            );
-            setIsImportingCsv(false);
-            return;
-          }
-          if (insertedMem) {
-            memberIdByLowerName.set(lower, insertedMem.id);
+      if (missingMembersToInsert.length > 0) {
+        const { data: insertedMembers, error: memErr } = await supabase
+          .from("group_members")
+          .insert(missingMembersToInsert)
+          .select("id, display_name");
+
+        if (memErr) {
+          setCsvError(`Error adding group members: ${memErr.message}`);
+          setIsImportingCsv(false);
+          return;
+        }
+
+        for (const m of insertedMembers || []) {
+          if (m.display_name) {
+            memberIdByLowerName.set(m.display_name.trim().toLowerCase(), m.id);
           }
         }
       }
 
-      // 2. Insert each transaction and its exact reconstructed splits
+      // 2. Build entire expensesToInsert and splitsToInsert arrays in memory using crypto.randomUUID()
+      const expensesToInsert: Array<Record<string, unknown>> = [];
+      const splitsToInsert: Array<Record<string, unknown>> = [];
+      const fallbackCurrencyById = new Map<string, string>();
+      const amountDollarsById = new Map<string, number>();
+
       for (const txn of parsedCsv.transactions) {
         const payerMemberId = memberIdByLowerName.get(
           txn.paidByMemberName.trim().toLowerCase()
         );
         if (!payerMemberId) continue;
 
-        const expensePayload: Record<string, unknown> = {
+        const expenseId =
+          typeof crypto !== "undefined" &&
+          typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+                const r = (Math.random() * 16) | 0;
+                const v = c === "x" ? r : (r & 0x3) | 0x8;
+                return v.toString(16);
+              });
+
+        fallbackCurrencyById.set(expenseId, txn.currency);
+        amountDollarsById.set(
+          expenseId,
+          Number((txn.amountCents / 100).toFixed(2))
+        );
+
+        expensesToInsert.push({
+          id: expenseId,
           group_id: targetGroup.id,
           paid_by_member_id: payerMemberId,
           description: txn.description,
@@ -927,13 +959,27 @@ export function SettleUpDashboard({
           currency: txn.currencySymbol,
           type: txn.type,
           date: txn.date || getTodayLocalDate(),
-        };
+        });
 
-        let { data: newExp, error: expError } = await supabase
+        for (const s of txn.splits) {
+          const mId = memberIdByLowerName.get(
+            s.memberName.trim().toLowerCase()
+          );
+          if (!mId) continue;
+          splitsToInsert.push({
+            expense_id: expenseId,
+            member_id: mId,
+            split_amount_cents: s.splitAmountCents,
+          });
+        }
+      }
+
+      // 3. Execute single bulk insert into expenses
+      if (expensesToInsert.length > 0) {
+        let bulkExpensesPayload = expensesToInsert;
+        let { error: expError } = await supabase
           .from("expenses")
-          .insert(expensePayload)
-          .select("id")
-          .single();
+          .insert(bulkExpensesPayload);
 
         for (let attempt = 0; attempt < 4 && expError; attempt++) {
           const msg = expError.message?.toLowerCase() || "";
@@ -941,100 +987,101 @@ export function SettleUpDashboard({
           if (
             (msg.includes("expenses_currency_check") ||
               msg.includes("currency")) &&
-            expensePayload.currency !== txn.currency
+            bulkExpensesPayload.some(
+              (row) => row.currency !== fallbackCurrencyById.get(row.id as string)
+            )
           ) {
-            expensePayload.currency = txn.currency;
+            bulkExpensesPayload = bulkExpensesPayload.map((row) => ({
+              ...row,
+              currency:
+                fallbackCurrencyById.get(row.id as string) || row.currency,
+            }));
             updated = true;
           }
-          if (msg.includes('"amount"') && !("amount" in expensePayload)) {
-            expensePayload.amount = Number((txn.amountCents / 100).toFixed(2));
+          if (
+            msg.includes('"amount"') &&
+            !("amount" in bulkExpensesPayload[0])
+          ) {
+            bulkExpensesPayload = bulkExpensesPayload.map((row) => ({
+              ...row,
+              amount: amountDollarsById.get(row.id as string) ?? 0,
+            }));
             updated = true;
           }
           if (
             msg.includes('"created_by"') &&
-            !("created_by" in expensePayload)
+            !("created_by" in bulkExpensesPayload[0])
           ) {
-            expensePayload.created_by = user.id;
+            bulkExpensesPayload = bulkExpensesPayload.map((row) => ({
+              ...row,
+              created_by: user.id,
+            }));
             updated = true;
           }
-          if (msg.includes('"payer_id"') && !("payer_id" in expensePayload)) {
-            expensePayload.payer_id = user.id || payerMemberId;
+          if (
+            msg.includes('"payer_id"') &&
+            !("payer_id" in bulkExpensesPayload[0])
+          ) {
+            bulkExpensesPayload = bulkExpensesPayload.map((row) => ({
+              ...row,
+              payer_id: user.id || row.paid_by_member_id,
+            }));
             updated = true;
           }
           if (!updated) break;
           const retry = await supabase
             .from("expenses")
-            .insert(expensePayload)
-            .select("id")
-            .single();
-          newExp = retry.data;
+            .insert(bulkExpensesPayload);
           expError = retry.error;
         }
 
-        if (expError || !newExp) {
-          setCsvError(
-            `Error importing transaction "${txn.description}": ${expError?.message || "Unknown error"}`
-          );
+        if (expError) {
+          setCsvError(`Error importing transactions: ${expError.message}`);
           setIsImportingCsv(false);
           return;
         }
+      }
 
-        let splitsPayload: Array<Record<string, unknown>> = txn.splits
-          .map((s) => {
-            const mId = memberIdByLowerName.get(
-              s.memberName.trim().toLowerCase()
-            );
-            if (!mId) return null;
-            return {
-              expense_id: newExp.id,
-              member_id: mId,
-              split_amount_cents: s.splitAmountCents,
-            };
-          })
-          .filter((s): s is NonNullable<typeof s> => s !== null);
+      // 4. Execute single bulk insert into expense_splits
+      if (splitsToInsert.length > 0) {
+        let bulkSplitsPayload = splitsToInsert;
+        let { error: splitsError } = await supabase
+          .from("expense_splits")
+          .insert(bulkSplitsPayload);
 
-        if (splitsPayload.length > 0) {
-          let { error: splitsError } = await supabase
-            .from("expense_splits")
-            .insert(splitsPayload);
-
-          for (
-            let attempt = 0;
-            attempt < 2 && splitsError && splitsPayload.length > 0;
-            attempt++
+        for (let attempt = 0; attempt < 2 && splitsError; attempt++) {
+          const msg = splitsError.message?.toLowerCase() || "";
+          let updated = false;
+          if (msg.includes('"amount"') && !("amount" in bulkSplitsPayload[0])) {
+            bulkSplitsPayload = bulkSplitsPayload.map((s) => ({
+              ...s,
+              amount: Number(
+                ((s.split_amount_cents as number) / 100).toFixed(2)
+              ),
+            }));
+            updated = true;
+          }
+          if (
+            msg.includes('"user_id"') &&
+            !("user_id" in bulkSplitsPayload[0])
           ) {
-            const msg = splitsError.message?.toLowerCase() || "";
-            let updated = false;
-            if (msg.includes('"amount"') && !("amount" in splitsPayload[0])) {
-              splitsPayload = splitsPayload.map((s) => ({
-                ...s,
-                amount: Number(
-                  ((s.split_amount_cents as number) / 100).toFixed(2)
-                ),
-              }));
-              updated = true;
-            }
-            if (msg.includes('"user_id"') && !("user_id" in splitsPayload[0])) {
-              splitsPayload = splitsPayload.map((s) => ({
-                ...s,
-                user_id: user.id || s.member_id,
-              }));
-              updated = true;
-            }
-            if (!updated) break;
-            const retrySplits = await supabase
-              .from("expense_splits")
-              .insert(splitsPayload);
-            splitsError = retrySplits.error;
+            bulkSplitsPayload = bulkSplitsPayload.map((s) => ({
+              ...s,
+              user_id: user.id || s.member_id,
+            }));
+            updated = true;
           }
+          if (!updated) break;
+          const retrySplits = await supabase
+            .from("expense_splits")
+            .insert(bulkSplitsPayload);
+          splitsError = retrySplits.error;
+        }
 
-          if (splitsError) {
-            setCsvError(
-              `Error importing splits for "${txn.description}": ${splitsError.message}`
-            );
-            setIsImportingCsv(false);
-            return;
-          }
+        if (splitsError) {
+          setCsvError(`Error importing splits: ${splitsError.message}`);
+          setIsImportingCsv(false);
+          return;
         }
       }
 
@@ -1537,10 +1584,10 @@ export function SettleUpDashboard({
         </aside>
 
         {/* Expense Entry & Settlement Panel */}
-        <section className="md:col-span-2 space-y-6">
+        <section className="md:col-span-2 min-w-0 space-y-6">
           {activeGroup ? (
-            <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4 overflow-hidden">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2.5 flex-wrap min-w-0">
                   <h2 className="text-xl font-bold text-slate-900 tracking-tight truncate">
                     {activeGroup.name}
@@ -1797,7 +1844,7 @@ export function SettleUpDashboard({
 
                   <div>
                     <label className="text-xs font-semibold text-slate-600 block mb-1">
-                      Amount & Currency
+                      Amount & Currency{isExactMode ? " (Auto-Summed)" : ""}
                     </label>
                     <div className="flex gap-2">
                       <div className="relative flex-1">
@@ -1807,11 +1854,31 @@ export function SettleUpDashboard({
                         <input
                           type="number"
                           step="0.01"
-                          placeholder="0.00"
-                          value={amount}
-                          onChange={(e) => setAmount(e.target.value)}
-                          className="w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                          required
+                          placeholder={isExactMode ? "Auto-summed" : "0.00"}
+                          value={
+                            isExactMode
+                              ? exactSummary.totalSplitCents > 0
+                                ? (exactSummary.totalSplitCents / 100).toFixed(2)
+                                : ""
+                              : amount
+                          }
+                          onChange={(e) => {
+                            if (!isExactMode) {
+                              setAmount(e.target.value);
+                            }
+                          }}
+                          readOnly={isExactMode}
+                          title={
+                            isExactMode
+                              ? "Automatically summed from individual $ Exact member amounts below"
+                              : undefined
+                          }
+                          className={`w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition ${
+                            isExactMode
+                              ? "bg-slate-50 text-slate-700 font-semibold cursor-default"
+                              : "bg-white text-slate-900"
+                          }`}
+                          required={!isExactMode}
                         />
                       </div>
                       <div className="flex border border-slate-300 rounded-lg p-0.5 bg-slate-100">
@@ -1909,7 +1976,14 @@ export function SettleUpDashboard({
                         </button>
                         <button
                           type="button"
-                          onClick={() => setSplitMode("exact")}
+                          onClick={() => {
+                            setSplitMode("exact");
+                            if (exactSummary.totalSplitCents > 0) {
+                              setAmount(
+                                (exactSummary.totalSplitCents / 100).toFixed(2)
+                              );
+                            }
+                          }}
                           className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
                             splitMode === "exact"
                               ? "bg-white text-blue-700 shadow-2xs"
@@ -2092,12 +2166,28 @@ export function SettleUpDashboard({
                                 min="0"
                                 placeholder="0.00"
                                 value={exactValues[m.id] ?? ""}
-                                onChange={(e) =>
-                                  setExactValues((prev) => ({
-                                    ...prev,
-                                    [m.id]: e.target.value,
-                                  }))
-                                }
+                                onChange={(e) => {
+                                  const nextVal = e.target.value;
+                                  const nextExact = {
+                                    ...exactValues,
+                                    [m.id]: nextVal,
+                                  };
+                                  setExactValues(nextExact);
+                                  let nextSumCents = 0;
+                                  for (const mem of members) {
+                                    const parsed = parseFloat(
+                                      nextExact[mem.id] || "0"
+                                    );
+                                    if (!isNaN(parsed) && parsed > 0) {
+                                      nextSumCents += Math.round(parsed * 100);
+                                    }
+                                  }
+                                  setAmount(
+                                    nextSumCents > 0
+                                      ? (nextSumCents / 100).toFixed(2)
+                                      : ""
+                                  );
+                                }}
                                 className="w-full pl-6 pr-2 py-1 border border-slate-300 rounded-lg text-xs text-right text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                               />
                             </div>
@@ -2119,18 +2209,14 @@ export function SettleUpDashboard({
                             <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                           )}
                           <span>
-                            Allocated: {currency}
-                            {(exactSummary.totalSplitCents / 100).toFixed(2)} of{" "}
-                            {currency}
-                            {(totalCents / 100).toFixed(2)}
+                            Auto-Summed Total: {currency}
+                            {(exactSummary.totalSplitCents / 100).toFixed(2)}
                           </span>
                         </span>
                         <span className="font-bold">
                           {exactSummary.valid
-                            ? "Exact Match"
-                            : exactSummary.remainingCents > 0
-                              ? `${currency}${(exactSummary.remainingCents / 100).toFixed(2)} remaining`
-                              : `${currency}${(Math.abs(exactSummary.remainingCents) / 100).toFixed(2)} over`}
+                            ? `${exactSummary.splits.length} ${exactSummary.splits.length === 1 ? "person" : "people"} allocated`
+                            : "Enter member amounts above"}
                         </span>
                       </div>
                     </div>

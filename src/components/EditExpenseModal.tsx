@@ -184,11 +184,45 @@ export default function EditExpenseModal({
     }
   };
 
+  // Live exact split calculation & auto-summed total
+  const exactSummary = useMemo(() => {
+    const centsRecord: Record<string, number> = {};
+    let totalSplitCents = 0;
+    for (const m of members) {
+      const val = parseFloat(exactValues[m.id] || "0");
+      const cents = !isNaN(val) && val > 0 ? Math.round(val * 100) : 0;
+      centsRecord[m.id] = cents;
+      if (cents > 0) {
+        totalSplitCents += cents;
+      }
+    }
+    const valid = validateExactSplits(totalSplitCents, centsRecord);
+    const splits = Object.entries(centsRecord)
+      .filter(([, cents]) => cents > 0)
+      .map(([memberId, splitAmountCents]) => ({
+        memberId,
+        splitAmountCents,
+      }));
+    const error = valid
+      ? undefined
+      : "Please enter at least one member amount greater than $0.00.";
+    return {
+      valid,
+      totalSplitCents,
+      splits,
+      error,
+    };
+  }, [members, exactValues]);
+
+  const isExactMode = type === "expense" && splitMode === "exact";
   const parsedAmount = parseFloat(amount);
-  const totalCents =
+  const manualTotalCents =
     !isNaN(parsedAmount) && parsedAmount > 0
       ? Math.round(parsedAmount * 100)
       : 0;
+  const totalCents = isExactMode
+    ? exactSummary.totalSplitCents
+    : manualTotalCents;
 
   const perPersonAmount =
     totalCents > 0 && selectedMembers.length > 0
@@ -229,41 +263,6 @@ export default function EditExpenseModal({
       splitMap,
     };
   }, [members, percentageValues, totalCents]);
-
-  // Live exact split validation
-  const exactSummary = useMemo(() => {
-    const centsRecord: Record<string, number> = {};
-    let totalSplitCents = 0;
-    for (const m of members) {
-      const val = parseFloat(exactValues[m.id] || "0");
-      const cents = !isNaN(val) ? Math.round(val * 100) : 0;
-      centsRecord[m.id] = cents;
-      if (cents > 0) {
-        totalSplitCents += cents;
-      }
-    }
-    const remainingCents = totalCents - totalSplitCents;
-    const valid = validateExactSplits(totalCents, centsRecord);
-    const splits = Object.entries(centsRecord)
-      .filter(([, cents]) => cents > 0)
-      .map(([memberId, splitAmountCents]) => ({
-        memberId,
-        splitAmountCents,
-      }));
-    const absDiff = (Math.abs(remainingCents) / 100).toFixed(2);
-    const error = valid
-      ? undefined
-      : remainingCents > 0
-        ? `${absDiff} remaining to allocate.`
-        : `Allocated ${absDiff} over the total amount.`;
-    return {
-      valid,
-      remainingCents,
-      totalSplitCents,
-      splits,
-      error,
-    };
-  }, [members, exactValues, totalCents]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -533,7 +532,7 @@ export default function EditExpenseModal({
 
           <div>
             <label className="text-xs font-semibold text-slate-600 block mb-1">
-              Amount & Currency
+              Amount & Currency{isExactMode ? " (Auto-Summed)" : ""}
             </label>
             <div className="flex gap-2">
               <div className="relative flex-1">
@@ -543,11 +542,31 @@ export default function EditExpenseModal({
                 <input
                   type="number"
                   step="0.01"
-                  placeholder="0.00"
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  className="w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                  required
+                  placeholder={isExactMode ? "Auto-summed" : "0.00"}
+                  value={
+                    isExactMode
+                      ? exactSummary.totalSplitCents > 0
+                        ? (exactSummary.totalSplitCents / 100).toFixed(2)
+                        : ""
+                      : amount
+                  }
+                  onChange={(e) => {
+                    if (!isExactMode) {
+                      setAmount(e.target.value);
+                    }
+                  }}
+                  readOnly={isExactMode}
+                  title={
+                    isExactMode
+                      ? "Automatically summed from individual $ Exact member amounts below"
+                      : undefined
+                  }
+                  className={`w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition ${
+                    isExactMode
+                      ? "bg-slate-50 text-slate-700 font-semibold cursor-default"
+                      : "bg-white text-slate-900"
+                  }`}
+                  required={!isExactMode}
                 />
               </div>
               <div className="flex border border-slate-300 rounded-lg p-0.5 bg-slate-100">
@@ -647,7 +666,14 @@ export default function EditExpenseModal({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setSplitMode("exact")}
+                  onClick={() => {
+                    setSplitMode("exact");
+                    if (exactSummary.totalSplitCents > 0) {
+                      setAmount(
+                        (exactSummary.totalSplitCents / 100).toFixed(2)
+                      );
+                    }
+                  }}
                   className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
                     splitMode === "exact"
                       ? "bg-white text-blue-700 shadow-2xs"
@@ -820,12 +846,26 @@ export default function EditExpenseModal({
                         min="0"
                         placeholder="0.00"
                         value={exactValues[m.id] ?? ""}
-                        onChange={(e) =>
-                          setExactValues((prev) => ({
-                            ...prev,
-                            [m.id]: e.target.value,
-                          }))
-                        }
+                        onChange={(e) => {
+                          const nextVal = e.target.value;
+                          const nextExact = {
+                            ...exactValues,
+                            [m.id]: nextVal,
+                          };
+                          setExactValues(nextExact);
+                          let nextSumCents = 0;
+                          for (const mem of members) {
+                            const parsed = parseFloat(nextExact[mem.id] || "0");
+                            if (!isNaN(parsed) && parsed > 0) {
+                              nextSumCents += Math.round(parsed * 100);
+                            }
+                          }
+                          setAmount(
+                            nextSumCents > 0
+                              ? (nextSumCents / 100).toFixed(2)
+                              : ""
+                          );
+                        }}
                         className="w-full pl-6 pr-2 py-1 border border-slate-300 rounded-lg text-xs text-right text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
                     </div>
@@ -847,18 +887,14 @@ export default function EditExpenseModal({
                     <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                   )}
                   <span>
-                    Allocated: {currency}
-                    {(exactSummary.totalSplitCents / 100).toFixed(2)} of{" "}
-                    {currency}
-                    {(totalCents / 100).toFixed(2)}
+                    Auto-Summed Total: {currency}
+                    {(exactSummary.totalSplitCents / 100).toFixed(2)}
                   </span>
                 </span>
                 <span className="font-bold">
                   {exactSummary.valid
-                    ? "Exact Match"
-                    : exactSummary.remainingCents > 0
-                      ? `${currency}${(exactSummary.remainingCents / 100).toFixed(2)} remaining`
-                      : `${currency}${(Math.abs(exactSummary.remainingCents) / 100).toFixed(2)} over`}
+                    ? `${exactSummary.splits.length} ${exactSummary.splits.length === 1 ? "person" : "people"} allocated`
+                    : "Enter member amounts above"}
                 </span>
               </div>
             </div>
