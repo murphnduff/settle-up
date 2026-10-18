@@ -348,53 +348,63 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
   // Edge Case 8: Custom Unequal Splits (% Percentage & $ Exact)
   // --------------------------------------------------------------------------
   it('Edge Case 8: splitAmountByPercentage and validateExactSplits handle custom unequal splits accurately', () => {
-    // 70% / 30% split of $100.00 (10000 cents)
-    const pctSplits = splitAmountByPercentage(10000, [
-      { memberId: murph.id, percentage: 70 },
-      { memberId: kev.id, percentage: 30 },
-    ]);
-    assert.strictEqual(pctSplits.length, 2);
-    assert.strictEqual(pctSplits[0].splitAmountCents, 7000);
-    assert.strictEqual(pctSplits[1].splitAmountCents, 3000);
+    // 70% / 30% split of $100.00 (10000 cents) and odd $10.01 (1001 cents)
+    const pctSplits = splitAmountByPercentage(10000, {
+      [murph.id]: 70,
+      [kev.id]: 30,
+    });
+    assert.strictEqual(pctSplits[murph.id], 7000);
+    assert.strictEqual(pctSplits[kev.id], 3000);
 
-    // Odd-penny percentage split: $10.00 (1000 cents) across 33.34%, 33.33%, 33.33%
-    const oddPctSplits = splitAmountByPercentage(1000, [
-      { memberId: murph.id, percentage: 33.34 },
-      { memberId: kev.id, percentage: 33.33 },
-      { memberId: fitz.id, percentage: 33.33 },
-    ]);
-    assert.strictEqual(oddPctSplits.length, 3);
+    const odd7030 = splitAmountByPercentage(1001, {
+      [murph.id]: 70,
+      [kev.id]: 30,
+    });
+    assert.strictEqual(odd7030[murph.id] + odd7030[kev.id], 1001);
+    assert.strictEqual(odd7030[murph.id], 701);
+    assert.strictEqual(odd7030[kev.id], 300);
+
+    // Odd-penny percentage split: $10.00 (1000 cents) across 33.33%, 33.33%, 33.34%
+    const oddPctSplits = splitAmountByPercentage(1000, {
+      [murph.id]: 33.33,
+      [kev.id]: 33.33,
+      [fitz.id]: 33.34,
+    });
     assert.strictEqual(
-      oddPctSplits.reduce((acc, s) => acc + s.splitAmountCents, 0),
+      oddPctSplits[murph.id] + oddPctSplits[kev.id] + oddPctSplits[fitz.id],
       1000
     );
-    assert.strictEqual(oddPctSplits[0].splitAmountCents, 334);
-    assert.strictEqual(oddPctSplits[1].splitAmountCents, 333);
-    assert.strictEqual(oddPctSplits[2].splitAmountCents, 333);
+    assert.strictEqual(oddPctSplits[murph.id], 333);
+    assert.strictEqual(oddPctSplits[kev.id], 333);
+    assert.strictEqual(oddPctSplits[fitz.id], 334);
 
-    // Invalid percentage sum (90%) returns empty array
-    const invalidPct = splitAmountByPercentage(10000, [
-      { memberId: murph.id, percentage: 60 },
-      { memberId: kev.id, percentage: 30 },
-    ]);
-    assert.strictEqual(invalidPct.length, 0);
+    // Invalid percentage sum (90%) returns empty object
+    const invalidPct = splitAmountByPercentage(10000, {
+      [murph.id]: 60,
+      [kev.id]: 30,
+    });
+    assert.deepStrictEqual(invalidPct, {});
 
     // Exact split validation: valid $100.00 = $65.25 + $34.75
-    const exactValid = validateExactSplits(10000, [
-      { memberId: murph.id, splitAmountCents: 6525 },
-      { memberId: kev.id, splitAmountCents: 3475 },
-    ]);
-    assert.strictEqual(exactValid.valid, true);
-    assert.strictEqual(exactValid.remainingCents, 0);
-    assert.strictEqual(exactValid.splits.length, 2);
+    const exactValid = validateExactSplits(10000, {
+      [murph.id]: 6525,
+      [kev.id]: 3475,
+    });
+    assert.strictEqual(exactValid, true);
 
-    // Exact split validation: $5.00 remaining
-    const exactUnder = validateExactSplits(10000, [
-      { memberId: murph.id, splitAmountCents: 6000 },
-      { memberId: kev.id, splitAmountCents: 3500 },
-    ]);
-    assert.strictEqual(exactUnder.valid, false);
-    assert.strictEqual(exactUnder.remainingCents, 500);
+    // Exact split validation: $5.00 remaining -> false
+    const exactUnder = validateExactSplits(10000, {
+      [murph.id]: 6000,
+      [kev.id]: 3500,
+    });
+    assert.strictEqual(exactUnder, false);
+
+    // Negative exact split -> false
+    const exactNegative = validateExactSplits(10000, {
+      [murph.id]: 11000,
+      [kev.id]: -1000,
+    });
+    assert.strictEqual(exactNegative, false);
   });
 
   // --------------------------------------------------------------------------

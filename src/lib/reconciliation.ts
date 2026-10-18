@@ -243,46 +243,44 @@ export function canDeleteMember(
   return { canDelete: true };
 }
 
-export interface PercentageInput {
-  memberId: string;
-  percentage: number;
-}
-
 /**
  * Distributes an integer amount in cents across members according to percentage shares.
  * Validates that the sum of percentages equals 100% (within 0.01% tolerance).
  * Uses the Largest Remainder Method (with deterministic tie-breaking by order) so that:
- * SUM(splitAmountCents) === totalAmountCents without losing or inventing pennies.
+ * SUM(allocated cents) === totalAmountCents without losing or inventing pennies.
  */
 export function splitAmountByPercentage(
   totalAmountCents: number,
-  memberPercentages: PercentageInput[] | Record<string, number>
-): SplitRecord[] {
+  memberPercentages: Record<string, number>
+): Record<string, number> {
   if (totalAmountCents <= 0 || !memberPercentages) {
-    return [];
+    return {};
   }
 
-  const normalized: PercentageInput[] = Array.isArray(memberPercentages)
-    ? memberPercentages.filter((p) => p.memberId && p.percentage > 0)
-    : Object.entries(memberPercentages)
-        .filter(([id, pct]) => Boolean(id) && pct > 0)
-        .map(([memberId, percentage]) => ({ memberId, percentage }));
+  const entries = Object.entries(memberPercentages).filter(
+    ([id, pct]) => Boolean(id) && typeof pct === 'number' && !isNaN(pct) && pct > 0
+  );
 
-  if (normalized.length === 0) {
-    return [];
+  if (entries.length === 0) {
+    return {};
   }
 
-  const totalPercentage = normalized.reduce((acc, p) => acc + p.percentage, 0);
+  // Reject any negative percentage
+  if (Object.values(memberPercentages).some((pct) => pct < 0)) {
+    return {};
+  }
+
+  const totalPercentage = entries.reduce((acc, [, pct]) => acc + pct, 0);
   if (Math.abs(totalPercentage - 100) > 0.01) {
-    return [];
+    return {};
   }
 
-  const rawAllocations = normalized.map((item, index) => {
-    const exactCents = (totalAmountCents * item.percentage) / 100;
+  const rawAllocations = entries.map(([memberId, percentage], index) => {
+    const exactCents = (totalAmountCents * percentage) / 100;
     const flooredCents = Math.floor(exactCents + 1e-9);
     const fraction = exactCents - flooredCents;
     return {
-      memberId: item.memberId,
+      memberId,
       index,
       flooredCents,
       fraction,
@@ -306,119 +304,39 @@ export function splitAmountByPercentage(
     remainder--;
   }
 
-  return rawAllocations.map((a) => {
-    const splitAmountCents = a.flooredCents + (bonusByIndex.get(a.index) || 0);
-    return {
-      memberId: a.memberId,
-      splitAmountCents,
-      userId: a.memberId,
-      amount: splitAmountCents / 100,
-    };
-  });
-}
+  const result: Record<string, number> = {};
+  for (const a of rawAllocations) {
+    result[a.memberId] = a.flooredCents + (bonusByIndex.get(a.index) || 0);
+  }
 
-export interface ExactSplitInput {
-  memberId: string;
-  splitAmountCents?: number;
-  amount?: number;
-}
-
-export interface ExactSplitsValidationResult {
-  valid: boolean;
-  remainingCents: number;
-  totalSplitCents: number;
-  splits: SplitRecord[];
-  error?: string;
+  return result;
 }
 
 /**
- * Validates exact cent/dollar split allocations against totalAmountCents.
- * Ensures SUM(splitAmountCents) === totalAmountCents with 0 remaining cents.
+ * Verifies that exact integer cent allocations are non-negative and sum strictly to totalAmountCents.
  */
 export function validateExactSplits(
   totalAmountCents: number,
-  exactInputs: ExactSplitInput[] | Record<string, number>
-): ExactSplitsValidationResult {
-  const normalizedCents: { memberId: string; splitAmountCents: number }[] =
-    Array.isArray(exactInputs)
-      ? exactInputs.map((item) => ({
-          memberId: item.memberId,
-          splitAmountCents:
-            typeof item.splitAmountCents === 'number'
-              ? Math.round(item.splitAmountCents)
-              : Math.round((item.amount || 0) * 100),
-        }))
-      : Object.entries(exactInputs || {}).map(([memberId, cents]) => ({
-          memberId,
-          splitAmountCents: Math.round(cents),
-        }));
-
-  const hasNegative = normalizedCents.some((s) => s.splitAmountCents < 0);
-  const activeSplits: SplitRecord[] = normalizedCents
-    .filter((s) => s.memberId && s.splitAmountCents > 0)
-    .map((s) => ({
-      memberId: s.memberId,
-      splitAmountCents: s.splitAmountCents,
-      userId: s.memberId,
-      amount: s.splitAmountCents / 100,
-    }));
-
-  const totalSplitCents = activeSplits.reduce(
-    (acc, s) => acc + s.splitAmountCents,
-    0
-  );
-  const remainingCents = Math.round(totalAmountCents) - totalSplitCents;
-
-  if (totalAmountCents <= 0) {
-    return {
-      valid: false,
-      remainingCents,
-      totalSplitCents,
-      splits: activeSplits,
-      error: 'Total amount must be greater than zero.',
-    };
+  memberAmountsCents: Record<string, number>
+): boolean {
+  if (totalAmountCents <= 0 || !memberAmountsCents) {
+    return false;
   }
 
-  if (hasNegative) {
-    return {
-      valid: false,
-      remainingCents,
-      totalSplitCents,
-      splits: activeSplits,
-      error: 'Split amounts cannot be negative.',
-    };
+  const values = Object.values(memberAmountsCents);
+  if (values.length === 0) {
+    return false;
   }
 
-  if (activeSplits.length === 0) {
-    return {
-      valid: false,
-      remainingCents,
-      totalSplitCents,
-      splits: [],
-      error: 'At least one member must have a split amount greater than zero.',
-    };
+  let sumCents = 0;
+  for (const rawCents of values) {
+    if (typeof rawCents !== 'number' || isNaN(rawCents) || rawCents < 0) {
+      return false;
+    }
+    sumCents += Math.round(rawCents);
   }
 
-  if (remainingCents !== 0) {
-    const absDiff = (Math.abs(remainingCents) / 100).toFixed(2);
-    return {
-      valid: false,
-      remainingCents,
-      totalSplitCents,
-      splits: activeSplits,
-      error:
-        remainingCents > 0
-          ? `${absDiff} remaining to allocate.`
-          : `Allocated ${absDiff} over the total amount.`,
-    };
-  }
-
-  return {
-    valid: true,
-    remainingCents: 0,
-    totalSplitCents,
-    splits: activeSplits,
-  };
+  return sumCents === Math.round(totalAmountCents);
 }
 
 // ============================================================================

@@ -197,20 +197,31 @@ export default function EditExpenseModal({
 
   // Live percentage summary
   const percentageSummary = useMemo(() => {
-    const inputs = members.map((m) => ({
-      memberId: m.id,
-      percentage: parseFloat(percentageValues[m.id] || "0") || 0,
-    }));
-    const totalPct = inputs.reduce((acc, i) => acc + i.percentage, 0);
+    const pctRecord: Record<string, number> = {};
+    let totalPct = 0;
+    for (const m of members) {
+      const pct = parseFloat(percentageValues[m.id] || "0") || 0;
+      pctRecord[m.id] = pct;
+      totalPct += pct;
+    }
     const remainingPct = 100 - totalPct;
-    const isValid = Math.abs(remainingPct) <= 0.01 && inputs.some((i) => i.percentage > 0);
-    const splits =
+    const isValid =
+      Math.abs(remainingPct) <= 0.01 &&
+      Object.values(pctRecord).some((p) => p > 0);
+    const allocatedRecord =
       isValid && totalCents > 0
-        ? splitAmountByPercentage(totalCents, inputs)
-        : [];
-    const splitMap = new Map(splits.map((s) => [s.memberId, s.splitAmountCents]));
+        ? splitAmountByPercentage(totalCents, pctRecord)
+        : {};
+    const splits = Object.entries(allocatedRecord).map(
+      ([memberId, splitAmountCents]) => ({
+        memberId,
+        splitAmountCents,
+      })
+    );
+    const splitMap = new Map(
+      splits.map((s) => [s.memberId, s.splitAmountCents])
+    );
     return {
-      inputs,
       totalPct,
       remainingPct,
       isValid,
@@ -221,14 +232,37 @@ export default function EditExpenseModal({
 
   // Live exact split validation
   const exactSummary = useMemo(() => {
-    const inputs = members.map((m) => {
+    const centsRecord: Record<string, number> = {};
+    let totalSplitCents = 0;
+    for (const m of members) {
       const val = parseFloat(exactValues[m.id] || "0");
-      return {
-        memberId: m.id,
-        splitAmountCents: !isNaN(val) && val > 0 ? Math.round(val * 100) : 0,
-      };
-    });
-    return validateExactSplits(totalCents, inputs);
+      const cents = !isNaN(val) ? Math.round(val * 100) : 0;
+      centsRecord[m.id] = cents;
+      if (cents > 0) {
+        totalSplitCents += cents;
+      }
+    }
+    const remainingCents = totalCents - totalSplitCents;
+    const valid = validateExactSplits(totalCents, centsRecord);
+    const splits = Object.entries(centsRecord)
+      .filter(([, cents]) => cents > 0)
+      .map(([memberId, splitAmountCents]) => ({
+        memberId,
+        splitAmountCents,
+      }));
+    const absDiff = (Math.abs(remainingCents) / 100).toFixed(2);
+    const error = valid
+      ? undefined
+      : remainingCents > 0
+        ? `${absDiff} remaining to allocate.`
+        : `Allocated ${absDiff} over the total amount.`;
+    return {
+      valid,
+      remainingCents,
+      totalSplitCents,
+      splits,
+      error,
+    };
   }, [members, exactValues, totalCents]);
 
   const handleSave = async (e: React.FormEvent) => {
