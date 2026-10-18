@@ -14,24 +14,20 @@ import {
   Trash2,
   Edit2,
   Share2,
+  Link2,
 } from "lucide-react";
 
 export interface GroupMember {
   id: string; // group_members.id
   groupId?: string;
-  userId?: string | null;
   name: string; // display_name
   displayName?: string;
-  email?: string | null;
-  invitedEmail?: string | null;
-  inviteToken?: string;
-  role: "admin" | "member";
 }
 
 export interface Group {
   id: string;
   name: string;
-  created_by: string;
+  created_by?: string | null;
   created_at?: string;
 }
 
@@ -40,7 +36,8 @@ interface MemberInviteModalProps {
   onClose: () => void;
   group: Group | null;
   currentMembers: GroupMember[];
-  currentUserId: string;
+  isSuperAdmin: boolean;
+  activeMemberId?: string;
   expenses: ExpenseRecord[];
   onMemberAdded: () => void;
 }
@@ -50,16 +47,16 @@ export default function MemberInviteModal({
   onClose,
   group,
   currentMembers,
-  currentUserId,
+  isSuperAdmin,
+  activeMemberId,
   expenses,
   onMemberAdded,
 }: MemberInviteModalProps) {
   const supabase = createClient();
   const dialogRef = useRef<HTMLDialogElement>(null);
 
-  // Form states for pre-creating a member
+  // Form state for adding a member (display_name only)
   const [displayName, setDisplayName] = useState("");
-  const [email, setEmail] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{
     type: "success" | "error" | "info" | "warning";
@@ -67,17 +64,12 @@ export default function MemberInviteModal({
   } | null>(null);
 
   // Copy tracking states
-  const [copiedTokenId, setCopiedTokenId] = useState<string | null>(null);
+  const [copiedGroupLink, setCopiedGroupLink] = useState(false);
+  const [copiedMemberId, setCopiedMemberId] = useState<string | null>(null);
 
   // Renaming state
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
-
-  const isCurrentAdmin =
-    group?.created_by === currentUserId ||
-    currentMembers.some(
-      (m) => m.userId === currentUserId && m.role === "admin"
-    );
 
   // Sync native <dialog> element with isOpen prop
   useEffect(() => {
@@ -98,7 +90,6 @@ export default function MemberInviteModal({
   const handleClose = () => {
     setStatusMessage(null);
     setDisplayName("");
-    setEmail("");
     setEditingMemberId(null);
     onClose();
   };
@@ -139,31 +130,49 @@ export default function MemberInviteModal({
     }
   };
 
-  const handleCopyMemberTokenLink = async (member: GroupMember) => {
-    if (!member.inviteToken) return;
-    const url = `${window.location.origin}/join?token=${member.inviteToken}`;
+  const getGroupShareUrl = () => {
+    if (!group) return "";
+    const origin =
+      typeof window !== "undefined"
+        ? window.location.origin
+        : "https://split.murphnduff.org";
+    return `${origin}/g/${group.id}`;
+  };
+
+  const handleCopyGroupLink = async () => {
+    if (!group) return;
+    const url = getGroupShareUrl();
     const ok = await copyToClipboard(url);
     if (ok) {
-      setCopiedTokenId(member.id);
-      setTimeout(() => setCopiedTokenId(null), 2500);
+      setCopiedGroupLink(true);
+      setTimeout(() => setCopiedGroupLink(false), 2500);
     }
   };
 
-  // Pre-create member (always starts as unclaimed with user_id = null)
-  const handlePrecreateMember = async (e: React.FormEvent) => {
+  const handleCopyMemberLink = async (member: GroupMember) => {
+    if (!group) return;
+    const url = `${getGroupShareUrl()}?m=${member.id}`;
+    const ok = await copyToClipboard(url);
+    if (ok) {
+      setCopiedMemberId(member.id);
+      setTimeout(() => setCopiedMemberId(null), 2500);
+    }
+  };
+
+  // Add member (Super-Admin only, display_name only)
+  const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!group) return;
 
-    if (!isCurrentAdmin) {
+    if (!isSuperAdmin) {
       setStatusMessage({
         type: "error",
-        text: "Only group admins can invite or add members.",
+        text: "Only the Super-Admin (murph@murphnduff.org) can add or remove members.",
       });
       return;
     }
 
     const trimmedName = displayName.trim();
-    const trimmedEmail = email.trim().toLowerCase();
 
     if (!trimmedName) {
       setStatusMessage({
@@ -173,11 +182,9 @@ export default function MemberInviteModal({
       return;
     }
 
-    // Check for duplicates
+    // Case-insensitive duplicate check within this group
     const duplicate = currentMembers.find(
-      (m) =>
-        m.name.toLowerCase() === trimmedName.toLowerCase() ||
-        (trimmedEmail && m.invitedEmail?.toLowerCase() === trimmedEmail)
+      (m) => m.name.trim().toLowerCase() === trimmedName.toLowerCase()
     );
     if (duplicate) {
       setStatusMessage({
@@ -191,15 +198,11 @@ export default function MemberInviteModal({
     setStatusMessage(null);
 
     try {
-      // Always insert with user_id = null so member has a claimable invite token!
       const { error: insertError } = await supabase
         .from("group_members")
         .insert({
           group_id: group.id,
           display_name: trimmedName,
-          invited_email: trimmedEmail || null,
-          role: "member",
-          user_id: null,
         });
 
       if (insertError) {
@@ -212,10 +215,9 @@ export default function MemberInviteModal({
 
       setStatusMessage({
         type: "success",
-        text: `Added "${trimmedName}"! Copy their invite link below and send it to them via email or text to join.`,
+        text: `Added "${trimmedName}"! Share the group link or their direct link below.`,
       });
       setDisplayName("");
-      setEmail("");
       onMemberAdded();
     } catch (err: unknown) {
       const message =
@@ -228,14 +230,28 @@ export default function MemberInviteModal({
 
   // Rename member
   const handleRenameMember = async (memberId: string) => {
-    if (!editingName.trim()) {
+    const trimmed = editingName.trim();
+    if (!trimmed) {
       setEditingMemberId(null);
+      return;
+    }
+
+    const duplicate = currentMembers.find(
+      (m) =>
+        m.id !== memberId &&
+        m.name.trim().toLowerCase() === trimmed.toLowerCase()
+    );
+    if (duplicate) {
+      setStatusMessage({
+        type: "warning",
+        text: `"${duplicate.name}" is already in this group.`,
+      });
       return;
     }
 
     const { error } = await supabase
       .from("group_members")
-      .update({ display_name: editingName.trim() })
+      .update({ display_name: trimmed })
       .eq("id", memberId);
 
     if (error) {
@@ -250,9 +266,9 @@ export default function MemberInviteModal({
     }
   };
 
-  // Delete member with Section 2 Deletion Guard
+  // Delete member with Section 2 Deletion Guard (Super-Admin only)
   const handleDeleteMember = async (member: GroupMember) => {
-    if (!isCurrentAdmin) return;
+    if (!isSuperAdmin) return;
 
     if (!canDeleteMember(member.id, expenses)) {
       setStatusMessage({
@@ -298,12 +314,12 @@ export default function MemberInviteModal({
       }}
       className="m-auto p-0 rounded-2xl shadow-2xl border border-slate-200 bg-white max-w-lg w-full backdrop:bg-slate-900/60 backdrop:backdrop-blur-xs open:animate-in open:fade-in-0 open:zoom-in-95"
     >
-      <div className="p-6 space-y-6">
+      <div className="p-6 space-y-5">
         {/* Header */}
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
             <div className="p-2.5 bg-blue-50 text-blue-600 rounded-xl">
-              {isCurrentAdmin ? (
+              {isSuperAdmin ? (
                 <UserPlus className="w-5 h-5" />
               ) : (
                 <Users className="w-5 h-5" />
@@ -314,12 +330,13 @@ export default function MemberInviteModal({
                 id="invite-modal-title"
                 className="text-lg font-bold text-slate-900"
               >
-                {isCurrentAdmin ? "Manage Members" : "Group Members"} • {group?.name || "Group"}
+                {isSuperAdmin ? "Manage Members" : "Group Members & Links"} •{" "}
+                {group?.name || "Group"}
               </h2>
               <p className="text-xs text-slate-500">
-                {isCurrentAdmin
-                  ? "Pre-create members, assign expenses immediately, and copy invite links to share."
-                  : "View members of this group."}
+                {isSuperAdmin
+                  ? "Add member profiles and share no-login group or member links."
+                  : "Copy the group link or your direct member link to share."}
               </p>
             </div>
           </div>
@@ -332,6 +349,44 @@ export default function MemberInviteModal({
             <X className="w-5 h-5" />
           </button>
         </div>
+
+        {/* Shareable Group URL Card */}
+        {group && (
+          <div className="p-3.5 bg-blue-50/70 border border-blue-200 rounded-xl space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <span className="text-xs font-bold text-blue-900 flex items-center gap-1.5">
+                  <Link2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  Main Group Link (No Login Required)
+                </span>
+                <p className="text-[11px] text-blue-700 truncate mt-0.5 font-mono">
+                  {getGroupShareUrl()}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyGroupLink}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 shrink-0 transition cursor-pointer shadow-2xs ${
+                  copiedGroupLink
+                    ? "bg-emerald-600 text-white"
+                    : "bg-blue-600 hover:bg-blue-700 text-white"
+                }`}
+              >
+                {copiedGroupLink ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    Copied!
+                  </>
+                ) : (
+                  <>
+                    <Share2 className="w-3.5 h-3.5" />
+                    Copy Group Link
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Status Message Banner */}
         {statusMessage && (
@@ -355,41 +410,29 @@ export default function MemberInviteModal({
           </div>
         )}
 
-        {/* Section 1: Pre-Create Member Form (Only for Group Admins) */}
-        {isCurrentAdmin ? (
-          <form onSubmit={handlePrecreateMember} className="space-y-3">
+        {/* Section 1: Add Member Form (Strictly Super-Admin Only, display_name only) */}
+        {isSuperAdmin ? (
+          <form onSubmit={handleAddMember} className="space-y-2.5">
             <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
               <UserPlus className="w-3.5 h-3.5 text-slate-500" />
-              Add Member Profile
+              Add Member to Group
             </label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <div className="flex gap-2">
               <input
                 type="text"
-                placeholder="Name (e.g. Kev, Fitz)"
+                placeholder="Member display name (e.g. Kev, Fitz, Sarah)"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 disabled={isSubmitting}
-                className="border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                className="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                 required
               />
-              <input
-                type="email"
-                placeholder="Email (Optional reference)"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                disabled={isSubmitting}
-                className="border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-              />
-            </div>
-            <div className="flex items-center justify-between gap-2 pt-1">
-              <p className="text-[11px] text-slate-400">
-                You can assign expenses to them immediately. Copy their invite link below to send to them!
-              </p>
               <button
                 type="submit"
                 disabled={isSubmitting || !displayName.trim()}
-                className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
+                className="bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
               >
+                <UserPlus className="w-3.5 h-3.5" />
                 {isSubmitting ? "Adding..." : "Add Member"}
               </button>
             </div>
@@ -397,180 +440,162 @@ export default function MemberInviteModal({
         ) : (
           <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 flex items-center gap-2">
             <Shield className="w-4 h-4 text-slate-400 shrink-0" />
-            <span>You are a member of this group. Only group admins can invite or remove members.</span>
+            <span>
+              Anyone with the group link can add or edit transactions. Only the Super-Admin can add or remove group members.
+            </span>
           </div>
         )}
 
-        {/* Section 2: Current Group Members & Unique Claim Links */}
+        {/* Section 2: Current Group Members & Pre-Selected Direct Links */}
         <div className="space-y-2 pt-2 border-t border-slate-100">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
               <Users className="w-3.5 h-3.5 text-slate-500" />
               Members ({currentMembers.length})
             </h3>
+            <span className="text-[11px] text-slate-400">
+              Direct links auto-select that member
+            </span>
           </div>
 
           <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-            {currentMembers.map((member) => {
-              const isCurrentUser =
-                member.userId === currentUserId || member.id === currentUserId;
-              const isUnclaimed = !member.userId;
-              const isEditing = editingMemberId === member.id;
-              const canEditThisMember = isCurrentAdmin || isCurrentUser;
-              const hasTx = !canDeleteMember(member.id, expenses);
+            {currentMembers.length === 0 ? (
+              <p className="text-xs text-slate-400 italic py-4 text-center">
+                No members in this group yet.
+              </p>
+            ) : (
+              currentMembers.map((member) => {
+                const isSelectedIdentity = member.id === activeMemberId;
+                const isEditing = editingMemberId === member.id;
+                const canEditThisMember = isSuperAdmin || isSelectedIdentity;
+                const hasTx = !canDeleteMember(member.id, expenses);
 
-              const initials = (member.name || "M")
-                .split(" ")
-                .map((n) => n[0])
-                .join("")
-                .slice(0, 2)
-                .toUpperCase();
+                const initials = (member.name || "M")
+                  .split(" ")
+                  .map((n) => n[0])
+                  .join("")
+                  .slice(0, 2)
+                  .toUpperCase();
 
-              return (
-                <div
-                  key={member.id}
-                  className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs gap-2"
-                >
-                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                    <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 font-bold flex items-center justify-center text-xs shrink-0">
-                      {initials}
-                    </div>
+                return (
+                  <div
+                    key={member.id}
+                    className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50 border border-slate-200/80 text-xs gap-2"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                      <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 font-bold flex items-center justify-center text-xs shrink-0">
+                        {initials}
+                      </div>
 
-                    <div className="min-w-0 flex-1">
-                      {isEditing ? (
-                        <div className="flex items-center gap-1.5">
-                          <input
-                            type="text"
-                            value={editingName}
-                            onChange={(e) => setEditingName(e.target.value)}
-                            className="border border-slate-300 rounded px-2 py-0.5 text-xs text-slate-900 bg-white"
-                            autoFocus
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                handleRenameMember(member.id);
-                              } else if (e.key === "Escape") {
-                                setEditingMemberId(null);
-                              }
-                            }}
-                          />
-                          <button
-                            type="button"
-                            onClick={() => handleRenameMember(member.id)}
-                            className="text-emerald-600 hover:text-emerald-700 font-bold px-1"
-                          >
-                            Save
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setEditingMemberId(null)}
-                            className="text-slate-400 hover:text-slate-600 px-1"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-slate-900 truncate">
-                            {member.name}
-                          </span>
-                          {isCurrentUser && (
-                            <span className="text-[10px] text-slate-400 font-normal">
-                              (You)
-                            </span>
-                          )}
-                          {canEditThisMember && (
+                      <div className="min-w-0 flex-1">
+                        {isEditing ? (
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="text"
+                              value={editingName}
+                              onChange={(e) => setEditingName(e.target.value)}
+                              className="border border-slate-300 rounded px-2 py-0.5 text-xs text-slate-900 bg-white"
+                              autoFocus
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  handleRenameMember(member.id);
+                                } else if (e.key === "Escape") {
+                                  setEditingMemberId(null);
+                                }
+                              }}
+                            />
                             <button
                               type="button"
-                              onClick={() => {
-                                setEditingMemberId(member.id);
-                                setEditingName(member.name);
-                              }}
-                              title="Rename"
-                              className="text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                              onClick={() => handleRenameMember(member.id)}
+                              className="text-emerald-600 hover:text-emerald-700 font-bold px-1 cursor-pointer"
                             >
-                              <Edit2 className="w-3 h-3" />
+                              Save
                             </button>
-                          )}
-                        </div>
-                      )}
-
-                      <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                        {isUnclaimed ? (
-                          <span className="inline-flex items-center px-1.5 py-0.2 text-[9px] font-semibold rounded bg-amber-50 text-amber-700 border border-amber-200">
-                            Unclaimed Profile
-                          </span>
+                            <button
+                              type="button"
+                              onClick={() => setEditingMemberId(null)}
+                              className="text-slate-400 hover:text-slate-600 px-1 cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
                         ) : (
-                          <span className="inline-flex items-center px-1.5 py-0.2 text-[9px] font-semibold rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
-                            Active Account
-                          </span>
-                        )}
-                        {member.role === "admin" && (
-                          <span className="inline-flex items-center gap-0.5 text-[9px] font-bold text-indigo-600">
-                            <Shield className="w-2.5 h-2.5" />
-                            Admin
-                          </span>
-                        )}
-                        {member.invitedEmail && (
-                          <span className="text-[10px] text-slate-500 truncate max-w-[140px]">
-                            {member.invitedEmail}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-semibold text-slate-900 truncate">
+                              {member.name}
+                            </span>
+                            {isSelectedIdentity && (
+                              <span className="text-[10px] text-blue-600 font-semibold">
+                                (You)
+                              </span>
+                            )}
+                            {canEditThisMember && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingMemberId(member.id);
+                                  setEditingName(member.name);
+                                }}
+                                title="Rename member"
+                                className="text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                              >
+                                <Edit2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
                         )}
                       </div>
                     </div>
-                  </div>
 
-                  {/* Right side actions */}
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    {/* Always show Copy Invite Link for unclaimed members (even if they entered an email) */}
-                    {isUnclaimed && member.inviteToken && (
+                    {/* Right side actions: Copy Direct Member Link + Super-Admin Delete */}
+                    <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
-                        onClick={() => handleCopyMemberTokenLink(member)}
-                        title={`Copy join link for ${member.name}`}
+                        onClick={() => handleCopyMemberLink(member)}
+                        title={`Copy direct link pre-selected as ${member.name}`}
                         className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 transition cursor-pointer ${
-                          copiedTokenId === member.id
+                          copiedMemberId === member.id
                             ? "bg-emerald-600 text-white"
-                            : "bg-blue-600 text-white hover:bg-blue-700 shadow-2xs"
+                            : "bg-white text-slate-700 border border-slate-200 hover:bg-slate-100"
                         }`}
                       >
-                        {copiedTokenId === member.id ? (
+                        {copiedMemberId === member.id ? (
                           <>
                             <Check className="w-3 h-3" />
-                            Copied Link
+                            Copied
                           </>
                         ) : (
                           <>
                             <Share2 className="w-3 h-3" />
-                            Copy Invite Link
+                            Copy {member.name}&apos;s Link
                           </>
                         )}
                       </button>
-                    )}
 
-                    {/* Delete member guard button (Admins only) */}
-                    {isCurrentAdmin && !isCurrentUser && (
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteMember(member)}
-                        title={
-                          hasTx
-                            ? "Cannot delete: Member has transactions"
-                            : "Remove member"
-                        }
-                        disabled={hasTx}
-                        className={`p-1.5 rounded-lg transition ${
-                          hasTx
-                            ? "text-slate-300 cursor-not-allowed opacity-50"
-                            : "text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer"
-                        }`}
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+                      {isSuperAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteMember(member)}
+                          title={
+                            hasTx
+                              ? "Cannot delete: Member has transactions"
+                              : "Remove member"
+                          }
+                          disabled={hasTx}
+                          className={`p-1.5 rounded-lg transition ${
+                            hasTx
+                              ? "text-slate-300 cursor-not-allowed opacity-50"
+                              : "text-slate-400 hover:text-red-600 hover:bg-red-50 cursor-pointer"
+                          }`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
         </div>
 

@@ -1,6 +1,13 @@
 "use client";
 
-import { useEffect, useState, useTransition, useMemo, useCallback } from "react";
+import {
+  useEffect,
+  useState,
+  useTransition,
+  useMemo,
+  useCallback,
+  Suspense,
+} from "react";
 import { createClient } from "@/lib/supabase";
 import {
   calculateSettlements,
@@ -20,25 +27,80 @@ import {
   CheckCircle2,
   Trash2,
   LogOut,
+  LogIn,
   Plus,
   Receipt,
   ArrowRightLeft,
   Wallet,
   Sparkles,
   Edit3,
+  Share2,
+  Check,
+  Shield,
+  UserCheck,
 } from "lucide-react";
 import type { User } from "@supabase/supabase-js";
 
-export default function App() {
+const SUPER_ADMIN_EMAIL = "murph@murphnduff.org";
+const RECENT_GROUPS_STORAGE_KEY = "settle_up_recent_groups";
+const memberStorageKey = (groupId: string) => `settle_up_member_${groupId}`;
+
+function getRecentGroupIds(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(RECENT_GROUPS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function addRecentGroupId(groupId: string): string[] {
+  if (typeof window === "undefined" || !groupId) return [];
+  try {
+    const existing = getRecentGroupIds().filter((id) => id !== groupId);
+    const updated = [groupId, ...existing].slice(0, 25);
+    localStorage.setItem(RECENT_GROUPS_STORAGE_KEY, JSON.stringify(updated));
+    return updated;
+  } catch {
+    return [groupId];
+  }
+}
+
+function removeRecentGroupId(groupId: string): void {
+  if (typeof window === "undefined" || !groupId) return;
+  try {
+    const updated = getRecentGroupIds().filter((id) => id !== groupId);
+    localStorage.setItem(RECENT_GROUPS_STORAGE_KEY, JSON.stringify(updated));
+    localStorage.removeItem(memberStorageKey(groupId));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function SettleUpDashboard({
+  initialGroupId,
+}: {
+  initialGroupId?: string;
+}) {
   const supabase = useMemo(() => createClient(), []);
   const [user, setUser] = useState<User | null>(null);
+  const [authInitialized, setAuthInitialized] = useState(false);
   const [groups, setGroups] = useState<Group[]>([]);
-  const [activeGroupId, setActiveGroupId] = useState<string>("");
+  const [activeGroupId, setActiveGroupId] = useState<string>(
+    initialGroupId || ""
+  );
   const [members, setMembers] = useState<GroupMember[]>([]);
+  const [activeMemberId, setActiveMemberId] = useState<string>("");
   const [newGroupName, setNewGroupName] = useState("");
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
+  const [copiedGroupLink, setCopiedGroupLink] = useState(false);
   const [historyCurrencyFilter, setHistoryCurrencyFilter] = useState<
     "all" | "$" | "€"
   >("all");
@@ -46,26 +108,6 @@ export default function App() {
     type: "success" | "error";
     message: string;
   } | null>(null);
-
-  // Lazy-initialize pending invite from URL or sessionStorage without triggering an effect
-  const [hasPendingInvite] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    const params = new URLSearchParams(window.location.search);
-    const joinId = params.get("join");
-    const token = params.get("token");
-    if (token) {
-      sessionStorage.setItem("settle_up_invite_token", token);
-      return true;
-    }
-    if (joinId) {
-      sessionStorage.setItem("settle_up_join_group", joinId);
-      return true;
-    }
-    return (
-      !!sessionStorage.getItem("settle_up_invite_token") ||
-      !!sessionStorage.getItem("settle_up_join_group")
-    );
-  });
 
   // Form state
   const [description, setDescription] = useState("");
@@ -76,6 +118,12 @@ export default function App() {
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [, startTransition] = useTransition();
 
+  // Super-Admin strictly restricted to murph@murphnduff.org
+  const isSuperAdmin = useMemo(
+    () => user?.email?.toLowerCase() === SUPER_ADMIN_EMAIL,
+    [user]
+  );
+
   // Active group derived
   const activeGroup = useMemo(
     () => groups.find((g) => g.id === activeGroupId) || null,
@@ -84,42 +132,41 @@ export default function App() {
 
   // Auth listener
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => setUser(data.user));
+    supabase.auth.getUser().then(({ data }) => {
+      setUser(data.user);
+      setAuthInitialized(true);
+    });
     const { data: authListener } = supabase.auth.onAuthStateChange(
       (_, session) => {
         setUser(session?.user ?? null);
+        setAuthInitialized(true);
       }
     );
     return () => authListener.subscription.unsubscribe();
   }, [supabase]);
 
-  // Refresh members callback
+  // Refresh members callback (queries only valid schema columns)
   const refreshMembers = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
       const { data } = await supabase
         .from("group_members")
-        .select("id, group_id, user_id, display_name, invited_email, invite_token, role")
-        .eq("group_id", groupId);
+        .select("id, group_id, display_name, created_at")
+        .eq("group_id", groupId)
+        .order("created_at", { ascending: true });
 
       if (data) {
         const list: GroupMember[] = data.map((m) => ({
           id: m.id,
           groupId: m.group_id,
-          userId: m.user_id,
           name: m.display_name || "Member",
           displayName: m.display_name,
-          email: m.invited_email,
-          invitedEmail: m.invited_email,
-          inviteToken: m.invite_token,
-          role: m.role || "member",
         }));
         setMembers(list);
         setSelectedMembers((prev) => {
           if (prev.length === 0) {
             return list.map((u) => u.id);
           }
-          // retain currently selected members that still exist in the group
           const valid = prev.filter((id) => list.some((u) => u.id === id));
           return valid.length > 0 ? valid : list.map((u) => u.id);
         });
@@ -128,14 +175,14 @@ export default function App() {
     [supabase]
   );
 
-  // Refresh expenses callback
+  // Refresh expenses callback (queries only valid schema columns)
   const refreshExpenses = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
       const { data } = await supabase
         .from("expenses")
         .select(
-          "id, paid_by_member_id, description, amount_cents, currency, type, date, created_by, expense_splits(member_id, split_amount_cents)"
+          "id, paid_by_member_id, created_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
         )
         .eq("group_id", groupId)
         .order("date", { ascending: false });
@@ -154,9 +201,10 @@ export default function App() {
             amount: amt,
             amountCents: amtCents,
             currency: curr,
-            type: (e.type === "payment" ? "payment" : "expense") as "expense" | "payment",
+            type: (e.type === "payment" ? "payment" : "expense") as
+              | "expense"
+              | "payment",
             date: e.date,
-            createdBy: e.created_by,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             splits: (e.expense_splits || []).map((s: any) => {
               const splitCents = Number(s.split_amount_cents || 0);
@@ -175,146 +223,144 @@ export default function App() {
     [supabase]
   );
 
-  // Load groups or handle invite token / join link when user is authenticated
+  // Load groups based on Super-Admin status or localStorage recent groups + URL group
   useEffect(() => {
-    if (!user) return;
+    if (!authInitialized) return;
+    let cancelled = false;
 
     const params =
       typeof window !== "undefined"
         ? new URLSearchParams(window.location.search)
         : null;
+    const queryGroupId = params?.get("groupId") || params?.get("join") || "";
+    const preselectedMemberParam = params?.get("m") || "";
+    const targetGroupId = initialGroupId || queryGroupId;
 
-    const pendingToken =
-      params?.get("token") ||
-      (typeof window !== "undefined"
-        ? sessionStorage.getItem("settle_up_invite_token")
-        : null);
-
-    const joinId =
-      params?.get("join") ||
-      (typeof window !== "undefined"
-        ? sessionStorage.getItem("settle_up_join_group")
-        : null);
-
-    const targetGroupId = params?.get("groupId");
-
-    // Clean URL parameters
-    if (typeof window !== "undefined" && (pendingToken || joinId || targetGroupId)) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("token");
-      url.searchParams.delete("join");
-      url.searchParams.delete("groupId");
-      window.history.replaceState({}, "", url.pathname + (url.search ? url.search : ""));
+    // Persist target group and ?m= member in localStorage
+    if (targetGroupId) {
+      addRecentGroupId(targetGroupId);
+      if (preselectedMemberParam && typeof window !== "undefined") {
+        localStorage.setItem(
+          memberStorageKey(targetGroupId),
+          preselectedMemberParam
+        );
+      }
     }
 
-    async function initializeGroups() {
-      const currentUser = user;
-      if (!currentUser) return;
+    async function loadGroups() {
+      if (isSuperAdmin) {
+        // Super-Admin sees ALL groups
+        const { data: allGroups } = await supabase
+          .from("groups")
+          .select("id, name, created_by, created_at")
+          .order("created_at", { ascending: false });
 
-      // 1. Process pending token invite
-      if (pendingToken) {
-        sessionStorage.removeItem("settle_up_invite_token");
-        try {
-          const { data, error } = await supabase.rpc("claim_invite_token", {
-            p_token: pendingToken,
-          });
-          if (!error && data?.group_id) {
-            setNotification({
-              type: "success",
-              message: "Welcome! You have successfully claimed your group member spot.",
-            });
-            setActiveGroupId(data.group_id);
-          }
-        } catch (err) {
-          console.error("Failed to claim token:", err);
-        }
-      } else if (joinId) {
-        // 2. Process legacy group join
-        sessionStorage.removeItem("settle_up_join_group");
-        const { data: existing } = await supabase
-          .from("group_members")
-          .select("id")
-          .eq("group_id", joinId)
-          .eq("user_id", currentUser.id)
-          .maybeSingle();
-
-        if (!existing) {
-          const { error } = await supabase.from("group_members").insert({
-            group_id: joinId,
-            user_id: currentUser.id,
-            display_name:
-              currentUser.user_metadata?.full_name ||
-              currentUser.email?.split("@")[0] ||
-              "Member",
-            role: "member",
-          });
-          if (!error) {
-            setNotification({
-              type: "success",
-              message: "Welcome! You have successfully joined the group.",
-            });
-          }
-        }
-        setActiveGroupId(joinId);
-      } else if (targetGroupId) {
-        setActiveGroupId(targetGroupId);
-      }
-
-      // 3. Fetch user groups
-      const { data: userGroups } = await supabase.from("groups").select("*");
-      if (userGroups && userGroups.length > 0) {
-        setGroups(userGroups);
+        if (cancelled) return;
+        const list = allGroups || [];
+        setGroups(list);
         setActiveGroupId((prev) => {
-          if (prev && userGroups.some((g: Group) => g.id === prev)) {
+          if (targetGroupId && list.some((g) => g.id === targetGroupId)) {
+            return targetGroupId;
+          }
+          if (prev && list.some((g) => g.id === prev)) {
             return prev;
           }
-          return userGroups[0].id;
+          return list[0]?.id || "";
         });
       } else {
-        setGroups([]);
-        setActiveGroupId("");
+        // Regular visitors / non-admin users ONLY see groups from their recent_groups localStorage or URL
+        const recentIds = getRecentGroupIds();
+        if (recentIds.length === 0) {
+          if (!cancelled) {
+            setGroups([]);
+            setActiveGroupId("");
+          }
+          return;
+        }
+
+        const { data: recentGroups } = await supabase
+          .from("groups")
+          .select("id, name, created_by, created_at")
+          .in("id", recentIds);
+
+        if (cancelled) return;
+        // Order according to recentIds order
+        const list = (recentGroups || []).sort(
+          (a, b) => recentIds.indexOf(a.id) - recentIds.indexOf(b.id)
+        );
+        setGroups(list);
+        setActiveGroupId((prev) => {
+          if (targetGroupId && list.some((g) => g.id === targetGroupId)) {
+            return targetGroupId;
+          }
+          if (prev && list.some((g) => g.id === prev)) {
+            return prev;
+          }
+          return list[0]?.id || "";
+        });
       }
     }
 
-    initializeGroups();
-  }, [user, supabase]);
+    loadGroups();
 
-  // Load group members & expenses on active group change
+    return () => {
+      cancelled = true;
+    };
+  }, [authInitialized, isSuperAdmin, initialGroupId, supabase]);
+
+  // Load group members & expenses when activeGroupId changes, and restore activeMemberId
   useEffect(() => {
     if (!activeGroupId) return;
     let cancelled = false;
 
+    // Save activeGroupId to recent groups in localStorage
+    addRecentGroupId(activeGroupId);
+
+    // Check URL ?m= or localStorage for active member identity
+    const params =
+      typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search)
+        : null;
+    const urlMemberId = params?.get("m") || "";
+    const storedMemberId =
+      typeof window !== "undefined"
+        ? localStorage.getItem(memberStorageKey(activeGroupId)) || ""
+        : "";
+    const preferredMemberId = urlMemberId || storedMemberId;
+
+    if (urlMemberId && typeof window !== "undefined") {
+      localStorage.setItem(memberStorageKey(activeGroupId), urlMemberId);
+    }
+
     supabase
       .from("group_members")
-      .select("id, group_id, user_id, display_name, invited_email, invite_token, role")
+      .select("id, group_id, display_name, created_at")
       .eq("group_id", activeGroupId)
+      .order("created_at", { ascending: true })
       .then(({ data }) => {
         if (cancelled || !data) return;
         const list: GroupMember[] = data.map((m) => ({
           id: m.id,
           groupId: m.group_id,
-          userId: m.user_id,
           name: m.display_name || "Member",
           displayName: m.display_name,
-          email: m.invited_email,
-          invitedEmail: m.invited_email,
-          inviteToken: m.invite_token,
-          role: m.role || "member",
         }));
         setMembers(list);
-        setSelectedMembers((prev) => {
-          if (prev.length === 0) {
-            return list.map((u) => u.id);
-          }
-          const valid = prev.filter((id) => list.some((u) => u.id === id));
-          return valid.length > 0 ? valid : list.map((u) => u.id);
-        });
+        setSelectedMembers(list.map((u) => u.id));
+
+        if (preferredMemberId && list.some((m) => m.id === preferredMemberId)) {
+          setActiveMemberId(preferredMemberId);
+          setPayerId(preferredMemberId);
+        } else {
+          setActiveMemberId("");
+          setPayerId(list[0]?.id || "");
+        }
       });
 
     supabase
       .from("expenses")
       .select(
-        "id, paid_by_member_id, description, amount_cents, currency, type, date, created_by, expense_splits(member_id, split_amount_cents)"
+        "id, paid_by_member_id, created_by_member_id, description, amount_cents, currency, type, date, expense_splits(member_id, split_amount_cents)"
       )
       .eq("group_id", activeGroupId)
       .order("date", { ascending: false })
@@ -333,9 +379,10 @@ export default function App() {
             amount: amt,
             amountCents: amtCents,
             currency: curr,
-            type: (e.type === "payment" ? "payment" : "expense") as "expense" | "payment",
+            type: (e.type === "payment" ? "payment" : "expense") as
+              | "expense"
+              | "payment",
             date: e.date,
-            createdBy: e.created_by,
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             splits: (e.expense_splits || []).map((s: any) => {
               const splitCents = Number(s.split_amount_cents || 0);
@@ -356,22 +403,51 @@ export default function App() {
     };
   }, [activeGroupId, supabase]);
 
-  // Effective payer defaults to current user's member row or first group member
+  // Select member identity ("Who are you in this group?")
+  const handleSelectIdentity = (memberId: string) => {
+    setActiveMemberId(memberId);
+    setPayerId(memberId);
+    if (activeGroupId && typeof window !== "undefined") {
+      localStorage.setItem(memberStorageKey(activeGroupId), memberId);
+    }
+  };
+
+  // Switch active group and sync browser URL to /g/[group_id]
+  const handleSelectGroup = (groupId: string) => {
+    setActiveGroupId(groupId);
+    addRecentGroupId(groupId);
+    if (typeof window !== "undefined") {
+      window.history.pushState(null, "", `/g/${groupId}`);
+    }
+  };
+
+  // Copy Main Group Link
+  const handleCopyGroupLink = async () => {
+    if (!activeGroup) return;
+    const origin =
+      typeof window !== "undefined"
+        ? window.location.origin
+        : "https://split.murphnduff.org";
+    const url = `${origin}/g/${activeGroup.id}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedGroupLink(true);
+      setTimeout(() => setCopiedGroupLink(false), 2500);
+    } catch {
+      // fallback
+    }
+  };
+
+  // Effective payer defaults to selected identity or first group member
   const effectivePayerId = useMemo(() => {
     if (payerId && members.some((m) => m.id === payerId)) {
       return payerId;
     }
-    const userMember = members.find((m) => m.userId === user?.id);
-    if (userMember) return userMember.id;
+    if (activeMemberId && members.some((m) => m.id === activeMemberId)) {
+      return activeMemberId;
+    }
     return members[0]?.id || "";
-  }, [payerId, members, user]);
-
-  // Check if current user is admin or creator of active group
-  const isGroupAdmin = useMemo(() => {
-    if (!user || !activeGroup) return false;
-    if (activeGroup.created_by === user.id) return true;
-    return members.some((m) => m.userId === user.id && m.role === "admin");
-  }, [user, activeGroup, members]);
+  }, [payerId, activeMemberId, members]);
 
   // Currency totals
   const usdTotal = useMemo(
@@ -412,16 +488,12 @@ export default function App() {
   // Isolate settlements by currency
   const usdSettlements = useMemo(
     () =>
-      settlements.filter(
-        (s) => s.currency === "$" || s.currency === "USD"
-      ),
+      settlements.filter((s) => s.currency === "$" || s.currency === "USD"),
     [settlements]
   );
   const eurSettlements = useMemo(
     () =>
-      settlements.filter(
-        (s) => s.currency === "€" || s.currency === "EUR"
-      ),
+      settlements.filter((s) => s.currency === "€" || s.currency === "EUR"),
     [settlements]
   );
 
@@ -432,56 +504,31 @@ export default function App() {
       ? (parsedAmount / selectedMembers.length).toFixed(2)
       : null;
 
-  // Create new group
+  // Create new group (Strictly Super-Admin only)
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newGroupName.trim()) return;
+    if (!isSuperAdmin || !newGroupName.trim() || !user) return;
 
-    const {
-      data: { user: currentUser },
-    } = await supabase.auth.getUser();
-    if (!currentUser) {
-      alert("You must be logged in to create a group.");
-      return;
-    }
-
-    // 1. Create the Group
     const { data: newGroup, error: groupError } = await supabase
       .from("groups")
-      .insert({ name: newGroupName.trim(), created_by: currentUser.id })
-      .select()
+      .insert({ name: newGroupName.trim(), created_by: user.id })
+      .select("id, name, created_by, created_at")
       .single();
 
-    if (groupError) {
-      alert("Error creating group: " + groupError.message);
-      return;
-    }
-
-    // 2. Add creator as Admin with required display_name
-    const creatorDisplayName =
-      currentUser.user_metadata?.full_name ||
-      currentUser.email?.split("@")[0] ||
-      "Admin";
-
-    const { error: memberError } = await supabase.from("group_members").insert({
-      group_id: newGroup.id,
-      user_id: currentUser.id,
-      display_name: creatorDisplayName,
-      role: "admin",
-    });
-
-    if (memberError) {
-      alert("Error adding admin member: " + memberError.message);
+    if (groupError || !newGroup) {
+      alert("Error creating group: " + (groupError?.message || "Unknown error"));
       return;
     }
 
     setNewGroupName("");
-    setGroups((prev) => [...prev, newGroup]);
-    setActiveGroupId(newGroup.id);
+    setGroups((prev) => [newGroup, ...prev]);
+    handleSelectGroup(newGroup.id);
+    setIsInviteModalOpen(true);
   };
 
-  // Delete group
+  // Delete group (Strictly Super-Admin only)
   const handleDeleteGroup = async (groupId: string, groupName: string) => {
+    if (!isSuperAdmin) return;
     const confirmed = window.confirm(
       `Are you sure you want to delete the group "${groupName}"? This will remove all associated expenses and settlements.`
     );
@@ -497,30 +544,42 @@ export default function App() {
       return;
     }
 
+    removeRecentGroupId(groupId);
     const remaining = groups.filter((g) => g.id !== groupId);
     setGroups(remaining);
     if (activeGroupId === groupId) {
-      setActiveGroupId(remaining.length > 0 ? remaining[0].id : "");
+      const nextId = remaining.length > 0 ? remaining[0].id : "";
+      setActiveGroupId(nextId);
+      if (typeof window !== "undefined") {
+        window.history.pushState(null, "", nextId ? `/g/${nextId}` : "/");
+      }
     }
   };
 
-  // Add transaction with penny-split precision
+  // Add transaction with penny-split precision (Works for both anonymous and signed-in group visitors!)
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
     const finalPayerId = payerId || effectivePayerId;
-    if (!amount || !finalPayerId || selectedMembers.length === 0 || !user) return;
+    if (
+      !activeGroupId ||
+      !amount ||
+      !finalPayerId ||
+      selectedMembers.length === 0
+    ) {
+      return;
+    }
 
     const parsed = parseFloat(amount);
     if (isNaN(parsed) || parsed <= 0) return;
     const totalCents = Math.round(parsed * 100);
 
-    // 1. Insert into expenses
+    // 1. Insert into expenses (using paid_by_member_id and created_by_member_id)
     const { data: newExp, error: expError } = await supabase
       .from("expenses")
       .insert({
         group_id: activeGroupId,
-        created_by: user.id,
         paid_by_member_id: finalPayerId,
+        created_by_member_id: activeMemberId || finalPayerId,
         description:
           description.trim() ||
           (type === "payment" ? "Direct Payment" : "Group Expense"),
@@ -529,11 +588,13 @@ export default function App() {
         type,
         date: new Date().toISOString().split("T")[0],
       })
-      .select()
+      .select("id")
       .single();
 
-    if (expError) {
-      alert("Error adding transaction: " + expError.message);
+    if (expError || !newExp) {
+      alert(
+        "Error adding transaction: " + (expError?.message || "Unknown error")
+      );
       return;
     }
 
@@ -545,7 +606,6 @@ export default function App() {
     }> = [];
 
     if (type === "payment") {
-      // Strictly 1-to-1 payment
       const recipientId = selectedMembers[0];
       splitsPayload = [
         {
@@ -555,7 +615,6 @@ export default function App() {
         },
       ];
     } else {
-      // Group expense equal split with penny remainder distribution
       const equalSplits = splitAmountEqually(totalCents, selectedMembers);
       splitsPayload = equalSplits.map((s) => ({
         expense_id: newExp.id,
@@ -606,64 +665,62 @@ export default function App() {
   const signInWithGoogle = () => {
     supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: window.location.origin },
+      options: { redirectTo: window.location.href },
     });
   };
 
-  if (!user) {
-    return (
-      <main className="flex min-h-screen flex-col items-center justify-center p-6 bg-slate-50">
-        <div className="p-8 bg-white border border-slate-200 rounded-2xl shadow-sm text-center max-w-sm w-full space-y-4">
-          <div className="mx-auto w-12 h-12 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center font-bold text-xl">
-            $
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900 mb-1">
-              Settle Up
-            </h1>
-            <p className="text-sm text-slate-500">
-              Multi-group expense settlement tracker
-            </p>
-          </div>
-
-          {hasPendingInvite && (
-            <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl text-xs text-blue-800 flex items-start gap-2 text-left">
-              <Users className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-              <span>
-                You have been invited to join a group! Sign in with Google to claim your member spot.
-              </span>
-            </div>
-          )}
-
-          <button
-            onClick={signInWithGoogle}
-            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-4 rounded-xl transition shadow-xs cursor-pointer"
-          >
-            Sign in with Google
-          </button>
-        </div>
-      </main>
-    );
-  }
+  const activeMemberObj = members.find((m) => m.id === activeMemberId);
 
   return (
     <div className="min-h-screen bg-slate-50">
       <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="font-black text-blue-600 text-lg">$</span>
-          <h1 className="text-xl font-bold text-slate-900 tracking-tight">
-            Settle Up
-          </h1>
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-blue-600 text-white font-black flex items-center justify-center text-base shadow-2xs">
+            $
+          </div>
+          <div>
+            <h1 className="text-lg font-bold text-slate-900 tracking-tight leading-none">
+              Settle Up
+            </h1>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              Instant group expense & settlement tracker
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-4">
-          <span className="text-sm text-slate-600 font-medium">{user.email}</span>
-          <button
-            onClick={() => supabase.auth.signOut()}
-            className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-red-600 font-medium transition cursor-pointer"
-          >
-            <LogOut className="w-3.5 h-3.5" />
-            Sign out
-          </button>
+
+        <div className="flex items-center gap-3">
+          {user ? (
+            <>
+              <div className="flex items-center gap-2">
+                {isSuperAdmin && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                    <Shield className="w-3 h-3" />
+                    Super-Admin
+                  </span>
+                )}
+                <span className="text-xs sm:text-sm text-slate-600 font-medium">
+                  {user.email}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => supabase.auth.signOut()}
+                className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-red-600 font-medium transition cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                Sign out
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={signInWithGoogle}
+              className="inline-flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded-lg font-medium transition cursor-pointer"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              Admin Sign In
+            </button>
+          )}
         </div>
       </header>
 
@@ -682,6 +739,7 @@ export default function App() {
               <span>{notification.message}</span>
             </div>
             <button
+              type="button"
               onClick={() => setNotification(null)}
               className="text-slate-400 hover:text-slate-600 text-xs px-2 py-0.5 rounded cursor-pointer"
             >
@@ -696,7 +754,7 @@ export default function App() {
         <aside className="bg-white border border-slate-200 p-4 rounded-2xl h-fit flex flex-col gap-4">
           <div>
             <h2 className="font-semibold text-slate-800 mb-3 text-sm flex items-center justify-between">
-              <span>Your Groups</span>
+              <span>{isSuperAdmin ? "All Groups" : "Your Groups"}</span>
               <span className="text-xs text-slate-400 font-normal">
                 {groups.length}
               </span>
@@ -704,7 +762,9 @@ export default function App() {
             <div className="space-y-1">
               {groups.length === 0 ? (
                 <p className="text-xs text-slate-400 italic py-2">
-                  No groups yet. Create one below!
+                  {isSuperAdmin
+                    ? "No groups yet. Create one below!"
+                    : "Open a shared group link (/g/...) to access your group."}
                 </p>
               ) : (
                 groups.map((g) => (
@@ -718,12 +778,12 @@ export default function App() {
                   >
                     <button
                       type="button"
-                      onClick={() => setActiveGroupId(g.id)}
+                      onClick={() => handleSelectGroup(g.id)}
                       className="flex-1 text-left truncate mr-2 cursor-pointer"
                     >
                       {g.name}
                     </button>
-                    {g.created_by === user.id && (
+                    {isSuperAdmin && (
                       <button
                         type="button"
                         onClick={(e) => {
@@ -742,28 +802,31 @@ export default function App() {
             </div>
           </div>
 
-          <div className="pt-4 border-t border-slate-100">
-            <form onSubmit={handleCreateGroup} className="flex flex-col gap-2">
-              <label className="text-xs font-semibold text-slate-600">
-                Create New Group
-              </label>
-              <input
-                type="text"
-                placeholder="Group Name"
-                value={newGroupName}
-                onChange={(e) => setNewGroupName(e.target.value)}
-                className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                required
-              />
-              <button
-                type="submit"
-                className="w-full bg-blue-600 text-white py-2 rounded-lg text-xs font-semibold hover:bg-blue-700 transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                Create Group
-              </button>
-            </form>
-          </div>
+          {/* Create Group Form: Strictly visible ONLY to Super-Admin (murph@murphnduff.org) */}
+          {isSuperAdmin && (
+            <div className="pt-4 border-t border-slate-100">
+              <form onSubmit={handleCreateGroup} className="flex flex-col gap-2">
+                <label className="text-xs font-semibold text-slate-600">
+                  Create New Group
+                </label>
+                <input
+                  type="text"
+                  placeholder="Group Name (e.g. Ireland Golf)"
+                  value={newGroupName}
+                  onChange={(e) => setNewGroupName(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                  required
+                />
+                <button
+                  type="submit"
+                  className="w-full bg-blue-600 text-white py-2 rounded-lg text-xs font-semibold hover:bg-blue-700 transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Create Group
+                </button>
+              </form>
+            </div>
+          )}
         </aside>
 
         {/* Expense Entry & Settlement Panel */}
@@ -772,60 +835,109 @@ export default function App() {
             <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex items-center gap-2.5 flex-wrap">
                     <h2 className="text-xl font-bold text-slate-900 tracking-tight">
                       {activeGroup.name}
                     </h2>
                     <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700">
-                      {members.length} {members.length === 1 ? "member" : "members"}
+                      {members.length}{" "}
+                      {members.length === 1 ? "member" : "members"}
                     </span>
                   </div>
-                  <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                    {members.map((m) => (
-                      <span
-                        key={m.id}
-                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs bg-slate-50 border border-slate-200 text-slate-700"
-                      >
-                        <span
-                          className={`w-1.5 h-1.5 rounded-full ${
-                            m.userId ? "bg-emerald-500" : "bg-amber-400"
-                          }`}
-                        ></span>
-                        <span className="font-medium">{m.name}</span>
-                        {m.role === "admin" && (
-                          <span className="text-[10px] text-indigo-600 font-bold uppercase tracking-wider ml-0.5">
-                            Admin
-                          </span>
-                        )}
-                      </span>
-                    ))}
-                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setIsInviteModalOpen(true)}
-                  className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl transition shadow-xs shrink-0 cursor-pointer ${
-                    isGroupAdmin
-                      ? "bg-blue-600 hover:bg-blue-700 text-white"
-                      : "bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
-                  }`}
-                >
-                  {isGroupAdmin ? (
-                    <>
+
+                {/* Action Buttons: 1-Click Copy Group Link + Super-Admin Manage Members */}
+                <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={handleCopyGroupLink}
+                    className={`inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer ${
+                      copiedGroupLink
+                        ? "bg-emerald-600 text-white"
+                        : "bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
+                    }`}
+                  >
+                    {copiedGroupLink ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" />
+                        Copied Group Link!
+                      </>
+                    ) : (
+                      <>
+                        <Share2 className="w-3.5 h-3.5" />
+                        Copy Group Link
+                      </>
+                    )}
+                  </button>
+
+                  {isSuperAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => setIsInviteModalOpen(true)}
+                      className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl transition shadow-xs bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
+                    >
                       <UserPlus className="w-4 h-4" />
                       Manage Members
-                    </>
-                  ) : (
-                    <>
-                      <Users className="w-4 h-4" />
-                      View Members
-                    </>
+                    </button>
                   )}
-                </button>
+                </div>
               </div>
 
+              {/* Zero-Login "Who Are You in This Group?" Identity Pill Selector */}
+              {members.length > 0 ? (
+                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-xl space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                      <UserCheck className="w-3.5 h-3.5 text-blue-600" />
+                      {activeMemberObj
+                        ? `Viewing as ${activeMemberObj.name} (tap another name to switch):`
+                        : "Who are you in this group? Tap your name:"}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {members.map((m) => {
+                      const isMe = m.id === activeMemberId;
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => handleSelectIdentity(m.id)}
+                          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold transition cursor-pointer border ${
+                            isMe
+                              ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                              : "bg-white text-slate-700 border-slate-200 hover:bg-blue-50 hover:border-blue-200"
+                          }`}
+                        >
+                          <span>{m.name}</span>
+                          {isMe && (
+                            <span className="text-[10px] opacity-90">
+                              (You)
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between">
+                  <span>
+                    No members have been added to this group yet.
+                  </span>
+                  {isSuperAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => setIsInviteModalOpen(true)}
+                      className="font-bold underline cursor-pointer ml-2"
+                    >
+                      Add Members
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Multi-Currency Ledger Summary Metrics */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-3 border-t border-slate-100 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-100 text-xs">
                 <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100">
                   <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
                     USD Spent
@@ -853,8 +965,22 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="bg-white border border-slate-200 p-8 rounded-2xl text-center text-slate-500 text-sm">
-              Select or create a group to start tracking expenses.
+            <div className="bg-white border border-slate-200 p-8 rounded-2xl text-center space-y-3">
+              <div className="mx-auto w-11 h-11 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
+                <Users className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h2 className="text-base font-bold text-slate-900">
+                  {isSuperAdmin
+                    ? "Select or create a group"
+                    : "No active group selected"}
+                </h2>
+                <p className="text-xs text-slate-500 max-w-md mx-auto">
+                  {isSuperAdmin
+                    ? "Choose a group from the left sidebar or create a new group to start adding members and transactions."
+                    : "Open your shared group link (e.g. split.murphnduff.org/g/...) to immediately view and add expenses without needing to log in."}
+                </p>
+              </div>
             </div>
           )}
 
@@ -885,8 +1011,14 @@ export default function App() {
                       type="button"
                       onClick={() => {
                         setType("payment");
-                        if (members.length > 0 && selectedMembers.length !== 1) {
-                          setSelectedMembers([members[0].id]);
+                        if (
+                          members.length > 0 &&
+                          selectedMembers.length !== 1
+                        ) {
+                          const defaultRecipient =
+                            members.find((m) => m.id !== effectivePayerId) ||
+                            members[0];
+                          setSelectedMembers([defaultRecipient.id]);
                         }
                       }}
                       className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
@@ -914,7 +1046,7 @@ export default function App() {
                       <option value="">Select Member</option>
                       {members.map((m) => (
                         <option key={m.id} value={m.id}>
-                          {m.name} {m.userId === user.id ? "(You)" : ""}
+                          {m.name} {m.id === activeMemberId ? "(You)" : ""}
                         </option>
                       ))}
                     </select>
@@ -973,7 +1105,7 @@ export default function App() {
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g. Dinner, Fuel, Groceries, Hotel"
+                    placeholder="e.g. Dinner, Fuel, Groceries, Green Fees"
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
                     className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
@@ -1063,7 +1195,8 @@ export default function App() {
 
                 <button
                   type="submit"
-                  className="w-full bg-slate-900 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-slate-800 transition cursor-pointer shadow-xs"
+                  disabled={members.length === 0}
+                  className="w-full bg-slate-900 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-slate-800 transition cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Save Transaction
                 </button>
@@ -1078,7 +1211,7 @@ export default function App() {
                     </h3>
                     <p className="text-xs text-slate-400">
                       Showing {filteredExpenses.length} of {expenses.length}{" "}
-                      records • Group members can edit or delete any transaction
+                      records • Anyone with the group link can edit or delete
                     </p>
                   </div>
 
@@ -1141,7 +1274,8 @@ export default function App() {
                     filteredExpenses.map((exp) => {
                       const isPayment = exp.type === "payment";
                       const payerMember = members.find(
-                        (m) => m.id === exp.paidByMemberId || m.id === exp.payerId
+                        (m) =>
+                          m.id === exp.paidByMemberId || m.id === exp.payerId
                       );
 
                       return (
@@ -1197,9 +1331,7 @@ export default function App() {
                               </span>
                               <span
                                 className={`block text-[10px] uppercase font-bold tracking-wider mt-0.5 ${
-                                  isPayment
-                                    ? "text-blue-700"
-                                    : "text-rose-600"
+                                  isPayment ? "text-blue-700" : "text-rose-600"
                                 }`}
                               >
                                 {exp.type}
@@ -1246,7 +1378,8 @@ export default function App() {
               Settlement Plan
             </h2>
             <p className="text-xs text-slate-500 mt-1">
-              Greedy cash-flow minimization pairing largest debtors with largest creditors across isolated currency ledgers.
+              Greedy cash-flow minimization pairing largest debtors with largest
+              creditors across isolated currency ledgers.
             </p>
           </div>
 
@@ -1275,7 +1408,9 @@ export default function App() {
                   className="p-3 bg-blue-50/50 border border-blue-100 rounded-xl text-xs space-y-1"
                 >
                   <div className="text-slate-700">
-                    <span className="font-bold text-slate-900">{s.fromUser}</span>{" "}
+                    <span className="font-bold text-slate-900">
+                      {s.fromUser}
+                    </span>{" "}
                     pays{" "}
                     <span className="font-bold text-slate-900">{s.toUser}</span>
                   </div>
@@ -1312,7 +1447,9 @@ export default function App() {
                   className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl text-xs space-y-1"
                 >
                   <div className="text-slate-700">
-                    <span className="font-bold text-slate-900">{s.fromUser}</span>{" "}
+                    <span className="font-bold text-slate-900">
+                      {s.fromUser}
+                    </span>{" "}
                     pays{" "}
                     <span className="font-bold text-slate-900">{s.toUser}</span>
                   </div>
@@ -1326,13 +1463,14 @@ export default function App() {
         </aside>
       </div>
 
-      {/* Member Management Modal */}
+      {/* Member Management Modal (Super-Admin) */}
       <MemberInviteModal
         isOpen={isInviteModalOpen}
         onClose={() => setIsInviteModalOpen(false)}
         group={activeGroup}
         currentMembers={members}
-        currentUserId={user.id}
+        isSuperAdmin={isSuperAdmin}
+        activeMemberId={activeMemberId}
         expenses={expenses}
         onMemberAdded={() => {
           if (activeGroupId) {
@@ -1357,5 +1495,21 @@ export default function App() {
         />
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen flex items-center justify-center p-6 bg-slate-50">
+          <div className="text-xs text-slate-500 font-medium">
+            Loading Settle Up...
+          </div>
+        </div>
+      }
+    >
+      <SettleUpDashboard />
+    </Suspense>
   );
 }
