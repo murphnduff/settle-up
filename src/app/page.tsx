@@ -366,6 +366,13 @@ export default function App() {
     return members[0]?.id || "";
   }, [payerId, members, user]);
 
+  // Check if current user is admin or creator of active group
+  const isGroupAdmin = useMemo(() => {
+    if (!user || !activeGroup) return false;
+    if (activeGroup.created_by === user.id) return true;
+    return members.some((m) => m.userId === user.id && m.role === "admin");
+  }, [user, activeGroup, members]);
+
   // Currency totals
   const usdTotal = useMemo(
     () =>
@@ -716,17 +723,19 @@ export default function App() {
                     >
                       {g.name}
                     </button>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteGroup(g.id, g.name);
-                      }}
-                      title="Delete group"
-                      className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    {g.created_by === user.id && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteGroup(g.id, g.name);
+                        }}
+                        title="Delete group"
+                        className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 ))
               )}
@@ -795,10 +804,23 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setIsInviteModalOpen(true)}
-                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs shrink-0 cursor-pointer"
+                  className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl transition shadow-xs shrink-0 cursor-pointer ${
+                    isGroupAdmin
+                      ? "bg-blue-600 hover:bg-blue-700 text-white"
+                      : "bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
+                  }`}
                 >
-                  <UserPlus className="w-4 h-4" />
-                  Manage Members
+                  {isGroupAdmin ? (
+                    <>
+                      <UserPlus className="w-4 h-4" />
+                      Manage Members
+                    </>
+                  ) : (
+                    <>
+                      <Users className="w-4 h-4" />
+                      View Members
+                    </>
+                  )}
                 </button>
               </div>
 

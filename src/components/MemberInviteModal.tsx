@@ -6,7 +6,6 @@ import { canDeleteMember, ExpenseRecord } from "@/lib/reconciliation";
 import {
   UserPlus,
   X,
-  Copy,
   Check,
   Users,
   Shield,
@@ -68,7 +67,6 @@ export default function MemberInviteModal({
   } | null>(null);
 
   // Copy tracking states
-  const [copiedGeneral, setCopiedGeneral] = useState(false);
   const [copiedTokenId, setCopiedTokenId] = useState<string | null>(null);
 
   // Renaming state
@@ -78,7 +76,7 @@ export default function MemberInviteModal({
   const isCurrentAdmin =
     group?.created_by === currentUserId ||
     currentMembers.some(
-      (m) => (m.userId === currentUserId || m.id === currentUserId) && m.role === "admin"
+      (m) => m.userId === currentUserId && m.role === "admin"
     );
 
   // Sync native <dialog> element with isOpen prop
@@ -122,11 +120,6 @@ export default function MemberInviteModal({
     }
   };
 
-  const generalInviteUrl =
-    typeof window !== "undefined" && group
-      ? `${window.location.origin}/join?join=${group.id}`
-      : "";
-
   const copyToClipboard = async (text: string) => {
     try {
       if (navigator?.clipboard?.writeText) {
@@ -146,29 +139,28 @@ export default function MemberInviteModal({
     }
   };
 
-  const handleCopyGeneralLink = async () => {
-    if (!generalInviteUrl) return;
-    const ok = await copyToClipboard(generalInviteUrl);
-    if (ok) {
-      setCopiedGeneral(true);
-      setTimeout(() => setCopiedGeneral(false), 2200);
-    }
-  };
-
   const handleCopyMemberTokenLink = async (member: GroupMember) => {
     if (!member.inviteToken) return;
     const url = `${window.location.origin}/join?token=${member.inviteToken}`;
     const ok = await copyToClipboard(url);
     if (ok) {
       setCopiedTokenId(member.id);
-      setTimeout(() => setCopiedTokenId(null), 2200);
+      setTimeout(() => setCopiedTokenId(null), 2500);
     }
   };
 
-  // Pre-create member (unclaimed profile)
+  // Pre-create member (always starts as unclaimed with user_id = null)
   const handlePrecreateMember = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!group) return;
+
+    if (!isCurrentAdmin) {
+      setStatusMessage({
+        type: "error",
+        text: "Only group admins can invite or add members.",
+      });
+      return;
+    }
 
     const trimmedName = displayName.trim();
     const trimmedEmail = email.trim().toLowerCase();
@@ -181,16 +173,16 @@ export default function MemberInviteModal({
       return;
     }
 
-    // Check if name already exists in group
+    // Check for duplicates
     const duplicate = currentMembers.find(
       (m) =>
         m.name.toLowerCase() === trimmedName.toLowerCase() ||
-        (trimmedEmail && m.email?.toLowerCase() === trimmedEmail)
+        (trimmedEmail && m.invitedEmail?.toLowerCase() === trimmedEmail)
     );
     if (duplicate) {
       setStatusMessage({
         type: "warning",
-        text: `"${duplicate.name}" is already a member of this group.`,
+        text: `"${duplicate.name}" is already in this group.`,
       });
       return;
     }
@@ -199,21 +191,7 @@ export default function MemberInviteModal({
     setStatusMessage(null);
 
     try {
-      // 1. Check if user with this email already exists in profiles
-      let matchedUserId: string | null = null;
-      if (trimmedEmail) {
-        const { data: profile } = await supabase
-          .from("profiles")
-          .select("id")
-          .eq("email", trimmedEmail)
-          .maybeSingle();
-
-        if (profile?.id) {
-          matchedUserId = profile.id;
-        }
-      }
-
-      // 2. Insert member row (pre-created or linked)
+      // Always insert with user_id = null so member has a claimable invite token!
       const { error: insertError } = await supabase
         .from("group_members")
         .insert({
@@ -221,10 +199,8 @@ export default function MemberInviteModal({
           display_name: trimmedName,
           invited_email: trimmedEmail || null,
           role: "member",
-          user_id: matchedUserId,
-        })
-        .select()
-        .single();
+          user_id: null,
+        });
 
       if (insertError) {
         setStatusMessage({
@@ -236,7 +212,7 @@ export default function MemberInviteModal({
 
       setStatusMessage({
         type: "success",
-        text: `Added ${trimmedName} to ${group.name}! Share their unique invite link below so they can claim their profile.`,
+        text: `Added "${trimmedName}"! Copy their invite link below and send it to them via email or text to join.`,
       });
       setDisplayName("");
       setEmail("");
@@ -276,7 +252,8 @@ export default function MemberInviteModal({
 
   // Delete member with Section 2 Deletion Guard
   const handleDeleteMember = async (member: GroupMember) => {
-    // 1. Guard check in memory first
+    if (!isCurrentAdmin) return;
+
     if (!canDeleteMember(member.id, expenses)) {
       setStatusMessage({
         type: "error",
@@ -326,17 +303,23 @@ export default function MemberInviteModal({
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-3">
             <div className="p-2.5 bg-blue-50 text-blue-600 rounded-xl">
-              <UserPlus className="w-5 h-5" />
+              {isCurrentAdmin ? (
+                <UserPlus className="w-5 h-5" />
+              ) : (
+                <Users className="w-5 h-5" />
+              )}
             </div>
             <div>
               <h2
                 id="invite-modal-title"
                 className="text-lg font-bold text-slate-900"
               >
-                Manage Members • {group?.name || "Group"}
+                {isCurrentAdmin ? "Manage Members" : "Group Members"} • {group?.name || "Group"}
               </h2>
               <p className="text-xs text-slate-500">
-                Pre-create members, assign expenses immediately, and share invite links.
+                {isCurrentAdmin
+                  ? "Pre-create members, assign expenses immediately, and copy invite links to share."
+                  : "View members of this group."}
               </p>
             </div>
           </div>
@@ -372,55 +355,62 @@ export default function MemberInviteModal({
           </div>
         )}
 
-        {/* Section 1: Pre-Create Member Form */}
-        <form onSubmit={handlePrecreateMember} className="space-y-3">
-          <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
-            <UserPlus className="w-3.5 h-3.5 text-slate-500" />
-            Pre-Create Member Profile
-          </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <input
-              type="text"
-              placeholder="Display Name (e.g. Kev, Fitz)"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              disabled={isSubmitting}
-              className="border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-              required
-            />
-            <input
-              type="email"
-              placeholder="Email (Optional)"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={isSubmitting}
-              className="border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-            />
+        {/* Section 1: Pre-Create Member Form (Only for Group Admins) */}
+        {isCurrentAdmin ? (
+          <form onSubmit={handlePrecreateMember} className="space-y-3">
+            <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+              <UserPlus className="w-3.5 h-3.5 text-slate-500" />
+              Add Member Profile
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <input
+                type="text"
+                placeholder="Name (e.g. Kev, Fitz)"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                disabled={isSubmitting}
+                className="border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                required
+              />
+              <input
+                type="email"
+                placeholder="Email (Optional reference)"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={isSubmitting}
+                className="border border-slate-300 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <p className="text-[11px] text-slate-400">
+                You can assign expenses to them immediately. Copy their invite link below to send to them!
+              </p>
+              <button
+                type="submit"
+                disabled={isSubmitting || !displayName.trim()}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                {isSubmitting ? "Adding..." : "Add Member"}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 flex items-center gap-2">
+            <Shield className="w-4 h-4 text-slate-400 shrink-0" />
+            <span>You are a member of this group. Only group admins can invite or remove members.</span>
           </div>
-          <div className="flex items-center justify-between gap-2 pt-1">
-            <p className="text-[11px] text-slate-400">
-              Members can be included in expenses immediately before signing up!
-            </p>
-            <button
-              type="submit"
-              disabled={isSubmitting || !displayName.trim()}
-              className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
-            >
-              {isSubmitting ? "Adding..." : "Add Member"}
-            </button>
-          </div>
-        </form>
+        )}
 
         {/* Section 2: Current Group Members & Unique Claim Links */}
         <div className="space-y-2 pt-2 border-t border-slate-100">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
               <Users className="w-3.5 h-3.5 text-slate-500" />
-              Members & Unique Invite Links ({currentMembers.length})
+              Members ({currentMembers.length})
             </h3>
           </div>
 
-          <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+          <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
             {currentMembers.map((member) => {
               const isCurrentUser =
                 member.userId === currentUserId || member.id === currentUserId;
@@ -495,7 +485,7 @@ export default function MemberInviteModal({
                                 setEditingMemberId(member.id);
                                 setEditingName(member.name);
                               }}
-                              title="Rename member"
+                              title="Rename"
                               className="text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
                             >
                               <Edit2 className="w-3 h-3" />
@@ -521,7 +511,7 @@ export default function MemberInviteModal({
                           </span>
                         )}
                         {member.invitedEmail && (
-                          <span className="text-[10px] text-slate-400 truncate max-w-[120px]">
+                          <span className="text-[10px] text-slate-500 truncate max-w-[140px]">
                             {member.invitedEmail}
                           </span>
                         )}
@@ -531,16 +521,16 @@ export default function MemberInviteModal({
 
                   {/* Right side actions */}
                   <div className="flex items-center gap-1.5 shrink-0">
-                    {/* Unique invite token copy button */}
+                    {/* Always show Copy Invite Link for unclaimed members (even if they entered an email) */}
                     {isUnclaimed && member.inviteToken && (
                       <button
                         type="button"
                         onClick={() => handleCopyMemberTokenLink(member)}
-                        title="Copy unique claim link for this member"
-                        className={`px-2 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 transition cursor-pointer ${
+                        title={`Copy join link for ${member.name}`}
+                        className={`px-2.5 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 transition cursor-pointer ${
                           copiedTokenId === member.id
                             ? "bg-emerald-600 text-white"
-                            : "bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200"
+                            : "bg-blue-600 text-white hover:bg-blue-700 shadow-2xs"
                         }`}
                       >
                         {copiedTokenId === member.id ? (
@@ -551,13 +541,13 @@ export default function MemberInviteModal({
                         ) : (
                           <>
                             <Share2 className="w-3 h-3" />
-                            Copy Link
+                            Copy Invite Link
                           </>
                         )}
                       </button>
                     )}
 
-                    {/* Delete member guard button */}
+                    {/* Delete member guard button (Admins only) */}
                     {isCurrentAdmin && !isCurrentUser && (
                       <button
                         type="button"
@@ -581,46 +571,6 @@ export default function MemberInviteModal({
                 </div>
               );
             })}
-          </div>
-        </div>
-
-        {/* Section 3: General Group Join Link */}
-        <div className="space-y-2 pt-2 border-t border-slate-100">
-          <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
-            <span className="flex items-center gap-1.5">
-              <Share2 className="w-3.5 h-3.5 text-slate-500" />
-              General Group Join Link
-            </span>
-          </label>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              readOnly
-              value={generalInviteUrl}
-              onFocus={(e) => e.target.select()}
-              className="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-600 bg-slate-50 select-all font-mono"
-            />
-            <button
-              type="button"
-              onClick={handleCopyGeneralLink}
-              className={`px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shrink-0 cursor-pointer ${
-                copiedGeneral
-                  ? "bg-emerald-600 text-white"
-                  : "bg-slate-900 text-white hover:bg-slate-800"
-              }`}
-            >
-              {copiedGeneral ? (
-                <>
-                  <Check className="w-3.5 h-3.5" />
-                  Copied!
-                </>
-              ) : (
-                <>
-                  <Copy className="w-3.5 h-3.5" />
-                  Copy Link
-                </>
-              )}
-            </button>
           </div>
         </div>
 
