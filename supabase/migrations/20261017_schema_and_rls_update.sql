@@ -1,6 +1,6 @@
 -- ====================================================================
 -- Settle Up - Master Database Schema & RLS Security Migration
--- Aligned with PROJECT_CONTEXT.md (Sections 2 & 3)
+-- ZERO RECURSION FIX (Uses PL/pgSQL & Drops All Legacy Policies)
 -- Completely Idempotent (safe to run multiple times)
 -- ====================================================================
 
@@ -258,34 +258,52 @@ CREATE INDEX IF NOT EXISTS idx_expense_splits_member_id ON public.expense_splits
 
 
 -- ====================================================================
--- 3. SECURITY DEFINER FUNCTIONS (Recursion Barrier & Search Path Hardening)
+-- 3. SECURITY DEFINER HELPER FUNCTIONS (PL/pgSQL = CANNOT BE INLINED)
 -- ====================================================================
 
--- 3.1 Check if user is an active member of the group
+-- 3.1 Check if user is a member of the group
 CREATE OR REPLACE FUNCTION public.is_group_member(p_group_id UUID, p_user_id UUID)
 RETURNS BOOLEAN
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
-STABLE
 AS $$
-  SELECT EXISTS (
+BEGIN
+  RETURN EXISTS (
     SELECT 1
     FROM public.group_members
     WHERE group_id = p_group_id
       AND user_id = p_user_id
   );
+END;
 $$;
 
--- 3.2 Check if user is an admin of the group or the group creator
-CREATE OR REPLACE FUNCTION public.is_group_admin(p_group_id UUID, p_user_id UUID)
+-- 3.2 Check if user is the creator of the group
+CREATE OR REPLACE FUNCTION public.is_group_creator(p_group_id UUID, p_user_id UUID)
 RETURNS BOOLEAN
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
-STABLE
 AS $$
-  SELECT EXISTS (
+BEGIN
+  RETURN EXISTS (
+    SELECT 1
+    FROM public.groups
+    WHERE id = p_group_id
+      AND created_by = p_user_id
+  );
+END;
+$$;
+
+-- 3.3 Check if user is an admin of the group or the group creator
+CREATE OR REPLACE FUNCTION public.is_group_admin(p_group_id UUID, p_user_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN EXISTS (
     SELECT 1
     FROM public.group_members
     WHERE group_id = p_group_id
@@ -298,10 +316,10 @@ AS $$
     WHERE id = p_group_id
       AND created_by = p_user_id
   );
+END;
 $$;
 
--- 3.3 Atomic RPC function to claim an invite token link
--- Usage: supabase.rpc('claim_invite_token', { p_token: '...' })
+-- 3.4 Atomic RPC function to claim an invite token link
 CREATE OR REPLACE FUNCTION public.claim_invite_token(p_token UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -340,7 +358,7 @@ BEGIN
     RAISE EXCEPTION 'This invite link has already been claimed by another account.';
   END IF;
 
-  -- Bind authenticated user to this member profile
+  -- Bind authenticated user to this member profile while keeping Admin display_name
   UPDATE public.group_members
   SET user_id = v_current_user_id
   WHERE id = v_member.id;
@@ -354,38 +372,59 @@ BEGIN
 END;
 $$;
 
--- 3.4 Rate-limit friendly user lookup by email for invite modal
+-- 3.5 Rate-limit friendly user lookup by email for invite modal
 CREATE OR REPLACE FUNCTION public.find_user_by_email(lookup_email TEXT)
 RETURNS TABLE (id UUID, full_name TEXT, email TEXT)
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
-STABLE
 AS $$
+BEGIN
+  RETURN QUERY
   SELECT p.id, p.full_name, p.email
   FROM public.profiles p
   WHERE lower(trim(p.email)) = lower(trim(lookup_email))
   LIMIT 1;
+END;
 $$;
 
 -- Grant execution to authenticated users
 GRANT EXECUTE ON FUNCTION public.is_group_member(UUID, UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.is_group_creator(UUID, UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.is_group_admin(UUID, UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.claim_invite_token(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.find_user_by_email(TEXT) TO authenticated;
 
 
 -- ====================================================================
--- 4. ROW-LEVEL SECURITY (RLS) POLICIES
+-- 4. CLEAN SLATE: DROP ALL EXISTING POLICIES (Kills any leftover recursive policies)
+-- ====================================================================
+DO $$
+DECLARE
+    pol RECORD;
+BEGIN
+    FOR pol IN 
+        SELECT schemaname, tablename, policyname 
+        FROM pg_policies 
+        WHERE schemaname = 'public' 
+          AND tablename IN ('groups', 'group_members', 'expenses', 'expense_splits', 'profiles')
+    LOOP
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', pol.policyname, pol.schemaname, pol.tablename);
+    END LOOP;
+END $$;
+
+
+-- ====================================================================
+-- 5. ROW-LEVEL SECURITY (RLS) POLICIES (Guaranteed Zero Recursion)
 -- ====================================================================
 
 -- --------------------------------------------------------------------
--- 4.1 GROUPS TABLE
+-- 5.1 GROUPS TABLE
 -- --------------------------------------------------------------------
 ALTER TABLE public.groups ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "Users can view groups they created or belong to" ON public.groups;
-CREATE POLICY "Users can view groups they created or belong to"
+-- SELECT: Creator or Member (via PL/pgSQL function = zero inlining recursion)
+CREATE POLICY "groups_select_policy"
 ON public.groups
 FOR SELECT
 TO authenticated
@@ -394,8 +433,8 @@ USING (
   OR public.is_group_member(id, auth.uid())
 );
 
-DROP POLICY IF EXISTS "Users can insert groups they create" ON public.groups;
-CREATE POLICY "Users can insert groups they create"
+-- INSERT: Only group creator
+CREATE POLICY "groups_insert_policy"
 ON public.groups
 FOR INSERT
 TO authenticated
@@ -403,16 +442,16 @@ WITH CHECK (
   created_by = auth.uid()
 );
 
-DROP POLICY IF EXISTS "Group creators can update their groups" ON public.groups;
-CREATE POLICY "Group creators can update their groups"
+-- UPDATE: Only creator
+CREATE POLICY "groups_update_policy"
 ON public.groups
 FOR UPDATE
 TO authenticated
-USING (created_by = auth.uid() OR public.is_group_admin(id, auth.uid()))
-WITH CHECK (created_by = auth.uid() OR public.is_group_admin(id, auth.uid()));
+USING (created_by = auth.uid())
+WITH CHECK (created_by = auth.uid());
 
-DROP POLICY IF EXISTS "Group creators can delete their groups" ON public.groups;
-CREATE POLICY "Group creators can delete their groups"
+-- DELETE: Only creator
+CREATE POLICY "groups_delete_policy"
 ON public.groups
 FOR DELETE
 TO authenticated
@@ -420,28 +459,26 @@ USING (created_by = auth.uid());
 
 
 -- --------------------------------------------------------------------
--- 4.2 GROUP_MEMBERS TABLE
+-- 5.2 GROUP_MEMBERS TABLE
 -- --------------------------------------------------------------------
 ALTER TABLE public.group_members ENABLE ROW LEVEL SECURITY;
 
--- SELECT: Co-members can view all members in their shared groups
-DROP POLICY IF EXISTS "Members can view co-members of their groups" ON public.group_members;
-CREATE POLICY "Members can view co-members of their groups"
+-- SELECT: View members if you created the group, belong to the group, or are the user
+CREATE POLICY "group_members_select_policy"
 ON public.group_members
 FOR SELECT
 TO authenticated
 USING (
-  public.is_group_member(group_id, auth.uid())
-  OR EXISTS (SELECT 1 FROM public.groups g WHERE g.id = group_id AND g.created_by = auth.uid())
-  OR user_id = auth.uid()
+  user_id = auth.uid()
+  OR public.is_group_creator(group_id, auth.uid())
+  OR public.is_group_member(group_id, auth.uid())
 );
 
--- INSERT: 
--- 1. Creator inserting their initial admin member row
--- 2. Admins adding pre-created or invited members
--- 3. Authenticated users self-joining via group link with role 'member'
-DROP POLICY IF EXISTS "Allow controlled insert into group_members" ON public.group_members;
-CREATE POLICY "Allow controlled insert into group_members"
+-- INSERT:
+-- 1. Creator inserting initial admin row
+-- 2. Creator or Admin pre-creating / inviting members
+-- 3. Invitee self-joining as 'member'
+CREATE POLICY "group_members_insert_policy"
 ON public.group_members
 FOR INSERT
 TO authenticated
@@ -450,7 +487,7 @@ WITH CHECK (
   (
     user_id = auth.uid() 
     AND role = 'admin' 
-    AND EXISTS (SELECT 1 FROM public.groups g WHERE g.id = group_id AND g.created_by = auth.uid())
+    AND public.is_group_creator(group_id, auth.uid())
   )
   OR
   -- Scenario B: Group admin or creator adding pre-created or invited members
@@ -458,37 +495,31 @@ WITH CHECK (
     public.is_group_admin(group_id, auth.uid())
   )
   OR
-  -- Scenario C: Self-joining via group link (must be role 'member')
+  -- Scenario C: Self-joining via link (must be role 'member')
   (
     user_id = auth.uid() 
     AND role = 'member'
   )
 );
 
--- UPDATE:
--- 1. Admins can update roles or names
--- 2. Any member can rename their own display_name
--- 3. Authenticated user can claim an unclaimed member record matching an invite token
-DROP POLICY IF EXISTS "Allow controlled update on group_members" ON public.group_members;
-CREATE POLICY "Allow controlled update on group_members"
+-- UPDATE: Admin, self display_name update, or token claiming
+CREATE POLICY "group_members_update_policy"
 ON public.group_members
 FOR UPDATE
 TO authenticated
 USING (
-  public.is_group_admin(group_id, auth.uid())
-  OR user_id = auth.uid()
+  user_id = auth.uid()
+  OR public.is_group_admin(group_id, auth.uid())
   OR (user_id IS NULL AND invite_token IS NOT NULL)
 )
 WITH CHECK (
-  public.is_group_admin(group_id, auth.uid())
-  OR (user_id = auth.uid())
+  user_id = auth.uid()
+  OR public.is_group_admin(group_id, auth.uid())
   OR (user_id = auth.uid() AND role = 'member')
 );
 
--- DELETE:
--- Admins or members themselves can remove membership ONLY IF they have 0 transactions (Section 2 Deletion Guard)
-DROP POLICY IF EXISTS "Admins or members themselves can delete membership" ON public.group_members;
-CREATE POLICY "Admins or members themselves can delete membership"
+-- DELETE: Admins or members themselves ONLY IF they have 0 transactions (Section 2 Deletion Guard)
+CREATE POLICY "group_members_delete_policy"
 ON public.group_members
 FOR DELETE
 TO authenticated
@@ -496,7 +527,7 @@ USING (
   (
     user_id = auth.uid() 
     OR public.is_group_admin(group_id, auth.uid())
-    OR EXISTS (SELECT 1 FROM public.groups g WHERE g.id = group_id AND g.created_by = auth.uid())
+    OR public.is_group_creator(group_id, auth.uid())
   )
   AND NOT EXISTS (
     SELECT 1 FROM public.expenses e WHERE e.paid_by_member_id = group_members.id
@@ -508,12 +539,11 @@ USING (
 
 
 -- --------------------------------------------------------------------
--- 4.3 PROFILES TABLE
+-- 5.3 PROFILES TABLE
 -- --------------------------------------------------------------------
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "Users can view own profile and shared group members" ON public.profiles;
-CREATE POLICY "Users can view own profile and shared group members"
+CREATE POLICY "profiles_select_policy"
 ON public.profiles
 FOR SELECT
 TO authenticated
@@ -526,8 +556,7 @@ USING (
   )
 );
 
-DROP POLICY IF EXISTS "Users can update their own profile" ON public.profiles;
-CREATE POLICY "Users can update their own profile"
+CREATE POLICY "profiles_update_policy"
 ON public.profiles
 FOR UPDATE
 TO authenticated
@@ -536,20 +565,17 @@ WITH CHECK (id = auth.uid());
 
 
 -- --------------------------------------------------------------------
--- 4.4 EXPENSES TABLE (Group-Wide Transaction Management)
--- Section 3: Any member can create, edit, or delete any transaction in the group
+-- 5.4 EXPENSES TABLE (Group-Wide Transaction Management)
 -- --------------------------------------------------------------------
 ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "Members can view expenses in their groups" ON public.expenses;
-CREATE POLICY "Members can view expenses in their groups"
+CREATE POLICY "expenses_select_policy"
 ON public.expenses
 FOR SELECT
 TO authenticated
 USING (public.is_group_member(group_id, auth.uid()));
 
-DROP POLICY IF EXISTS "Members can insert expenses in their groups" ON public.expenses;
-CREATE POLICY "Members can insert expenses in their groups"
+CREATE POLICY "expenses_insert_policy"
 ON public.expenses
 FOR INSERT
 TO authenticated
@@ -558,16 +584,14 @@ WITH CHECK (
   AND public.is_group_member(group_id, auth.uid())
 );
 
-DROP POLICY IF EXISTS "Members can update expenses in their groups" ON public.expenses;
-CREATE POLICY "Members can update expenses in their groups"
+CREATE POLICY "expenses_update_policy"
 ON public.expenses
 FOR UPDATE
 TO authenticated
 USING (public.is_group_member(group_id, auth.uid()))
 WITH CHECK (public.is_group_member(group_id, auth.uid()));
 
-DROP POLICY IF EXISTS "Members can delete expenses in their groups" ON public.expenses;
-CREATE POLICY "Members can delete expenses in their groups"
+CREATE POLICY "expenses_delete_policy"
 ON public.expenses
 FOR DELETE
 TO authenticated
@@ -575,12 +599,11 @@ USING (public.is_group_member(group_id, auth.uid()));
 
 
 -- --------------------------------------------------------------------
--- 4.5 EXPENSE_SPLITS TABLE
+-- 5.5 EXPENSE_SPLITS TABLE
 -- --------------------------------------------------------------------
 ALTER TABLE public.expense_splits ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "Members can view splits for their group expenses" ON public.expense_splits;
-CREATE POLICY "Members can view splits for their group expenses"
+CREATE POLICY "expense_splits_select_policy"
 ON public.expense_splits
 FOR SELECT
 TO authenticated
@@ -592,8 +615,7 @@ USING (
   )
 );
 
-DROP POLICY IF EXISTS "Members can insert splits for their group expenses" ON public.expense_splits;
-CREATE POLICY "Members can insert splits for their group expenses"
+CREATE POLICY "expense_splits_insert_policy"
 ON public.expense_splits
 FOR INSERT
 TO authenticated
@@ -605,8 +627,7 @@ WITH CHECK (
   )
 );
 
-DROP POLICY IF EXISTS "Members can update splits for their group expenses" ON public.expense_splits;
-CREATE POLICY "Members can update splits for their group expenses"
+CREATE POLICY "expense_splits_update_policy"
 ON public.expense_splits
 FOR UPDATE
 TO authenticated
@@ -625,8 +646,7 @@ WITH CHECK (
   )
 );
 
-DROP POLICY IF EXISTS "Members can delete splits for their group expenses" ON public.expense_splits;
-CREATE POLICY "Members can delete splits for their group expenses"
+CREATE POLICY "expense_splits_delete_policy"
 ON public.expense_splits
 FOR DELETE
 TO authenticated
@@ -637,4 +657,3 @@ USING (
       AND public.is_group_member(e.group_id, auth.uid())
   )
 );
-
