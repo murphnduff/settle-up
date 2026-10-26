@@ -6,10 +6,10 @@ import {
   splitAmountEqually,
   splitAmountByPercentage,
   validateExactSplits,
-  EXPENSE_CATEGORIES,
+  buildGroupCategories,
 } from "@/lib/reconciliation";
 import { GroupMember } from "@/components/MemberInviteModal";
-import { X, Sparkles, AlertCircle, Edit3, CheckCircle2 } from "lucide-react";
+import { X, Sparkles, AlertCircle, Edit3, CheckCircle2, Plus } from "lucide-react";
 
 export type SplitMode = "equal" | "percentage" | "exact";
 
@@ -67,6 +67,7 @@ interface EditExpenseModalProps {
   onClose: () => void;
   expense: ExpenseItem | null;
   members: GroupMember[];
+  existingCategories?: string[];
   onSaved: () => void;
 }
 
@@ -95,6 +96,7 @@ export default function EditExpenseModal({
   onClose,
   expense,
   members,
+  existingCategories = [],
   onSaved,
 }: EditExpenseModalProps) {
   const supabase = createClient();
@@ -155,20 +157,14 @@ export default function EditExpenseModal({
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isCustomCategory, setIsCustomCategory] = useState(false);
+  const [customCategoryInput, setCustomCategoryInput] = useState("");
 
-  // Include custom imported category if it isn't in standard EXPENSE_CATEGORIES
-  const categoryOptions = useMemo(() => {
-    const base: string[] = [...EXPENSE_CATEGORIES];
-    const current = (category || "").trim();
-    if (
-      current &&
-      current.toLowerCase() !== "payment" &&
-      !base.some((c) => c.toLowerCase() === current.toLowerCase())
-    ) {
-      return [current, ...base];
-    }
-    return base;
-  }, [category]);
+  // Combine default preset categories with group-wide categories and current category
+  const categoryOptions = useMemo(
+    () => buildGroupCategories([], [...existingCategories, category]),
+    [existingCategories, category]
+  );
 
   // Sync native dialog
   useEffect(() => {
@@ -343,10 +339,11 @@ export default function EditExpenseModal({
 
     try {
       // 1. Update the expense record
+      const effectiveExpenseCategory = isCustomCategory
+        ? customCategoryInput.trim() || category.trim() || "General"
+        : (category || "").trim() || "General";
       const resolvedCategory =
-        type === "payment"
-          ? "Payment"
-          : (category || "").trim() || "General";
+        type === "payment" ? "Payment" : effectiveExpenseCategory;
 
       const updatePayload: Record<string, unknown> = {
         description:
@@ -672,18 +669,21 @@ export default function EditExpenseModal({
 
         {/* Category Selector (Strictly for Group Expenses; payments automatically use 'Payment') */}
         {type === "expense" && (
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             <label className="text-xs font-semibold text-slate-600 block">
               Category
             </label>
             <div className="flex flex-wrap gap-1.5">
               {categoryOptions.map((cat) => {
-                const isSelected = category === cat;
+                const isSelected = !isCustomCategory && category === cat;
                 return (
                   <button
                     key={cat}
                     type="button"
-                    onClick={() => setCategory(cat)}
+                    onClick={() => {
+                      setCategory(cat);
+                      setIsCustomCategory(false);
+                    }}
                     className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
                       isSelected
                         ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
@@ -694,7 +694,62 @@ export default function EditExpenseModal({
                   </button>
                 );
               })}
+              <button
+                type="button"
+                onClick={() => {
+                  setIsCustomCategory(true);
+                  setCustomCategoryInput("");
+                }}
+                className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer inline-flex items-center gap-1 ${
+                  isCustomCategory
+                    ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                    : "bg-white text-blue-600 border-blue-200 hover:bg-blue-50"
+                }`}
+              >
+                <Plus className="w-3 h-3" />
+                <span>Custom...</span>
+              </button>
             </div>
+
+            {isCustomCategory && (
+              <div className="flex items-center gap-2 pt-0.5 animate-in fade-in-50">
+                <input
+                  type="text"
+                  placeholder="Custom category (e.g. Golf, Ski Passes, Tolls)"
+                  value={customCategoryInput}
+                  onChange={(e) => setCustomCategoryInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      const trimmed = customCategoryInput.trim();
+                      if (trimmed) {
+                        setCategory(trimmed);
+                        setIsCustomCategory(false);
+                        setCustomCategoryInput("");
+                      }
+                    }
+                  }}
+                  autoFocus
+                  className="flex-1 border border-blue-300 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                {customCategoryInput.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const trimmed = customCategoryInput.trim();
+                      if (trimmed) {
+                        setCategory(trimmed);
+                        setIsCustomCategory(false);
+                        setCustomCategoryInput("");
+                      }
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 transition cursor-pointer shrink-0"
+                  >
+                    Apply
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
 

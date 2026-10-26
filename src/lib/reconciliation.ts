@@ -10,12 +10,45 @@ export const EXPENSE_CATEGORIES = [
   'General',
   'Dining out',
   'Groceries',
-  'Liquor',
+  'Drinks',
   'Lodging',
-  'Transport',
+  'Flights',
+  'Car Rental',
+  'Gas',
   'Activities',
-  'Insurance',
 ] as const;
+
+/**
+ * Combines the default preset categories with any unique custom categories
+ * already present in the group's expenses (excluding 'Payment').
+ */
+export function buildGroupCategories(
+  expenses: Array<{ category?: string; type?: string }> = [],
+  extraCategories: string[] = []
+): string[] {
+  const result: string[] = [...EXPENSE_CATEGORIES];
+  const seenLower = new Set(result.map((c) => c.toLowerCase()));
+
+  const addIfUnique = (raw?: string) => {
+    const trimmed = (raw || '').trim();
+    if (!trimmed) return;
+    const lower = trimmed.toLowerCase();
+    if (lower === 'payment' || seenLower.has(lower)) return;
+    seenLower.add(lower);
+    result.push(trimmed);
+  };
+
+  for (const exp of expenses) {
+    if (exp.type === 'payment') continue;
+    addIfUnique(exp.category);
+  }
+
+  for (const extra of extraCategories) {
+    addIfUnique(extra);
+  }
+
+  return result;
+}
 
 export interface MemberRecord {
   id: string;

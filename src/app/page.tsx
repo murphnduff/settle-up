@@ -20,6 +20,7 @@ import {
   generateGroupCsv,
   deriveGroupNameFromCsvFilename,
   EXPENSE_CATEGORIES,
+  buildGroupCategories,
   ParsedGroupCsvResult,
   SettlementInstruction,
   MemberSummaryRecord,
@@ -283,6 +284,8 @@ export function SettleUpDashboard({
   );
   const [type, setType] = useState<"expense" | "payment">("expense");
   const [category, setCategory] = useState<string>("General");
+  const [isCustomCategory, setIsCustomCategory] = useState<boolean>(false);
+  const [customCategoryInput, setCustomCategoryInput] = useState<string>("");
   const [splitMode, setSplitMode] = useState<SplitMode>("equal");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [percentageValues, setPercentageValues] = useState<
@@ -733,6 +736,12 @@ export function SettleUpDashboard({
   );
   const eurCategorySpend: CategorySpendRecord[] = useMemo(
     () => calculateCategorySpend(expenses, "EUR"),
+    [expenses]
+  );
+
+  // Dynamic per-group category options (merges EXPENSE_CATEGORIES presets with any unique custom categories in the group)
+  const groupCategories: string[] = useMemo(
+    () => buildGroupCategories(expenses),
     [expenses]
   );
 
@@ -1350,6 +1359,10 @@ export function SettleUpDashboard({
       calculatedSplits = exactSummary.splits;
     }
 
+    const effectiveExpenseCategory = isCustomCategory
+      ? customCategoryInput.trim() || category.trim() || "General"
+      : (category || "").trim() || "General";
+
     const expensePayload: Record<string, unknown> = {
       group_id: activeGroupId,
       paid_by_member_id: finalPayerId,
@@ -1357,9 +1370,7 @@ export function SettleUpDashboard({
         description.trim() ||
         (type === "payment" ? "Direct Payment" : "Group Expense"),
       category:
-        type === "payment"
-          ? "Payment"
-          : (category || "").trim() || "General",
+        type === "payment" ? "Payment" : effectiveExpenseCategory,
       amount_cents: totalCents,
       currency,
       type,
@@ -1470,6 +1481,8 @@ export function SettleUpDashboard({
     setDescription("");
     setAmount("");
     setCategory("General");
+    setIsCustomCategory(false);
+    setCustomCategoryInput("");
     setPercentageValues({});
     setExactValues({});
     startTransition(() => {
@@ -2381,18 +2394,21 @@ export function SettleUpDashboard({
 
                 {/* Category Selector (Strictly for Group Expenses; payments automatically use 'Payment') */}
                 {type === "expense" && (
-                  <div className="space-y-1.5">
+                  <div className="space-y-2">
                     <label className="text-xs font-semibold text-slate-600 block">
                       Category
                     </label>
                     <div className="flex flex-wrap gap-1.5">
-                      {EXPENSE_CATEGORIES.map((cat) => {
-                        const isSelected = category === cat;
+                      {groupCategories.map((cat) => {
+                        const isSelected = !isCustomCategory && category === cat;
                         return (
                           <button
                             key={cat}
                             type="button"
-                            onClick={() => setCategory(cat)}
+                            onClick={() => {
+                              setIsCustomCategory(false);
+                              setCategory(cat);
+                            }}
                             className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
                               isSelected
                                 ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
@@ -2403,7 +2419,43 @@ export function SettleUpDashboard({
                           </button>
                         );
                       })}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsCustomCategory(true);
+                          if (
+                            !customCategoryInput &&
+                            !EXPENSE_CATEGORIES.includes(
+                              category as (typeof EXPENSE_CATEGORIES)[number]
+                            )
+                          ) {
+                            setCustomCategoryInput(category);
+                          }
+                        }}
+                        className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
+                          isCustomCategory
+                            ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                            : "bg-white text-blue-600 border-dashed border-blue-300 hover:bg-blue-50"
+                        }`}
+                      >
+                        + Custom...
+                      </button>
                     </div>
+                    {isCustomCategory && (
+                      <div className="pt-0.5">
+                        <input
+                          type="text"
+                          value={customCategoryInput}
+                          onChange={(e) => {
+                            setCustomCategoryInput(e.target.value);
+                            setCategory(e.target.value);
+                          }}
+                          placeholder="Custom category (e.g. Golf, Ski Passes, Tolls)"
+                          autoFocus
+                          className="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-xs text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -3248,6 +3300,7 @@ export function SettleUpDashboard({
           onClose={() => setEditingExpense(null)}
           expense={editingExpense}
           members={members}
+          existingCategories={groupCategories}
           onSaved={() => {
             if (activeGroupId) {
               refreshExpenses(activeGroupId);

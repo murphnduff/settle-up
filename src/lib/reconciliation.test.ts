@@ -11,6 +11,8 @@ import {
   calculateBalancesByCurrency,
   calculateMemberBreakdown,
   calculateCategorySpend,
+  buildGroupCategories,
+  EXPENSE_CATEGORIES,
   canDeleteMember,
 } from './reconciliation.ts';
 import type {
@@ -705,6 +707,27 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     assert.strictEqual(breakdown[1].amountCents, 8000);
     assert.strictEqual(breakdown[1].amountFormatted, '80.00');
     assert.strictEqual(breakdown[1].percentage, 40);
+
+    // Verify preset categories and dynamic per-group custom category merging (excluding 'Payment')
+    assert.deepStrictEqual([...EXPENSE_CATEGORIES], [
+      'General',
+      'Dining out',
+      'Groceries',
+      'Drinks',
+      'Lodging',
+      'Flights',
+      'Car Rental',
+      'Gas',
+      'Activities',
+    ]);
+    const mergedCategories = buildGroupCategories([
+      ...ledger,
+      { category: 'Golf', type: 'expense' },
+      { category: 'Ski Passes', type: 'expense' },
+    ]);
+    assert.ok(mergedCategories.includes('Golf'));
+    assert.ok(mergedCategories.includes('Ski Passes'));
+    assert.ok(!mergedCategories.includes('Payment'));
   });
 });
 

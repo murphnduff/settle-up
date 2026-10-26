@@ -90,9 +90,10 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Super-Admin Toggle:** `Archive Group` / `Unarchive Group` button in the group header toolbar.
 - **Read-Only Lock:** When `activeGroup.is_archived === true`, displays an `"Archived — Read-Only"` badge and banner, hides the "Add Transaction" form, and disables editing/deleting transactions or members while keeping `Export CSV` and `Copy Group Link` active.
 
-### 4.5 Expense Categorization & Spend Breakdown (`calculateCategorySpend`)
-- **Preset Categories (`EXPENSE_CATEGORIES`):** `['General', 'Dining out', 'Groceries', 'Liquor', 'Lodging', 'Transport', 'Activities', 'Insurance']`.
-- **UI & Custom Category Preservation:** Group Expenses show a pill selector defaulting to `'General'` (and preserve any custom imported category string in `EditExpenseModal`). Direct Payments hide the selector and automatically store `'Payment'`.
+### 4.5 Expense Categorization & Spend Breakdown (`calculateCategorySpend` & `buildGroupCategories`)
+- **Preset Categories (`EXPENSE_CATEGORIES`):** `['General', 'Dining out', 'Groceries', 'Drinks', 'Lodging', 'Flights', 'Car Rental', 'Gas', 'Activities']`.
+- **Dynamic Per-Group Categories (`buildGroupCategories`):** Combines the 9 preset categories with any unique custom `expense.category` values already present in the active group's `expenses` (excluding `'Payment'`). Any custom category added to a transaction or imported via CSV automatically becomes a 1-click pill option for all future transactions in that group.
+- **Inline `+ Custom...` Input:** Both the main **Add Transaction** form and `EditExpenseModal` include a `+ Custom...` pill button that reveals an inline text input for on-the-fly custom categories (e.g. `'Golf'`, `'Ski Passes'`, `'Tolls'`). Direct Payments hide the category selector and automatically store `'Payment'`.
 - **Spend by Category Breakdown:** Aggregates `amount_cents` grouped by `category` per currency strictly for `type === 'expense'` (excluding payments), sorted descending by spend with formatted totals, percentage of group spend, and progress bars.
 - **Lossless CSV Mapping:** Maps `expenses.category` directly to/from the 3rd CSV column (`Category`).
 
@@ -111,9 +112,9 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 4. ✅ **Group Archiving ("Retire Group"):**
    - Collapsible `Archived (N)` sidebar section, Super-Admin `Archive Group` / `Unarchive Group` toggle, and full Read-Only lock (`Archived — Read-Only` badge/banner).
 
-### Phase 1.2: Expense Categorization (Completed ✅)
-5. ✅ **Categories & Category Breakdown:**
-   - Added `category` column support on `expenses` (`General`, `Dining out`, `Groceries`, `Liquor`, `Lodging`, `Transport`, `Activities`, `Insurance`), UI pill selectors in Add/Edit forms, ledger badges, **Spend by Category** summary card (`calculateCategorySpend` tested in Edge Case 13), and lossless CSV `Category` column import/export.
+### Phase 1.2: Expense Categorization & Custom Categories (Completed ✅)
+5. ✅ **Categories, Custom Categories & Spend Breakdown:**
+   - Added `category` column support on `expenses` with tailored presets (`General`, `Dining out`, `Groceries`, `Drinks`, `Lodging`, `Flights`, `Car Rental`, `Gas`, `Activities`), dynamic per-group category merging (`buildGroupCategories`), inline `+ Custom...` category input in Add/Edit forms, ledger badges, **Spend by Category** summary card (`calculateCategorySpend` tested in Edge Case 13), and lossless CSV `Category` column import/export.
 
 ### Phase 1.3: Disaster Recovery & Snapshots (Next Up)
 6. **Automated Daily Snapshots:**
