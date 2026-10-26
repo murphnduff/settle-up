@@ -77,6 +77,13 @@ export function splitAmountEqually(
 
 /**
  * Calculates net balances for each member grouped by currency.
+ *
+ * Net Balance(u) = SUM(Paid Expenses) - SUM(Split Shares)
+ *                + SUM(Direct Payments Made) - SUM(Direct Payments Received)
+ *
+ * Direct settlement transfers (`type === 'payment'`) never clamp or cap at $0.00;
+ * an overpayment naturally inverts the debtor/creditor balances past zero.
+ *
  * Positive balance = Creditor (is owed money)
  * Negative balance = Debtor (owes money)
  */
@@ -84,14 +91,26 @@ export function calculateBalancesByCurrency(
   members: MemberRecord[],
   expenses: ExpenseRecord[]
 ): Map<string, Map<string, number>> {
-  // Find all distinct currencies
-  const currencies = Array.from(
-    new Set(expenses.map((e) => e.currency || 'USD'))
-  );
+  const normalizeCurrencyFamily = (rawCur?: string): 'USD' | 'EUR' | string => {
+    const c = (rawCur || 'USD').trim();
+    if (c === '$' || c.toUpperCase() === 'USD') return 'USD';
+    if (c === '€' || c.toUpperCase() === 'EUR') return 'EUR';
+    return c;
+  };
+
+  // Preserve the caller's preferred label ('$' vs 'USD', '€' vs 'EUR') per currency family
+  const familyLabelMap = new Map<string, string>();
+  for (const e of expenses) {
+    const raw = (e.currency || 'USD').trim();
+    const fam = normalizeCurrencyFamily(raw);
+    if (!familyLabelMap.has(fam)) {
+      familyLabelMap.set(fam, raw);
+    }
+  }
 
   const currencyBalances = new Map<string, Map<string, number>>();
 
-  for (const cur of currencies) {
+  for (const [family, label] of familyLabelMap.entries()) {
     const balances = new Map<string, number>();
 
     // Initialize all members with 0 cents
@@ -100,7 +119,7 @@ export function calculateBalancesByCurrency(
     }
 
     const curExpenses = expenses.filter(
-      (e) => (e.currency || 'USD') === cur
+      (e) => normalizeCurrencyFamily(e.currency) === family
     );
 
     for (const exp of curExpenses) {
@@ -112,26 +131,32 @@ export function calculateBalancesByCurrency(
 
       if (!payerId || totalCents <= 0) continue;
 
-      // Payer paid total amount -> credit payer
+      // Payer paid total amount (Expense fronted OR Direct Payment sent) -> credit payer (+totalCents)
+      // Never clamp at 0: overpayments must invert balances past zero.
       const currentPayerBalance = balances.get(payerId) || 0;
       balances.set(payerId, currentPayerBalance + totalCents);
 
-      // Deduct each participant's split share -> debit participant
+      // Deduct each participant's split share (Expense share owed OR Direct Payment received) -> debit participant (-splitCents)
       for (const split of exp.splits) {
         const participantId = split.memberId || split.userId || '';
         if (!participantId) continue;
 
-        const splitCents =
+        const rawSplitCents =
           typeof split.splitAmountCents === 'number'
             ? Math.round(split.splitAmountCents)
             : Math.round((split.amount || 0) * 100);
+
+        const splitCents =
+          exp.type === 'payment' && exp.splits.length === 1 && rawSplitCents <= 0
+            ? totalCents
+            : rawSplitCents;
 
         const currentPartBalance = balances.get(participantId) || 0;
         balances.set(participantId, currentPartBalance - splitCents);
       }
     }
 
-    currencyBalances.set(cur, balances);
+    currencyBalances.set(label, balances);
   }
 
   return currencyBalances;

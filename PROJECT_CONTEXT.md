@@ -1,82 +1,107 @@
-# Settle Up (v1.0) — Production Architecture & Maintenance Reference
+# Settle Up - Master Architecture, Requirements & Test Spec (v1.0 Production)
 
-## 1. Tech Stack & Deployment
-- **Framework:** Next.js 16 (App Router, Turbopack, React 19, TypeScript)
-- **Styling & UI:** Tailwind CSS + Lucide Icons (responsive across Desktop, Tablet, and Mobile)
-- **Database & Auth:** Supabase (PostgreSQL 15+, Row-Level Security, Google OAuth strictly for Super-Admin)
-- **Testing & Linting:** Node 24 built-in test runner (`node --experimental-strip-types --test src/lib/reconciliation.test.ts`), ESLint 9
-- **Production Hosting:** Vercel (`https://split.murphnduff.org`)
-- **Deployment Workflow:** Local commits deployed via PowerShell `sync "commit message"` macro (`git add . && git commit -m ... && git push`)
-
----
-
-## 2. Security, Privacy & Anti-Indexing
-
-### 2.1 Single Global Super-Admin (`murph@murphnduff.org`)
-- **Database Enforcement (`public.is_super_admin()`):**
-  - PostgreSQL RLS helper verifies `lower(coalesce(auth.jwt() ->> 'email', '')) = 'murph@murphnduff.org'`.
-  - Only `public.is_super_admin()` is permitted to `INSERT`, `UPDATE`, or `DELETE` rows in `public.groups` or `INSERT` / `DELETE` rows in `public.group_members`.
-- **Client Enforcement (`src/app/page.tsx`):**
-  - Checks `user?.email?.toLowerCase() === 'murph@murphnduff.org'`.
-  - Super-Admin sees **all** groups in the left sidebar and has exclusive access to **Create Group** (`"Add me as a member"` checked by default, uncheckable for non-participant group creation), **Delete Group**, **Import CSV**, and **Manage Members** (Add/Delete members).
-
-### 2.2 Zero-Login Regular Users & Cross-Device Identity Recognition
-- **Root-Level Friendly Group URLs (`https://split.murphnduff.org/[slug]`):**
-  - Groups have a `slug` column in `public.groups` derived from `name` (`name.trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')`, e.g., `SoCal 2026` $\rightarrow$ `/SoCal_2026`).
-  - Dynamic route `src/app/[slug]/page.tsx` resolves groups by `slug` (case-insensitive), `id`, or space-normalized `name`. Legacy `/g/[group_id]` URLs automatically redirect to `/[slug]`.
-- **Instant Access & `?m=<Name>` Recognition:**
-  - Anyone opening `/<slug>` or `/<slug>?m=<Name>` immediately views the group without signing in.
-  - Selecting a member pill (`"Who are you in this group?"`) stores `settleup_member_<groupId>` and `recent_groups` in `localStorage`, sets that member as the default payer, and updates the browser URL to `/<slug>?m=<Name>` via `window.history.replaceState` for bookmarking and cross-device recognition.
-
-### 2.3 Stealth Root Homepage (`/`)
-- Unauthenticated visitors hitting `/` with no saved `recent_groups` in `localStorage` never query or enumerate `public.groups`.
-- Instead, `/` renders only a minimal **"Private Portal"** card with an **Admin Sign In** button and instructions to open a shared group link directly.
-
-### 2.4 Full Crawler & AI-Scraper Shield
-1. **`src/app/robots.ts`:** Serves `/robots.txt` with `User-agent: *` and `Disallow: /`.
-2. **`src/app/layout.tsx`:** Global `metadata.robots` configured with `index: false, follow: false, nocache: true, googleBot: { index: false, follow: false, noimageindex: true, 'max-snippet': -1 }`.
-3. **`next.config.ts`:** Global `X-Robots-Tag: noindex, nofollow, noarchive, nosnippet, noimageindex` HTTP response header applied to `/:path*`.
+## 1. Tech Stack & Infrastructure
+- **Frontend / Fullstack:** Next.js 16 (App Router, React 19, TypeScript, Tailwind CSS, Lucide Icons) — fully responsive across Desktop, Tablet, and Mobile.
+- **Backend / Database:** Supabase (PostgreSQL 15+, Google OAuth for Super-Admin only, Row-Level Security).
+- **Keep-Alive Heartbeat:** Next.js API route (`/api/heartbeat`) + `vercel.json` cron job executing a lightweight query (`SELECT id FROM groups LIMIT 1`) every 5 days to prevent Supabase Free Tier 7-day inactivity pausing.
+- **Testing & Tooling:** Node 24 built-in test runner (`node --experimental-strip-types --test`), ESLint 9.
+- **Hosting & Production:** Vercel (`https://split.murphnduff.org`).
+- **Deployment Workflow:** Local commits pushed via PowerShell `sync "commit message"` macro.
 
 ---
 
-## 3. Keep-Alive Architecture
-- **Heartbeat Endpoint (`src/app/api/heartbeat/route.ts`):** Executes `SELECT id FROM groups LIMIT 1` against Supabase and returns `{"status":"ok","timestamp":"..."}`.
-- **Vercel Cron (`vercel.json`):** Scheduled cron job invokes `/api/heartbeat` (`0 12 * * *`) to prevent Supabase Free Tier 7-day inactivity pausing.
+## 2. Security, Privacy & High-Trust Data Model
+
+### 2.1 Philosophy: Clean Root Slugs + Single Global Super-Admin
+- **Single Global Super-Admin (`murph@murphnduff.org`):**
+  - Admin rights are verified strictly by `user?.email?.toLowerCase() === 'murph@murphnduff.org'` (client) and `lower(auth.jwt() ->> 'email') = 'murph@murphnduff.org'` via the `public.is_super_admin()` database helper.
+  - Only `murph@murphnduff.org` can see the master group list, create groups, delete groups, manage members, or import CSV data.
+  - Admin is not required to be a participant in created groups (e.g. creating a group for others; "Add me as a member" checkbox defaults to `true`).
+- **Regular Users (Zero Sign-In & Root-Level Friendly URLs):**
+  - Access any group directly via root slug: `https://split.murphnduff.org/[slug]` (or `?m=<display_name>`).
+  - No OAuth login required for visitors.
+  - "Who Are You?" pill selection saves `active_member_id` and adds the group to `localStorage` (`recent_groups`), updating the URL to `?m=<name>` via `window.history.replaceState` for cross-device recognition.
+- **Stealth Root & Anti-Indexing Shield:**
+  - Visiting root `/` unauthenticated with no local groups renders a minimal "Private Portal" sign-in card with zero descriptive copy.
+  - `src/app/robots.ts` blocks all user agents and AI crawlers (`Googlebot`, `Google-Extended`, `GPTBot`, `CCBot`, etc.).
+  - Global `noindex, nofollow, noarchive, nosnippet` metadata in `src/app/layout.tsx` and `X-Robots-Tag` HTTP headers in `next.config.ts`.
+
+### 2.2 Database Tables & Schema
+- **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `created_at` (TIMESTAMPTZ).
+- **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ). Unique constraint on `(group_id, lower(display_name))`.
+- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
+- **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
 
 ---
 
-## 4. Core Features & Math Engine (`src/lib/reconciliation.ts`)
+## 3. Core Math Engine & Reconciliation Rules (`src/lib/reconciliation.ts`)
 
-### 4.1 Isolated Multi-Currency Ledgers & Integer-Cent Math
-- All monetary values are stored and calculated in integer cents (`amount_cents`, `split_amount_cents`) to eliminate floating-point drift.
-- **Currency Isolation:** `USD ($)` and `EUR (€)` ledgers are calculated and settled independently (`calculateBalancesByCurrency`, `calculateSettlements`) using a greedy largest-debtor to largest-creditor cash-flow minimization algorithm.
+### 3.1 Strict Integer-Cent Arithmetic
+- All financial math is computed in integer cents to prevent floating-point drift.
+- Isolated ledgers: `USD` and `EUR` calculate and settle independently.
 
-### 4.2 Three Split Modes (`Equal | % Percentage | $ Exact`)
-Available in both the main **Add Transaction** form (`src/app/page.tsx`) and **Edit Transaction** modal (`src/components/EditExpenseModal.tsx`):
-1. **Equal (`splitAmountEqually`):** Divides `totalAmountCents` evenly across selected members and distributes remainder pennies (`total % N`) deterministically.
-2. **% Percentage (`splitAmountByPercentage`):** Validates that member percentages sum to `100%` (within `0.01%` tolerance) and distributes integer cents via the Largest Fractional Remainder method so `SUM(splitAmountCents) === totalAmountCents`.
-3. **$ Exact (`validateExactSplits` + Live Auto-Sum):** Users type exact dollar/euro amounts per member; the top **Amount** field becomes `readOnly` (`Auto-Summed`) and automatically updates on every keystroke to equal the live sum of entered member amounts. Opening `EditExpenseModal` on an existing unequal split automatically pre-selects `$ Exact` mode.
+### 3.2 Net Balance Calculation
+For each user $u$ and currency $c$:
+$$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares}(u) + \sum \text{Direct Payments Made}(u) - \sum \text{Direct Payments Received}(u)$$
 
-### 4.3 Transaction Date Picker & Chronological Sorting
-- Both **Add Transaction** and **Edit Transaction** include an `<input type="date" />` field defaulting to today's local date (`YYYY-MM-DD`).
-- Transactions are stored in `public.expenses.date`, rendered with human-friendly formatting (e.g., `Oct 18, 2026`), and sorted chronologically by `date` descending with `created_at` descending as tie-breaker.
+### 3.3 Overpayment & Balance Inversion Handling (Critical)
+- Direct settlement transfers (`type === 'payment'`) must **never clamp or cap at $0.00**.
+- If Kevin owes Murph $20.00 ($\text{Kevin} = -2000\text{c}, \text{Murph} = +2000\text{c}$) and Kevin sends a payment of $22.00 ($2200\text{c}$) to Murph:
+  - Kevin's balance becomes: $-2000 + 2200 = +200\text{c}$ ($+\$2.00$, now a Creditor).
+  - Murph's balance becomes: $+2000 - 2200 = -200\text{c}$ ($-\$2.00$, now a Debtor).
+  - The Greedy Cash-Flow Settlement Plan must evaluate Murph as the debtor and Kevin as the creditor, generating: **"Murph pays Kevin : $2.00"**.
+- This scenario is codified as an explicit unit test in `src/lib/reconciliation.test.ts`.
 
-### 4.4 High-Speed Bulk CSV Import & Export
-- **Standard Multi-Column Net-Delta Format (`<slug>_<YYYY-MM-DD>_export.csv`):**
-  - **Header Row:** `Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,...`
-  - **Transaction Rows:** Each member column records their net delta (`+paid - share_owed`): `(amount_cents - payer_split_amount_cents) / 100` (positive) for the payer, `-split_amount_cents / 100` (negative) for other participants, and `0.00` for non-participants. `Category` is `'Payment'` for direct payments and `'General'` for expenses.
-  - **Footer Row:** `<YYYY-MM-DD>,Total balance, , ,<Currency>,<Net Member 1>,<Net Member 2>,...`
-- **Export CSV (`generateGroupCsv`):** Available to all users in the group header toolbar.
-- **Bulk Import CSV (`parseGroupCsv` + Batch Inserts):** Available to Super-Admin in the left sidebar. Reconstructs exact payers and odd-penny splits (`7857 x 6 + 7858`), batch-inserts missing `group_members` in 1 query, generates client-side UUIDs (`crypto.randomUUID()`), and executes 1 bulk `expenses` insert followed by 1 bulk `expense_splits` insert.
+### 3.4 Metric Aggregation: "Spent" Running Total
+- The running `USD Spent` and `EUR Spent` totals on the group dashboard strictly sum entries where `type === 'expense'`.
+- Direct settlement payments (`type === 'payment'`) are balance-clearing transfers, not consumption, and are strictly excluded from the "Spent" metric.
 
-### 4.5 Unit Test Suite (`src/lib/reconciliation.test.ts`)
-9 automated test suites verify all math and CSV edge cases via `npm test`:
-1. Indivisible Penny (`$100.00 / 3` $\rightarrow$ `3334, 3333, 3333` cents)
-2. Transitive Debt Simplification (`Murph -> Kev -> Fitz` $\rightarrow$ 1 transfer)
-3. 1-to-1 Direct Payment Offset
-4. Partial & Subset Splits
-5. Multi-Currency Isolation (`USD` vs `EUR`)
-6. Member Deletion Guard (`canDeleteMember`)
-7. Transaction Mutation Recalculation
-8. Custom Unequal Splits (`splitAmountByPercentage` `70/30` & `33.33/33.33/33.34` + `validateExactSplits`)
-9. Odd-Penny CSV Reconstruction (`parseGroupCsv` & `generateGroupCsv` round-trip verification)
+### 3.5 Cash-Flow Minimization (Greedy Algorithm)
+1. Filter out all zero-balance members ($|\text{balance}| = 0$).
+2. Split remaining members into **Debtors** ($\text{balance} < 0$) and **Creditors** ($\text{balance} > 0$).
+3. Sort both lists descending by absolute amount.
+4. Greedily match largest debtor to largest creditor for $\min(|\text{Debtor}|, \text{Creditor})$, decrementing balances until all debts clear.
+
+---
+
+## 4. Features & UX Specifications
+
+### 4.1 Split Modes (Group Expenses)
+- **`Equal`**: Evenly divides total among selected participants with remainder cents distributed deterministically.
+- **`% Percentage`**: Numeric inputs per member validating to $100\%$ with integer-cent rounding.
+- **`$ Exact`**: Inline dollar/euro input per member. The top-level `Amount` field automatically updates in real time to match the exact sum of member inputs, preventing double-entry.
+
+### 4.2 Unified CSV Import & Export (Splitwise-Compatible)
+- **Format:** `Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,...`
+- **Payer identification:** Member column with positive value (`val > 0`).
+- **Split allocations:** Member columns with negative values (`val < 0`) indicate owed split amounts. Payer's own share $= \text{Cost} - \text{val}$.
+- **Summary footer:** Ignores and generates trailing blank line + `<Date>,Total balance, , ,<Currency>,<Net 1>,...`.
+- **High-Speed Bulk Insert:** Import pre-generates client UUIDs and commits all members, expenses, and splits in three batched Supabase calls (< 0.5s).
+
+---
+
+## 5. Active Backlog & Future Development Roadmap
+
+### Phase 1.1: Core Polish & Settlement Integrity (Next Up)
+1. **Fix Direct Payment Overpayment Inversion:**
+   - Ensure direct payments allow net balances to invert past zero without clamping.
+   - Add automated test in `src/lib/reconciliation.test.ts`: Kevin owes $20, pays $22 $\rightarrow$ Murph owes Kevin $2.
+2. **Exclude Payments from Running Spent Metric:**
+   - Filter `type === 'expense'` on `USD Spent` and `EUR Spent` calculations.
+3. **Cumulative Member Breakdown:**
+   - Display a card/table showing each member's **Out-of-Pocket Fronted** vs. **Accrued Cost Consumed** vs. **Net Balance**.
+4. **Group Archiving ("Retire Group"):**
+   - Add `is_archived` column to `groups`. Archived groups move to a collapsed sidebar folder and lock to read-only.
+
+### Phase 1.2: Expense Categorization
+5. **Categories & Category Breakdown:**
+   - Add `category` column to `expenses` (Dining, Groceries, Lodging, Transport, General) with UI pill selectors, category spend totals, and direct CSV column mapping.
+
+### Phase 1.3: Disaster Recovery & Snapshots
+6. **Automated Daily Snapshots:**
+   - Scheduled GitHub Action or cron task pulling daily table dumps into timestamped private archives.
+
+### Phase 1.4: Receipts & AI Vision
+7. **Receipt Attachments & Extraction:**
+   - Supabase Storage upload for receipts + Gemini Multimodal API route to auto-extract merchant, date, amount, currency, and category.
+   

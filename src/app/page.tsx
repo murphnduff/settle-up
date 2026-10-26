@@ -627,11 +627,15 @@ export function SettleUpDashboard({
     return members[0]?.id || "";
   }, [payerId, activeMemberId, members]);
 
-  // Currency totals
+  // Currency totals (strictly aggregate rows where type === 'expense', excluding settlement payments)
   const usdTotal = useMemo(
     () =>
       expenses
-        .filter((e) => e.currency === "$" || e.currency === "USD")
+        .filter(
+          (e) =>
+            e.type === "expense" &&
+            (e.currency === "$" || e.currency === "USD")
+        )
         .reduce((acc, e) => acc + e.amount, 0),
     [expenses]
   );
@@ -639,7 +643,11 @@ export function SettleUpDashboard({
   const eurTotal = useMemo(
     () =>
       expenses
-        .filter((e) => e.currency === "€" || e.currency === "EUR")
+        .filter(
+          (e) =>
+            e.type === "expense" &&
+            (e.currency === "€" || e.currency === "EUR")
+        )
         .reduce((acc, e) => acc + e.amount, 0),
     [expenses]
   );
@@ -1816,7 +1824,15 @@ export function SettleUpDashboard({
                   <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
                     <button
                       type="button"
-                      onClick={() => setType("expense")}
+                      onClick={() => {
+                        setType("expense");
+                        if (
+                          members.length > 1 &&
+                          selectedMembers.length <= 1
+                        ) {
+                          setSelectedMembers(members.map((m) => m.id));
+                        }
+                      }}
                       className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
                         type === "expense"
                           ? "bg-white text-slate-900 shadow-2xs"
@@ -1831,7 +1847,8 @@ export function SettleUpDashboard({
                         setType("payment");
                         if (
                           members.length > 0 &&
-                          selectedMembers.length !== 1
+                          (selectedMembers.length !== 1 ||
+                            selectedMembers[0] === effectivePayerId)
                         ) {
                           const defaultRecipient =
                             members.find((m) => m.id !== effectivePayerId) ||
@@ -1857,7 +1874,21 @@ export function SettleUpDashboard({
                     </label>
                     <select
                       value={effectivePayerId}
-                      onChange={(e) => setPayerId(e.target.value)}
+                      onChange={(e) => {
+                        const nextPayer = e.target.value;
+                        setPayerId(nextPayer);
+                        if (
+                          type === "payment" &&
+                          selectedMembers.includes(nextPayer)
+                        ) {
+                          const nextRecipient = members.find(
+                            (m) => m.id !== nextPayer
+                          );
+                          setSelectedMembers(
+                            nextRecipient ? [nextRecipient.id] : []
+                          );
+                        }
+                      }}
                       className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                       required
                     >
@@ -1944,11 +1975,15 @@ export function SettleUpDashboard({
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g. Dinner, Fuel, Groceries, Green Fees"
+                      placeholder={
+                        type === "payment"
+                          ? "e.g. Settlement payment (optional)"
+                          : "e.g. Dinner, Fuel, Groceries, Green Fees"
+                      }
                       value={description}
                       onChange={(e) => setDescription(e.target.value)}
                       className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-                      required
+                      required={type === "expense"}
                     />
                   </div>
                   <div>
@@ -2051,13 +2086,18 @@ export function SettleUpDashboard({
                       <div className="flex flex-wrap gap-2">
                         {members.map((m) => {
                           const isSelected = selectedMembers.includes(m.id);
+                          const isSelfPayment =
+                            type === "payment" && m.id === effectivePayerId;
                           return (
                             <button
                               type="button"
                               key={m.id}
+                              disabled={isSelfPayment}
                               onClick={() => {
                                 if (type === "payment") {
-                                  setSelectedMembers([m.id]);
+                                  if (m.id !== effectivePayerId) {
+                                    setSelectedMembers([m.id]);
+                                  }
                                 } else {
                                   setSelectedMembers((prev) =>
                                     prev.includes(m.id)
@@ -2066,14 +2106,16 @@ export function SettleUpDashboard({
                                   );
                                 }
                               }}
-                              className={`px-3 py-1.5 rounded-full text-xs font-medium border transition cursor-pointer flex items-center gap-1.5 ${
-                                isSelected
-                                  ? "bg-blue-600 text-white border-blue-600 shadow-xs"
-                                  : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                              className={`px-3 py-1.5 rounded-full text-xs font-medium border transition flex items-center gap-1.5 ${
+                                isSelfPayment
+                                  ? "bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed opacity-60"
+                                  : isSelected
+                                    ? "bg-blue-600 text-white border-blue-600 shadow-xs cursor-pointer"
+                                    : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 cursor-pointer"
                               }`}
                             >
                               <span>{m.name}</span>
-                              {isSelected && (
+                              {isSelected && !isSelfPayment && (
                                 <span className="text-[10px]">✓</span>
                               )}
                             </button>

@@ -497,5 +497,64 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     );
     assert.strictEqual(exportedCsv, csvSample);
   });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 10: Direct Payment Overpayment & Balance Inversion ($20 debt, $22 payment -> $2 reverse settlement)
+  // --------------------------------------------------------------------------
+  it('Edge Case 10: Overpayment Inversion never clamps at $0.00 ($20 debt, $22 payment -> Murph pays Kevin $2.00)', () => {
+    const kevin: MemberRecord = { id: 'mem-kevin', name: 'Kevin' };
+    const groupMembers = [murph, kevin];
+
+    // 1. Kevin owes Murph $20.00 (Murph paid $40.00 split equally: $20.00 each)
+    const initialExpense: ExpenseRecord = {
+      id: 'exp-initial-20',
+      paidByMemberId: murph.id,
+      amountCents: 4000,
+      currency: 'USD',
+      type: 'expense',
+      splits: [
+        { memberId: murph.id, splitAmountCents: 2000 },
+        { memberId: kevin.id, splitAmountCents: 2000 },
+      ],
+    };
+
+    // 2. Kevin sends a direct payment of $22.00 (2200 cents) to Murph
+    const overpayment: ExpenseRecord = {
+      id: 'pay-over-22',
+      paidByMemberId: kevin.id,
+      amountCents: 2200,
+      currency: 'USD',
+      type: 'payment',
+      splits: [{ memberId: murph.id, splitAmountCents: 2200 }],
+    };
+
+    const balances = calculateBalancesByCurrency(groupMembers, [
+      initialExpense,
+      overpayment,
+    ]).get('USD');
+
+    assert.ok(balances);
+    // Kevin: -2000 + 2200 = +200 cents (+$2.00 Creditor)
+    assert.strictEqual(balances.get(kevin.id), 200);
+    // Murph: +2000 - 2200 = -200 cents (-$2.00 Debtor)
+    assert.strictEqual(balances.get(murph.id), -200);
+
+    const settlements = calculateSettlements(groupMembers, [
+      initialExpense,
+      overpayment,
+    ]);
+
+    assert.strictEqual(settlements.length, 1);
+    assert.strictEqual(settlements[0].fromMemberId, murph.id);
+    assert.strictEqual(settlements[0].fromMemberName, 'Murph');
+    assert.strictEqual(settlements[0].toMemberId, kevin.id);
+    assert.strictEqual(settlements[0].toMemberName, 'Kevin');
+    assert.strictEqual(settlements[0].amountCents, 200);
+    assert.strictEqual(settlements[0].amountFormatted, '2.00');
+    assert.strictEqual(
+      `${settlements[0].fromUser} pays ${settlements[0].toUser} : $${settlements[0].amountFormatted}`,
+      'Murph pays Kevin : $2.00'
+    );
+  });
 });
 
