@@ -11,8 +11,12 @@ export interface ParsedReceiptData {
 }
 
 export interface CompressedReceiptResult {
+  /** Crisp 1600px (0.82 quality) JPEG Blob for Supabase Storage upload */
   blob: Blob;
+  /** Compact 1024px (0.70 quality) JPEG base64 string for fast AI OCR */
   base64: string;
+  /** Explicit alias for the compact 1024px (0.70 quality) AI payload */
+  aiBase64: string;
   mimeType: string;
   extension: string;
   previewUrl: string;
@@ -114,16 +118,55 @@ function loadImageElement(file: File): Promise<HTMLImageElement> {
   });
 }
 
+function renderImageToJpegDataUrl(
+  img: HTMLImageElement,
+  maxDimension: number,
+  quality: number
+): string {
+  const origWidth = img.naturalWidth || img.width || 1;
+  const origHeight = img.naturalHeight || img.height || 1;
+
+  let targetWidth = origWidth;
+  let targetHeight = origHeight;
+
+  const largestSide = Math.max(origWidth, origHeight);
+  if (largestSide > maxDimension) {
+    const scale = maxDimension / largestSide;
+    targetWidth = Math.max(1, Math.round(origWidth * scale));
+    targetHeight = Math.max(1, Math.round(origHeight * scale));
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Browser 2D canvas context is unavailable.");
+  }
+
+  // Fill white background so transparent PNGs/WebPs render cleanly as JPEG
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, targetWidth, targetHeight);
+  ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
 /**
- * Compresses image files (image/jpeg, image/png, image/webp, HEIC, Ultra-HDR JPEG, etc.)
- * using an HTML5 <canvas> down to maxDimension (1600px) at JPEG quality 0.80 so mobile
- * photos stay under ~400KB. Falls back to raw file base64 if canvas decoding fails.
- * Passes PDFs through as-is.
+ * Dual-resolution client compression:
+ * 1. Generates a compact 1024px max-dimension JPEG at 0.70 quality (`aiBase64` / `base64`)
+ *    specifically for `POST /api/parse-receipt` (reduces payload size & vision token latency by ~65%).
+ * 2. Generates a crisp 1600px max-dimension JPEG at 0.82 quality (`blob` / `previewUrl`)
+ *    for the Supabase Storage `'receipts'` bucket upload.
+ * Falls back to raw file base64 if canvas decoding fails. Passes PDFs through as-is.
  */
 export async function compressReceiptFile(
   file: File,
-  maxDimension = 1600,
-  quality = 0.8
+  storageMaxDimension = 1600,
+  storageQuality = 0.82,
+  aiMaxDimension = 1024,
+  aiQuality = 0.7
 ): Promise<CompressedReceiptResult> {
   const fileName = file.name || "";
   const isPdf =
@@ -135,6 +178,7 @@ export async function compressReceiptFile(
     return {
       blob: file,
       base64,
+      aiBase64: base64,
       mimeType: "application/pdf",
       extension: "pdf",
       previewUrl,
@@ -150,38 +194,27 @@ export async function compressReceiptFile(
   if (isLikelyImage) {
     try {
       const img = await loadImageElement(file);
-      const origWidth = img.naturalWidth || img.width || 1;
-      const origHeight = img.naturalHeight || img.height || 1;
 
-      let targetWidth = origWidth;
-      let targetHeight = origHeight;
+      // 1. Compact 1024px @ 0.70 quality JPEG for fast AI OCR
+      const aiDataUrl = renderImageToJpegDataUrl(
+        img,
+        aiMaxDimension,
+        aiQuality
+      );
+      const aiCleanBase64 = aiDataUrl.replace(/^data:[^;]+;base64,/i, "");
 
-      const largestSide = Math.max(origWidth, origHeight);
-      if (largestSide > maxDimension) {
-        const scale = maxDimension / largestSide;
-        targetWidth = Math.max(1, Math.round(origWidth * scale));
-        targetHeight = Math.max(1, Math.round(origHeight * scale));
-      }
+      // 2. Crisp 1600px @ 0.82 quality JPEG for Supabase Storage
+      const storageDataUrl = renderImageToJpegDataUrl(
+        img,
+        storageMaxDimension,
+        storageQuality
+      );
+      const storageCleanBase64 = storageDataUrl.replace(
+        /^data:[^;]+;base64,/i,
+        ""
+      );
 
-      const canvas = document.createElement("canvas");
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        throw new Error("Browser 2D canvas context is unavailable.");
-      }
-
-      // Fill white background so transparent PNGs/WebPs render cleanly as JPEG
-      ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, targetWidth, targetHeight);
-      ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
-
-      const dataUrl = canvas.toDataURL("image/jpeg", quality);
-      const cleanBase64 = dataUrl.replace(/^data:[^;]+;base64,/i, "");
-
-      // Convert dataUrl to Blob (faster and avoids a second JPEG encode pass)
-      const byteString = atob(cleanBase64);
+      const byteString = atob(storageCleanBase64);
       const byteNumbers = new Uint8Array(byteString.length);
       for (let i = 0; i < byteString.length; i++) {
         byteNumbers[i] = byteString.charCodeAt(i);
@@ -190,10 +223,11 @@ export async function compressReceiptFile(
 
       return {
         blob,
-        base64: cleanBase64,
+        base64: aiCleanBase64,
+        aiBase64: aiCleanBase64,
         mimeType: "image/jpeg",
         extension: "jpg",
-        previewUrl: dataUrl,
+        previewUrl: storageDataUrl,
         isPdf: false,
       };
     } catch {
@@ -207,6 +241,7 @@ export async function compressReceiptFile(
       return {
         blob: file,
         base64: cleanBase64,
+        aiBase64: cleanBase64,
         mimeType: fallbackMime,
         extension: fallbackExt,
         previewUrl: URL.createObjectURL(file),
@@ -221,10 +256,38 @@ export async function compressReceiptFile(
   return {
     blob: file,
     base64: cleanBase64,
+    aiBase64: cleanBase64,
     mimeType: file.type || "image/jpeg",
     extension: "jpg",
     previewUrl: URL.createObjectURL(file),
     isPdf: false,
+  };
+}
+
+/**
+ * Fetches a shared receipt URL (e.g. from `?shared_receipt=<url>`) and compresses it to a
+ * compact 1024px @ 0.70 JPEG base64 payload for fast AI OCR extraction.
+ */
+export async function compressRemoteReceiptForAi(
+  receiptUrl: string
+): Promise<{ base64: string; mimeType: string }> {
+  const response = await fetch(receiptUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch shared receipt (${response.status} ${response.statusText})`
+    );
+  }
+  const blob = await response.blob();
+  const isPdf =
+    blob.type === "application/pdf" || isPdfReceiptUrl(receiptUrl);
+  const fileName = isPdf ? "shared-receipt.pdf" : "shared-receipt.jpg";
+  const file = new File([blob], fileName, {
+    type: blob.type || (isPdf ? "application/pdf" : "image/jpeg"),
+  });
+  const compressed = await compressReceiptFile(file);
+  return {
+    base64: compressed.aiBase64,
+    mimeType: compressed.mimeType,
   };
 }
 

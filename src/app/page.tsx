@@ -49,6 +49,7 @@ import EditExpenseModal, {
 } from "@/components/EditExpenseModal";
 import {
   compressReceiptFile,
+  compressRemoteReceiptForAi,
   uploadReceiptToStorage,
   parseReceiptWithAi,
   isPdfReceiptUrl,
@@ -375,6 +376,8 @@ export function SettleUpDashboard({
   const [exactValues, setExactValues] = useState<Record<string, string>>({});
 
   // Add Transaction Receipt & AI Extraction state
+  const addTransactionFormRef = useRef<HTMLFormElement>(null);
+  const [isFormHighlighted, setIsFormHighlighted] = useState<boolean>(false);
   const addReceiptCameraInputRef = useRef<HTMLInputElement>(null);
   const addReceiptInputRef = useRef<HTMLInputElement>(null);
   const addReceiptPdfInputRef = useRef<HTMLInputElement>(null);
@@ -391,6 +394,10 @@ export function SettleUpDashboard({
   >(null);
   const [receiptScanError, setReceiptScanError] = useState<string | null>(null);
   const [scannedCategories, setScannedCategories] = useState<string[]>([]);
+  const [sharedReceiptBannerUrl, setSharedReceiptBannerUrl] = useState<
+    string | null
+  >(null);
+  const processedSharedReceiptRef = useRef<string | null>(null);
   const [viewingReceipt, setViewingReceipt] = useState<{
     url: string;
     title: string;
@@ -1192,6 +1199,8 @@ export function SettleUpDashboard({
   };
 
   // Scan / Attach Receipt Handler in Add Transaction Form
+  // Uses dual-resolution compression (1024px @ 0.70 for AI OCR, 1600px @ 0.82 for Storage)
+  // and decouples form auto-fill from the storage upload so fields populate the instant AI OCR finishes.
   const handleAddReceiptFileChange = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
@@ -1209,36 +1218,129 @@ export function SettleUpDashboard({
       const compressed = await compressReceiptFile(file);
       setReceiptPreviewUrl(compressed.previewUrl);
 
-      const [uploadOutcome, parseOutcome] = await Promise.allSettled([
-        uploadReceiptToStorage(
-          supabase,
-          activeGroupId,
-          compressed.blob,
-          compressed.extension,
-          compressed.mimeType
-        ),
-        parseReceiptWithAi(compressed.base64, compressed.mimeType),
-      ]);
+      // 1. Trigger AI OCR immediately using the compact 1024px @ 0.70 payload and populate form the instant it resolves
+      const parseTask = parseReceiptWithAi(
+        compressed.aiBase64,
+        compressed.mimeType
+      )
+        .then(async (parsed) => {
+          if (parsed.description) {
+            setDescription(parsed.description);
+          }
+          if (parsed.currency) {
+            const detectedIso = normalizeCurrencyCode(parsed.currency);
+            setCurrency(detectedIso);
+            await ensureCurrenciesInGroup([detectedIso]);
+          }
+          if (parsed.date) {
+            setTransactionDate(parsed.date);
+          }
+          if (parsed.category) {
+            const cleanScannedCat = parsed.category.trim();
+            const existingMatch = groupCategories.find(
+              (c) => c.toLowerCase() === cleanScannedCat.toLowerCase()
+            );
+            const resolvedCat = existingMatch || cleanScannedCat;
+            if (!existingMatch && resolvedCat) {
+              setScannedCategories((prev) =>
+                prev.some((c) => c.toLowerCase() === resolvedCat.toLowerCase())
+                  ? prev
+                  : [...prev, resolvedCat]
+              );
+            }
+            setIsCustomCategory(false);
+            setCustomCategoryInput("");
+            setCategory(resolvedCat);
+          }
+          // Only pre-fill Amount when NOT in '$ Exact' split mode (where Amount is auto-summed from member inputs)
+          if (
+            typeof parsed.amount === "number" &&
+            parsed.amount > 0 &&
+            splitModeRef.current !== "exact"
+          ) {
+            setAmount(parsed.amount.toFixed(2));
+          }
+          setReceiptStatusMessage(
+            "Receipt scanned — fields pre-filled for review!"
+          );
+        })
+        .catch((err: unknown) => {
+          const reason =
+            err instanceof Error ? err.message : "Unknown OCR error";
+          setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
+          setReceiptStatusMessage("Receipt attached.");
+        })
+        .finally(() => {
+          setIsScanningReceipt(false);
+        });
 
-      if (uploadOutcome.status === "fulfilled") {
-        setReceiptUrl(uploadOutcome.value);
-      } else {
-        const msg =
-          uploadOutcome.reason instanceof Error
-            ? uploadOutcome.reason.message
-            : "Failed to upload receipt to storage.";
-        setNotification({ type: "error", message: msg });
-      }
+      // 2. Upload crisp 1600px @ 0.82 receipt to Supabase Storage in parallel without blocking form auto-fill
+      const uploadTask = uploadReceiptToStorage(
+        supabase,
+        activeGroupId,
+        compressed.blob,
+        compressed.extension,
+        compressed.mimeType
+      )
+        .then((uploadedUrl) => {
+          setReceiptUrl(uploadedUrl);
+        })
+        .catch((err: unknown) => {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : "Failed to upload receipt to storage.";
+          setNotification({ type: "error", message: msg });
+        })
+        .finally(() => {
+          setIsUploadingReceipt(false);
+        });
 
-      if (parseOutcome.status === "fulfilled") {
-        const parsed = parseOutcome.value;
+      await Promise.all([parseTask, uploadTask]);
+    } catch (err: unknown) {
+      const reason =
+        err instanceof Error ? err.message : "Could not process receipt file.";
+      setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
+      setReceiptStatusMessage(null);
+      setIsScanningReceipt(false);
+      setIsUploadingReceipt(false);
+    }
+  };
+
+  // Auto-attach and auto-scan a shared receipt URL (from Web Share Target /share-receipt or ?shared_receipt=<url>)
+  const attachAndScanSharedReceipt = useCallback(
+    async (sharedUrl: string, targetGrp?: Group | null) => {
+      const cleanUrl = sharedUrl.trim();
+      if (!cleanUrl) return;
+
+      setType("expense");
+      setReceiptUrl(cleanUrl);
+      setReceiptPreviewUrl(cleanUrl);
+      setReceiptFileName("Shared Receipt");
+      setReceiptScanError(null);
+      setIsScanningReceipt(true);
+      setIsUploadingReceipt(false);
+      setReceiptStatusMessage("Scanning shared receipt...");
+
+      setTimeout(() => {
+        addTransactionFormRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+        });
+      }, 120);
+
+      try {
+        const { base64, mimeType } =
+          await compressRemoteReceiptForAi(cleanUrl);
+        const parsed = await parseReceiptWithAi(base64, mimeType);
+
         if (parsed.description) {
           setDescription(parsed.description);
         }
         if (parsed.currency) {
           const detectedIso = normalizeCurrencyCode(parsed.currency);
           setCurrency(detectedIso);
-          await ensureCurrenciesInGroup([detectedIso]);
+          await ensureCurrenciesInGroup([detectedIso], targetGrp);
         }
         if (parsed.date) {
           setTransactionDate(parsed.date);
@@ -1260,7 +1362,6 @@ export function SettleUpDashboard({
           setCustomCategoryInput("");
           setCategory(resolvedCat);
         }
-        // Only pre-fill Amount when NOT in '$ Exact' split mode (where Amount is auto-summed from member inputs)
         if (
           typeof parsed.amount === "number" &&
           parsed.amount > 0 &&
@@ -1269,25 +1370,99 @@ export function SettleUpDashboard({
           setAmount(parsed.amount.toFixed(2));
         }
         setReceiptStatusMessage(
-          "Receipt scanned — fields pre-filled for review!"
+          "Shared receipt scanned — fields pre-filled for review!"
         );
-      } else {
+      } catch (err: unknown) {
         const reason =
-          parseOutcome.reason instanceof Error
-            ? parseOutcome.reason.message
-            : "Unknown OCR error";
-        setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
-        setReceiptStatusMessage("Receipt attached.");
+          err instanceof Error ? err.message : "Unknown OCR error";
+        setReceiptScanError(`Could not auto-scan shared receipt: ${reason}`);
+        setReceiptStatusMessage("Shared receipt attached.");
+      } finally {
+        setIsScanningReceipt(false);
       }
-    } catch (err: unknown) {
-      const reason =
-        err instanceof Error ? err.message : "Could not process receipt file.";
-      setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
-      setReceiptStatusMessage(null);
-    } finally {
-      setIsScanningReceipt(false);
-      setIsUploadingReceipt(false);
-    }
+    },
+    [ensureCurrenciesInGroup, groupCategories]
+  );
+
+  // Detect ?shared_receipt=<url> or ?share_error=<msg> on page load and auto-attach/scan when activeGroup resolves
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let cancelled = false;
+
+    Promise.resolve().then(() => {
+      if (cancelled) return;
+      const params = new URLSearchParams(window.location.search);
+      const shareError = params.get("share_error")?.trim();
+      if (shareError) {
+        setNotification({
+          type: "error",
+          message: `Could not share receipt: ${shareError}`,
+        });
+        params.delete("share_error");
+        const nextSearch = params.toString();
+        window.history.replaceState(
+          null,
+          "",
+          `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}`
+        );
+      }
+
+      const sharedUrl = params.get("shared_receipt")?.trim();
+      if (!sharedUrl) return;
+
+      // Show the group picker banner if the user landed on "/" and has multiple groups
+      if (!routeTarget) {
+        setSharedReceiptBannerUrl(sharedUrl);
+      }
+
+      if (!activeGroup) return;
+      const key = `${activeGroup.id}::${sharedUrl}`;
+      if (processedSharedReceiptRef.current === key) return;
+      processedSharedReceiptRef.current = key;
+
+      // Clean up ?shared_receipt from the address bar via window.history.replaceState
+      params.delete("shared_receipt");
+      const nextSearch = params.toString();
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}`
+      );
+
+      attachAndScanSharedReceipt(sharedUrl, activeGroup);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeGroup, routeTarget, attachAndScanSharedReceipt]);
+
+  // 1-Click "Settle" button handler in the Settlement Plan
+  const handleQuickSettle = (
+    instruction: SettlementInstruction,
+    targetCurrencyCode: string
+  ) => {
+    if (activeGroup?.is_archived) return;
+    const resolvedCurrency = normalizeCurrencyCode(targetCurrencyCode);
+
+    setType("payment");
+    setSplitMode("equal");
+    setPayerId(instruction.fromMemberId);
+    setSelectedMembers([instruction.toMemberId]);
+    setAmount((instruction.amountCents / 100).toFixed(2));
+    setCurrency(resolvedCurrency);
+    setDescription("Settlement Payment");
+    handleRemoveAddReceipt();
+
+    setIsFormHighlighted(true);
+    setTimeout(() => {
+      setIsFormHighlighted(false);
+    }, 2200);
+
+    addTransactionFormRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
   };
 
   const handleRemoveAddReceipt = () => {
@@ -2202,6 +2377,56 @@ export function SettleUpDashboard({
         </div>
       )}
 
+      {/* Shared Receipt Group Picker Banner (when shared via Web Share Target to /?shared_receipt=...) */}
+      {sharedReceiptBannerUrl && activeGroups.length > 1 && (
+        <div className="max-w-7xl mx-auto px-6 pt-4">
+          <div className="p-3.5 rounded-xl bg-blue-50 border border-blue-200 text-xs text-blue-900 flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="inline-flex items-center gap-1.5 font-bold text-blue-800">
+                <Receipt className="w-4 h-4 text-blue-600 shrink-0" />
+                <span>Shared Receipt Ready — Choose Group:</span>
+              </span>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {activeGroups.map((g) => {
+                  const isCurrent = g.id === activeGroupId;
+                  const slugOrId =
+                    g.slug || generateGroupSlug(g.name) || g.id;
+                  return (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() => {
+                        setActiveGroupId(g.id);
+                        addRecentGroupId(g.id);
+                        if (typeof window !== "undefined") {
+                          window.history.pushState(null, "", `/${slugOrId}`);
+                        }
+                        attachAndScanSharedReceipt(sharedReceiptBannerUrl, g);
+                        setSharedReceiptBannerUrl(null);
+                      }}
+                      className={`px-3 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
+                        isCurrent
+                          ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                          : "bg-white text-blue-800 border-blue-200 hover:bg-blue-100"
+                      }`}
+                    >
+                      {g.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSharedReceiptBannerUrl(null)}
+              className="text-blue-400 hover:text-blue-700 text-xs px-2 py-0.5 rounded cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       {!isSuperAdmin && groups.length === 0 && !activeGroup ? (
         <div className="max-w-md mx-auto px-6 py-24">
           <div className="bg-white border border-slate-200 p-8 rounded-2xl shadow-xs text-center space-y-4">
@@ -2275,9 +2500,26 @@ export function SettleUpDashboard({
                             handleDeleteGroup(g.id, g.name);
                           }}
                           title="Delete group"
-                          className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
+                          aria-label={`Delete group ${g.name}`}
+                          className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1.5 rounded-md transition-colors shrink-0 cursor-pointer"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth={2}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            className="w-4 h-4 shrink-0"
+                            aria-hidden="true"
+                          >
+                            <path d="M3 6h18" />
+                            <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                            <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                            <line x1="10" x2="10" y1="11" y2="17" />
+                            <line x1="14" x2="14" y1="11" y2="17" />
+                          </svg>
                         </button>
                       )}
                     </div>
@@ -2332,9 +2574,26 @@ export function SettleUpDashboard({
                               handleDeleteGroup(g.id, g.name);
                             }}
                             title="Delete group"
-                            className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
+                            aria-label={`Delete archived group ${g.name}`}
+                            className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1.5 rounded-md transition-colors shrink-0 cursor-pointer"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth={2}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="w-4 h-4 shrink-0"
+                              aria-hidden="true"
+                            >
+                              <path d="M3 6h18" />
+                              <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                              <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                              <line x1="10" x2="10" y1="11" y2="17" />
+                              <line x1="14" x2="14" y1="11" y2="17" />
+                            </svg>
                           </button>
                         )}
                       </div>
@@ -2966,8 +3225,13 @@ export function SettleUpDashboard({
               {/* Add Transaction Form (Hidden when group is archived) */}
               {!activeGroup.is_archived && (
               <form
+                ref={addTransactionFormRef}
                 onSubmit={handleAddExpense}
-                className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs space-y-4"
+                className={`bg-white border p-6 rounded-2xl shadow-xs space-y-4 transition-all duration-300 ${
+                  isFormHighlighted
+                    ? "border-emerald-400 ring-2 ring-emerald-500/30 bg-emerald-50/10"
+                    : "border-slate-200"
+                }`}
               >
                 <div className="flex items-center justify-between">
                   <h2 className="font-bold text-slate-900 text-base">
@@ -3062,13 +3326,13 @@ export function SettleUpDashboard({
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <button
                           type="button"
-                          disabled={isScanningReceipt || isUploadingReceipt}
+                          disabled={isScanningReceipt}
                           onClick={() =>
                             addReceiptCameraInputRef.current?.click()
                           }
                           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
                         >
-                          {isScanningReceipt || isUploadingReceipt ? (
+                          {isScanningReceipt ? (
                             <>
                               <Loader2 className="w-3.5 h-3.5 animate-spin" />
                               <span>Scanning...</span>
@@ -3082,7 +3346,7 @@ export function SettleUpDashboard({
                         </button>
                         <button
                           type="button"
-                          disabled={isScanningReceipt || isUploadingReceipt}
+                          disabled={isScanningReceipt}
                           onClick={() => addReceiptInputRef.current?.click()}
                           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
                         >
@@ -3091,7 +3355,7 @@ export function SettleUpDashboard({
                         </button>
                         <button
                           type="button"
-                          disabled={isScanningReceipt || isUploadingReceipt}
+                          disabled={isScanningReceipt}
                           onClick={() => addReceiptPdfInputRef.current?.click()}
                           title="Attach a PDF receipt"
                           className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-slate-700 border border-slate-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
@@ -3146,15 +3410,23 @@ export function SettleUpDashboard({
                               <div className="text-xs font-semibold text-slate-800 truncate">
                                 {receiptFileName || "Receipt attached"}
                               </div>
-                              {isScanningReceipt || isUploadingReceipt ? (
+                              {isScanningReceipt ? (
                                 <div className="text-[11px] text-blue-600 font-medium flex items-center gap-1 mt-0.5">
                                   <Loader2 className="w-3 h-3 animate-spin" />
                                   <span>Scanning receipt...</span>
                                 </div>
                               ) : (
-                                <div className="text-[11px] text-emerald-700 font-medium mt-0.5">
-                                  {receiptStatusMessage ||
-                                    "Ready to save with transaction"}
+                                <div className="text-[11px] text-emerald-700 font-medium flex items-center gap-1.5 mt-0.5">
+                                  <span>
+                                    {receiptStatusMessage ||
+                                      "Ready to save with transaction"}
+                                  </span>
+                                  {isUploadingReceipt && (
+                                    <span className="text-[10px] text-slate-400 inline-flex items-center gap-1">
+                                      <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                      uploading...
+                                    </span>
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -4054,28 +4326,46 @@ export function SettleUpDashboard({
                   return (
                     <div
                       key={idx}
-                      className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl text-xs space-y-1"
+                      className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl text-xs space-y-1.5"
                     >
-                      <div className="text-slate-700">
-                        <span className="font-bold text-slate-900">
-                          {s.fromUser}
-                        </span>{" "}
-                        pays{" "}
-                        <span className="font-bold text-slate-900">
-                          {s.toUser}
-                        </span>
-                      </div>
-                      <div className="text-sm font-bold text-emerald-800 flex items-baseline gap-1.5 flex-wrap">
-                        <span>
-                          {formatCurrency(
-                            s.amountCents,
-                            unifiedTargetCurrency
-                          )}
-                        </span>
-                        {secondaryEquivalents.length > 0 && (
-                          <span className="text-[11px] font-medium text-emerald-700/80">
-                            (≈ {secondaryEquivalents.join(" • ")})
-                          </span>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="space-y-1 min-w-0">
+                          <div className="text-slate-700">
+                            <span className="font-bold text-slate-900">
+                              {s.fromUser}
+                            </span>{" "}
+                            pays{" "}
+                            <span className="font-bold text-slate-900">
+                              {s.toUser}
+                            </span>
+                          </div>
+                          <div className="text-sm font-bold text-emerald-800 flex items-baseline gap-1.5 flex-wrap">
+                            <span>
+                              {formatCurrency(
+                                s.amountCents,
+                                unifiedTargetCurrency
+                              )}
+                            </span>
+                            {secondaryEquivalents.length > 0 && (
+                              <span className="text-[11px] font-medium text-emerald-700/80">
+                                (≈ {secondaryEquivalents.join(" • ")})
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {!activeGroup?.is_archived && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleQuickSettle(s, unifiedTargetCurrency)
+                            }
+                            title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
+                          >
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>Settle</span>
+                          </button>
                         )}
                       </div>
                     </div>
@@ -4123,21 +4413,43 @@ export function SettleUpDashboard({
                             : "bg-blue-50/50 border-blue-100"
                         }`}
                       >
-                        <div className="text-slate-700">
-                          <span className="font-bold text-slate-900">
-                            {s.fromUser}
-                          </span>{" "}
-                          pays{" "}
-                          <span className="font-bold text-slate-900">
-                            {s.toUser}
-                          </span>
-                        </div>
-                        <div
-                          className={`text-sm font-bold ${
-                            isSecondary ? "text-indigo-700" : "text-blue-700"
-                          }`}
-                        >
-                          {formatCurrency(s.amountCents, code)}
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="space-y-1 min-w-0">
+                            <div className="text-slate-700">
+                              <span className="font-bold text-slate-900">
+                                {s.fromUser}
+                              </span>{" "}
+                              pays{" "}
+                              <span className="font-bold text-slate-900">
+                                {s.toUser}
+                              </span>
+                            </div>
+                            <div
+                              className={`text-sm font-bold ${
+                                isSecondary
+                                  ? "text-indigo-700"
+                                  : "text-blue-700"
+                              }`}
+                            >
+                              {formatCurrency(s.amountCents, code)}
+                            </div>
+                          </div>
+
+                          {!activeGroup?.is_archived && (
+                            <button
+                              type="button"
+                              onClick={() => handleQuickSettle(s, code)}
+                              title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold text-white shadow-2xs transition cursor-pointer shrink-0 ${
+                                isSecondary
+                                  ? "bg-indigo-600 hover:bg-indigo-700"
+                                  : "bg-blue-600 hover:bg-blue-700"
+                              }`}
+                            >
+                              <CheckCircle2 className="w-3 h-3" />
+                              <span>Settle</span>
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))

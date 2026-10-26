@@ -3,9 +3,9 @@ import { EXPENSE_CATEGORIES } from "@/lib/reconciliation";
 import { normalizeParsedReceipt } from "@/lib/receipts";
 
 const CANDIDATE_MODELS = [
-  "gemini-flash-latest",
-  "gemini-3.8-flash",
   "gemini-flash-lite-latest",
+  "gemini-2.5-flash-lite",
+  "gemini-flash-latest",
   "gemini-2.5-flash",
 ];
 
@@ -125,27 +125,33 @@ export async function POST(request: NextRequest) {
       new Set([...(envModel ? [envModel] : []), ...CANDIDATE_MODELS])
     );
 
-    const requestBody = {
-      contents: [
-        {
-          parts: [
-            {
-              inlineData: {
-                mimeType,
-                data: cleanBase64,
-              },
+    const baseContents = [
+      {
+        parts: [
+          {
+            inlineData: {
+              mimeType,
+              data: cleanBase64,
             },
-            {
-              text: RECEIPT_EXTRACTION_PROMPT,
-            },
-          ],
-        },
-      ],
+          },
+          {
+            text: RECEIPT_EXTRACTION_PROMPT,
+          },
+        ],
+      },
+    ];
+
+    const buildRequestBody = (includeThinkingZero: boolean) => ({
+      contents: baseContents,
       generationConfig: {
         responseMimeType: "application/json",
         temperature: 0.1,
+        maxOutputTokens: 300,
+        ...(includeThinkingZero
+          ? { thinkingConfig: { thinkingBudget: 0 } }
+          : {}),
       },
-    };
+    });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let geminiJson: any = null;
@@ -159,12 +165,12 @@ export async function POST(request: NextRequest) {
           modelName
         )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-        const geminiRes = await fetch(endpoint, {
+        let geminiRes = await fetch(endpoint, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(requestBody),
+          body: JSON.stringify(buildRequestBody(true)),
         });
 
         if (geminiRes.ok) {
@@ -172,10 +178,34 @@ export async function POST(request: NextRequest) {
           return true;
         }
 
-        const errData = await geminiRes.json().catch(() => ({}));
-        const currentErrorMsg =
+        let errData = await geminiRes.json().catch(() => ({}));
+        let currentErrorMsg: string =
           errData?.error?.message ||
           `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+
+        // Fallback cleanly if a model rejects thinkingConfig
+        if (
+          geminiRes.status === 400 &&
+          /thinking/i.test(currentErrorMsg)
+        ) {
+          geminiRes = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(buildRequestBody(false)),
+          });
+
+          if (geminiRes.ok) {
+            geminiJson = await geminiRes.json();
+            return true;
+          }
+
+          errData = await geminiRes.json().catch(() => ({}));
+          currentErrorMsg =
+            errData?.error?.message ||
+            `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+        }
 
         if (!primaryErrorMsg) {
           primaryErrorMsg = currentErrorMsg;

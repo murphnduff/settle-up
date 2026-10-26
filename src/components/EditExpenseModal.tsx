@@ -253,79 +253,85 @@ export default function EditExpenseModal({
       const targetGroupId =
         groupId || expense?.groupId || members[0]?.groupId || "general";
 
-      const [uploadOutcome, parseOutcome] = await Promise.allSettled([
-        uploadReceiptToStorage(
-          supabase,
-          targetGroupId,
-          compressed.blob,
-          compressed.extension,
-          compressed.mimeType
-        ),
-        parseReceiptWithAi(compressed.base64, compressed.mimeType),
-      ]);
-
-      if (uploadOutcome.status === "fulfilled") {
-        setReceiptUrl(uploadOutcome.value);
-      } else {
-        const reason =
-          uploadOutcome.reason instanceof Error
-            ? uploadOutcome.reason.message
-            : "Receipt upload failed.";
-        setError(reason);
-      }
-
-      if (parseOutcome.status === "fulfilled") {
-        const parsed = parseOutcome.value;
-        if (parsed.description) {
-          setDescription(parsed.description);
-        }
-        if (parsed.currency) {
-          const detectedCode = normalizeCurrencyCode(parsed.currency);
-          setCurrency(detectedCode);
-          onCurrencyAdded?.(detectedCode);
-        }
-        if (parsed.date) {
-          setDate(parsed.date);
-        }
-        if (parsed.category) {
-          const cleanScannedCat = parsed.category.trim();
-          const existingMatch = categoryOptions.find(
-            (c) => c.toLowerCase() === cleanScannedCat.toLowerCase()
-          );
-          const resolvedCat = existingMatch || cleanScannedCat;
-          if (!existingMatch && resolvedCat) {
-            setScannedCategories((prev) =>
-              prev.some((c) => c.toLowerCase() === resolvedCat.toLowerCase())
-                ? prev
-                : [...prev, resolvedCat]
-            );
+      // 1. Trigger AI OCR immediately using the compact 1024px @ 0.70 payload and populate fields the instant it resolves
+      const parseTask = parseReceiptWithAi(
+        compressed.aiBase64,
+        compressed.mimeType
+      )
+        .then((parsed) => {
+          if (parsed.description) {
+            setDescription(parsed.description);
           }
-          setIsCustomCategory(false);
-          setCustomCategoryInput("");
-          setCategory(resolvedCat);
-        }
-        if (
-          typeof parsed.amount === "number" &&
-          parsed.amount > 0 &&
-          splitMode !== "exact"
-        ) {
-          setAmount(parsed.amount.toFixed(2));
-        }
-        setReceiptStatusMessage("Receipt scanned & fields updated!");
-      } else {
-        const reason =
-          parseOutcome.reason instanceof Error
-            ? parseOutcome.reason.message
-            : "Unknown OCR error";
-        setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
-        setReceiptStatusMessage("Receipt attached.");
-      }
+          if (parsed.currency) {
+            const detectedCode = normalizeCurrencyCode(parsed.currency);
+            setCurrency(detectedCode);
+            onCurrencyAdded?.(detectedCode);
+          }
+          if (parsed.date) {
+            setDate(parsed.date);
+          }
+          if (parsed.category) {
+            const cleanScannedCat = parsed.category.trim();
+            const existingMatch = categoryOptions.find(
+              (c) => c.toLowerCase() === cleanScannedCat.toLowerCase()
+            );
+            const resolvedCat = existingMatch || cleanScannedCat;
+            if (!existingMatch && resolvedCat) {
+              setScannedCategories((prev) =>
+                prev.some((c) => c.toLowerCase() === resolvedCat.toLowerCase())
+                  ? prev
+                  : [...prev, resolvedCat]
+              );
+            }
+            setIsCustomCategory(false);
+            setCustomCategoryInput("");
+            setCategory(resolvedCat);
+          }
+          if (
+            typeof parsed.amount === "number" &&
+            parsed.amount > 0 &&
+            splitMode !== "exact"
+          ) {
+            setAmount(parsed.amount.toFixed(2));
+          }
+          setReceiptStatusMessage("Receipt scanned & fields updated!");
+        })
+        .catch((err: unknown) => {
+          const reason =
+            err instanceof Error ? err.message : "Unknown OCR error";
+          setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
+          setReceiptStatusMessage("Receipt attached.");
+        })
+        .finally(() => {
+          setIsScanningReceipt(false);
+        });
+
+      // 2. Upload crisp 1600px @ 0.82 receipt to Supabase Storage in parallel
+      const uploadTask = uploadReceiptToStorage(
+        supabase,
+        targetGroupId,
+        compressed.blob,
+        compressed.extension,
+        compressed.mimeType
+      )
+        .then((uploadedUrl) => {
+          setReceiptUrl(uploadedUrl);
+        })
+        .catch((err: unknown) => {
+          const reason =
+            err instanceof Error ? err.message : "Receipt upload failed.";
+          setError(reason);
+        })
+        .finally(() => {
+          setIsUploadingReceipt(false);
+        });
+
+      await Promise.all([parseTask, uploadTask]);
     } catch (err: unknown) {
       const reason =
         err instanceof Error ? err.message : "Failed to process receipt file.";
       setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
       setReceiptStatusMessage(null);
-    } finally {
       setIsScanningReceipt(false);
       setIsUploadingReceipt(false);
     }

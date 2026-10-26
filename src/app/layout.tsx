@@ -15,6 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Settle Up",
   description: "Private group expense & settlement tracker",
+  manifest: "/manifest.json",
   robots: {
     index: false,
     follow: false,

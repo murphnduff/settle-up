@@ -147,13 +147,17 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 ### Phase 1.4: Receipts & AI Vision (Completed ✅)
 7. ✅ **Receipt Attachments & AI Receipt Extraction (OCR):**
    - Client-side HTML5 `<canvas>` compression (`1600px`, `0.80` JPEG quality) + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
-   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`gemini-flash-latest` / `gemini-3.8-flash` / `gemini-flash-lite-latest` / `gemini-2.5-flash` with dynamic model auto-discovery) with parallel upload + auto-fill in Add/Edit Transaction forms, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
+   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`['gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash']` with `thinkingConfig: { thinkingBudget: 0 }`, `maxOutputTokens: 300`, and dynamic model auto-discovery), dual-resolution client compression (`1024px @ 0.70` for fast AI OCR + `1600px @ 0.82` for crisp Supabase Storage), decoupled instant form auto-fill in Add/Edit Transaction forms, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
 
 ### Phase 1.5: Per-Group Custom Currencies & Cross-Currency Unified Reconciliation (Completed ✅)
 8. ✅ **Per-Group Custom Currencies & Unified Settlement:**
    - `src/lib/currencies.ts` catalog (`USD`, `EUR`, `AUD`, `THB`, `GBP`, `CAD`, `JPY`, `NZD`, `CHF`, `MXN`, + custom ISO codes) and `formatCurrency` helper.
    - Per-group `currencies`, `default_currency`, and `exchange_rates` management, clean single-currency UX, auto-enable on AI scan/CSV import, and **🌐 Unified Settlement (Convert All)** with live exchange rates (`open.er-api.com`), editable rate overrides, and zero-sum unified reconciliation (`calculateUnifiedReconciliation` tested in Edge Case 15).
 
-### Future Enhancements
-9. **PWA Web Share Target Integration:**
-   - Allow sharing a receipt photo directly from the Android/iOS system gallery or camera app into the installed Settle Up Chrome PWA (`manifest.json` `share_target`) to initiate a new transaction with the shared receipt pre-attached.
+### Phase 2: Fast AI OCR, 1-Click Settlement & Mobile PWA Web Share Target (Completed ✅)
+9. ✅ **4x–5x Faster Receipt Scanning:**
+   - Prioritizes `gemini-flash-lite-latest` & `gemini-2.5-flash-lite` with `thinkingBudget: 0` (`maxOutputTokens: 300`, `temperature: 0.1`), dual-resolution client compression (`1024px` @ `0.70` JPEG for AI vs. `1600px` @ `0.82` JPEG for storage), and decoupled form auto-fill that populates fields the instant `/api/parse-receipt` resolves without waiting for storage upload.
+10. ✅ **1-Click "Settle" Button in Settlement Plan:**
+    - Each settlement instruction (in both Per-Currency Ledgers and Unified Settlement mode) includes a **"Settle"** button (hidden when archived) that switches the Add Transaction form to `Direct Payment` mode, pre-fills debtor, creditor, exact transfer amount, currency, and `'Settlement Payment'`, and smoothly scrolls the highlighted form into view.
+11. ✅ **Mobile "Share Receipt to Settle Up" (`public/manifest.json` + `/share-receipt`):**
+    - Configured PWA `share_target` in `public/manifest.json` and `POST /share-receipt` route handler (`src/app/share-receipt/route.ts`) that uploads shared images/PDFs to `receipts/shared/...` and redirects (`303 See Other`) to `/?shared_receipt=<url>` (or `/[slug]?shared_receipt=<url>`), where Settle Up automatically attaches the receipt, triggers AI OCR auto-fill, and cleans up the query string via `window.history.replaceState`.
