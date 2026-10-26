@@ -131,13 +131,24 @@ export function calculateBalancesByCurrency(
 
       if (!payerId || totalCents <= 0) continue;
 
-      // Payer paid total amount (Expense fronted OR Direct Payment sent) -> credit payer (+totalCents)
-      // Never clamp at 0: overpayments must invert balances past zero.
-      const currentPayerBalance = balances.get(payerId) || 0;
-      balances.set(payerId, currentPayerBalance + totalCents);
+      // Resolve effective splits: if an expense row is missing splits (e.g. orphaned in DB),
+      // fall back to splitting equally across all group members so zero-sum conservation holds.
+      const effectiveSplits =
+        exp.splits && exp.splits.length > 0
+          ? exp.splits
+          : exp.type !== 'payment' && members.length > 0
+            ? splitAmountEqually(
+                totalCents,
+                members.map((m) => m.id)
+              )
+            : [];
+
+      if (effectiveSplits.length === 0) continue;
+
+      let allocatedTotalCents = 0;
 
       // Deduct each participant's split share (Expense share owed OR Direct Payment received) -> debit participant (-splitCents)
-      for (const split of exp.splits) {
+      for (const split of effectiveSplits) {
         const participantId = split.memberId || split.userId || '';
         if (!participantId) continue;
 
@@ -147,12 +158,24 @@ export function calculateBalancesByCurrency(
             : Math.round((split.amount || 0) * 100);
 
         const splitCents =
-          exp.type === 'payment' && exp.splits.length === 1 && rawSplitCents <= 0
+          exp.type === 'payment' &&
+          effectiveSplits.length === 1 &&
+          rawSplitCents <= 0
             ? totalCents
             : rawSplitCents;
 
+        if (splitCents <= 0) continue;
+
+        allocatedTotalCents += splitCents;
         const currentPartBalance = balances.get(participantId) || 0;
         balances.set(participantId, currentPartBalance - splitCents);
+      }
+
+      // Payer paid total allocated amount (Expense fronted OR Direct Payment sent) -> credit payer (+allocatedTotalCents)
+      // Strictly matches sum of debited splits so SUM(balances) === 0 is invariant and never clamps at 0.
+      if (allocatedTotalCents > 0) {
+        const currentPayerBalance = balances.get(payerId) || 0;
+        balances.set(payerId, currentPayerBalance + allocatedTotalCents);
       }
     }
 

@@ -556,5 +556,31 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
       'Murph pays Kevin : $2.00'
     );
   });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 11: Expense with missing/empty splits falls back to equal split and preserves zero-sum balance
+  // --------------------------------------------------------------------------
+  it('Edge Case 11: Expense with empty splits falls back to equal split and never creates non-zero-sum phantom balance', () => {
+    const unsplitExpense: ExpenseRecord = {
+      id: 'exp-unsplit-7289',
+      paidByMemberId: fitz.id,
+      amountCents: 7289,
+      currency: 'USD',
+      type: 'expense',
+      splits: [],
+    };
+
+    const balances = calculateBalancesByCurrency(allMembers, [unsplitExpense]).get('USD');
+    assert.ok(balances);
+
+    const sumBalances =
+      (balances.get(murph.id) || 0) +
+      (balances.get(kev.id) || 0) +
+      (balances.get(fitz.id) || 0);
+    assert.strictEqual(sumBalances, 0);
+    assert.strictEqual(balances.get(murph.id), -2430);
+    assert.strictEqual(balances.get(kev.id), -2430);
+    assert.strictEqual(balances.get(fitz.id), 4860);
+  });
 });
 

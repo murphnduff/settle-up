@@ -1226,7 +1226,10 @@ export function SettleUpDashboard({
     }> = [];
 
     if (type === "payment") {
-      if (selectedMembers.length === 0) return;
+      if (selectedMembers.length === 0) {
+        alert("Please select a recipient for the payment.");
+        return;
+      }
       calculatedSplits = [
         {
           memberId: selectedMembers[0],
@@ -1234,7 +1237,10 @@ export function SettleUpDashboard({
         },
       ];
     } else if (splitMode === "equal") {
-      if (selectedMembers.length === 0) return;
+      if (selectedMembers.length === 0) {
+        alert("Please select at least one member to split this expense.");
+        return;
+      }
       calculatedSplits = splitAmountEqually(totalCents, selectedMembers);
     } else if (splitMode === "percentage") {
       if (!percentageSummary.isValid || percentageSummary.splits.length === 0) {
@@ -1361,6 +1367,8 @@ export function SettleUpDashboard({
     }
 
     if (splitsError) {
+      // Roll back the parent expense so an orphaned expense with 0 splits can never remain in the database
+      await supabase.from("expenses").delete().eq("id", newExp.id);
       alert("Error adding splits: " + splitsError.message);
       return;
     }

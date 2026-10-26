@@ -118,7 +118,9 @@ export default function EditExpenseModal({
     detectInitialSplitMode(expense)
   );
   const [selectedMembers, setSelectedMembers] = useState<string[]>(
-    expense ? expense.splits.map((s) => s.memberId) : []
+    expense && expense.splits.length > 0
+      ? expense.splits.map((s) => s.memberId)
+      : members.map((m) => m.id)
   );
   const [percentageValues, setPercentageValues] = useState<
     Record<string, string>
@@ -408,6 +410,16 @@ export default function EditExpenseModal({
       }
 
       if (insertSplitsError) {
+        // Restore previous splits if inserting updated splits failed so the expense never remains with 0 splits
+        if (expense.splits.length > 0) {
+          await supabase.from("expense_splits").insert(
+            expense.splits.map((s) => ({
+              expense_id: expense.id,
+              member_id: s.memberId,
+              split_amount_cents: s.splitAmountCents,
+            }))
+          );
+        }
         setError("Error saving new splits: " + insertSplitsError.message);
         setIsSubmitting(false);
         return;
