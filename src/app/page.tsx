@@ -316,6 +316,7 @@ export function SettleUpDashboard({
 
   // Add Transaction Receipt & AI Extraction state
   const addReceiptInputRef = useRef<HTMLInputElement>(null);
+  const addReceiptPdfInputRef = useRef<HTMLInputElement>(null);
   const receiptLightboxRef = useRef<HTMLDialogElement>(null);
   const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
   const [receiptPreviewUrl, setReceiptPreviewUrl] = useState<string | null>(
@@ -2432,7 +2433,14 @@ export function SettleUpDashboard({
                     <input
                       ref={addReceiptInputRef}
                       type="file"
-                      accept="image/*,application/pdf"
+                      accept="image/*"
+                      onChange={handleAddReceiptFileChange}
+                      className="hidden"
+                    />
+                    <input
+                      ref={addReceiptPdfInputRef}
+                      type="file"
+                      accept="application/pdf,image/*"
                       onChange={handleAddReceiptFileChange}
                       className="hidden"
                     />
@@ -2446,33 +2454,45 @@ export function SettleUpDashboard({
                             Scan / Attach Receipt
                           </span>
                           <span className="text-[11px] text-slate-500">
-                            Snap a photo or upload a PDF to auto-fill merchant,
-                            amount, date & category
+                            Pick a photo, snap with camera, or attach a PDF to
+                            auto-fill details
                           </span>
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        disabled={isScanningReceipt || isUploadingReceipt}
-                        onClick={() => addReceiptInputRef.current?.click()}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
-                      >
-                        {isScanningReceipt || isUploadingReceipt ? (
-                          <>
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            <span>Scanning receipt...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Camera className="w-3.5 h-3.5" />
-                            <span>
-                              {receiptPreviewUrl || receiptUrl
-                                ? "Replace Receipt"
-                                : "Scan / Attach Receipt"}
-                            </span>
-                          </>
-                        )}
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={isScanningReceipt || isUploadingReceipt}
+                          onClick={() => addReceiptInputRef.current?.click()}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
+                        >
+                          {isScanningReceipt || isUploadingReceipt ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              <span>Scanning receipt...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Camera className="w-3.5 h-3.5" />
+                              <span>
+                                {receiptPreviewUrl || receiptUrl
+                                  ? "Replace Photo"
+                                  : "Scan / Attach Photo"}
+                              </span>
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isScanningReceipt || isUploadingReceipt}
+                          onClick={() => addReceiptPdfInputRef.current?.click()}
+                          title="Attach a PDF or file receipt"
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>PDF / File</span>
+                        </button>
+                      </div>
                     </div>
 
                     {(receiptPreviewUrl || receiptUrl || isScanningReceipt) && (

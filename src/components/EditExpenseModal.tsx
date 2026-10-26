@@ -126,6 +126,7 @@ export default function EditExpenseModal({
   const supabase = createClient();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const receiptFileInputRef = useRef<HTMLInputElement>(null);
+  const receiptPdfInputRef = useRef<HTMLInputElement>(null);
 
   const [description, setDescription] = useState(expense?.description ?? "");
   const [amount, setAmount] = useState(
@@ -674,7 +675,14 @@ export default function EditExpenseModal({
             <input
               ref={receiptFileInputRef}
               type="file"
-              accept="image/*,application/pdf"
+              accept="image/*"
+              onChange={handleReceiptFileChange}
+              className="hidden"
+            />
+            <input
+              ref={receiptPdfInputRef}
+              type="file"
+              accept="application/pdf,image/*"
               onChange={handleReceiptFileChange}
               className="hidden"
             />
@@ -686,32 +694,44 @@ export default function EditExpenseModal({
                     Receipt Attachment & AI Auto-Fill
                   </span>
                   <span className="text-[11px] text-slate-500">
-                    Attach or replace a receipt photo/PDF to auto-extract details
+                    Pick a photo, snap with camera, or attach a PDF to auto-extract details
                   </span>
                 </div>
               </div>
-              <button
-                type="button"
-                disabled={isScanningReceipt || isUploadingReceipt}
-                onClick={() => receiptFileInputRef.current?.click()}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
-              >
-                {isScanningReceipt || isUploadingReceipt ? (
-                  <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    <span>Scanning receipt...</span>
-                  </>
-                ) : (
-                  <>
-                    <Camera className="w-3.5 h-3.5" />
-                    <span>
-                      {receiptPreviewUrl || receiptUrl
-                        ? "Replace Receipt"
-                        : "Scan / Attach Receipt"}
-                    </span>
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={isScanningReceipt || isUploadingReceipt}
+                  onClick={() => receiptFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
+                >
+                  {isScanningReceipt || isUploadingReceipt ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Scanning receipt...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>
+                        {receiptPreviewUrl || receiptUrl
+                          ? "Replace Photo"
+                          : "Scan / Attach Photo"}
+                      </span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  disabled={isScanningReceipt || isUploadingReceipt}
+                  onClick={() => receiptPdfInputRef.current?.click()}
+                  title="Attach a PDF or file receipt"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>PDF / File</span>
+                </button>
+              </div>
             </div>
 
             {(receiptPreviewUrl || receiptUrl || isScanningReceipt) && (
