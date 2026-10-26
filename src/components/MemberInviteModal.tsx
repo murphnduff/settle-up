@@ -37,6 +37,9 @@ export interface Group {
   slug?: string | null;
   created_by?: string | null;
   is_archived?: boolean;
+  currencies?: string[];
+  default_currency?: string;
+  exchange_rates?: Record<string, number>;
   created_at?: string;
 }
 

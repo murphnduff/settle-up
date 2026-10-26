@@ -14,6 +14,7 @@ import {
   calculateSettlements,
   calculateMemberBreakdown,
   calculateCategorySpend,
+  calculateUnifiedReconciliation,
   splitAmountEqually,
   splitAmountByPercentage,
   validateExactSplits,
@@ -27,6 +28,14 @@ import {
   MemberSummaryRecord,
   CategorySpendRecord,
 } from "@/lib/reconciliation";
+import {
+  SUPPORTED_CURRENCIES,
+  normalizeCurrencyCode,
+  getCurrencyInfo,
+  getCurrencySymbol,
+  formatCurrency,
+  buildGroupCurrencies,
+} from "@/lib/currencies";
 import MemberInviteModal, {
   Group,
   GroupMember,
@@ -75,6 +84,9 @@ import {
   FileText,
   ExternalLink,
   Loader2,
+  Globe,
+  RefreshCw,
+  Settings2,
 } from "lucide-react";
 import type { User, SupabaseClient } from "@supabase/supabase-js";
 
@@ -91,12 +103,36 @@ function normalizeGroup(row: any): Group {
     typeof row?.slug === "string" && row.slug.trim().length > 0
       ? row.slug.trim()
       : generateGroupSlug(name) || row.id;
+  const defaultCurrency = normalizeCurrencyCode(
+    row?.default_currency ||
+      (Array.isArray(row?.currencies) ? row.currencies[0] : "USD")
+  );
+  const currencies = buildGroupCurrencies(
+    Array.isArray(row?.currencies) ? row.currencies : [defaultCurrency],
+    defaultCurrency
+  );
+  const exchangeRates: Record<string, number> = {};
+  if (
+    row?.exchange_rates &&
+    typeof row.exchange_rates === "object" &&
+    !Array.isArray(row.exchange_rates)
+  ) {
+    for (const [k, v] of Object.entries(row.exchange_rates)) {
+      const num = Number(v);
+      if (!isNaN(num) && num > 0) {
+        exchangeRates[normalizeCurrencyCode(k)] = num;
+      }
+    }
+  }
   return {
     id: row.id,
     name,
     slug,
     created_by: row.created_by ?? null,
     is_archived: Boolean(row?.is_archived),
+    currencies,
+    default_currency: defaultCurrency,
+    exchange_rates: exchangeRates,
     created_at: row.created_at,
   };
 }
@@ -109,7 +145,7 @@ function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
       e.amount_cents ?? Math.round(Number(e.amount || 0) * 100)
     );
     const amt = amtCents / 100;
-    const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
+    const curr = normalizeCurrencyCode(e.currency);
     const cleanDate =
       typeof e.date === "string" ? e.date.split("T")[0] : getTodayLocalDate();
     const isPayment = e.type === "payment";
@@ -278,23 +314,47 @@ export function SettleUpDashboard({
   const [activeMemberId, setActiveMemberId] = useState<string>("");
   const [newGroupName, setNewGroupName] = useState("");
   const [addAdminAsMember, setAddAdminAsMember] = useState<boolean>(true);
+  const [showNewGroupCurrencies, setShowNewGroupCurrencies] =
+    useState<boolean>(false);
+  const [newGroupCurrencies, setNewGroupCurrencies] = useState<string[]>([
+    "USD",
+  ]);
+  const [newGroupDefaultCurrency, setNewGroupDefaultCurrency] =
+    useState<string>("USD");
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
+  const [isCurrencyModalOpen, setIsCurrencyModalOpen] = useState(false);
+  const [editingGroupCurrencies, setEditingGroupCurrencies] = useState<
+    string[]
+  >(["USD"]);
+  const [editingDefaultCurrency, setEditingDefaultCurrency] =
+    useState<string>("USD");
+  const [customIsoInput, setCustomIsoInput] = useState<string>("");
+  const [isSavingCurrencies, setIsSavingCurrencies] = useState<boolean>(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
   const [copiedGroupLink, setCopiedGroupLink] = useState(false);
   const [showArchivedGroups, setShowArchivedGroups] = useState(false);
-  const [historyCurrencyFilter, setHistoryCurrencyFilter] = useState<
-    "all" | "$" | "€"
-  >("all");
+  const [historyCurrencyFilter, setHistoryCurrencyFilter] =
+    useState<string>("all");
   const [notification, setNotification] = useState<{
     type: "success" | "error";
     message: string;
   } | null>(null);
 
+  // Unified Settlement (Cross-Currency Conversion) state
+  const [isUnifiedMode, setIsUnifiedMode] = useState<boolean>(false);
+  const [unifiedTargetCurrency, setUnifiedTargetCurrency] =
+    useState<string>("USD");
+  const [exchangeRatesInput, setExchangeRatesInput] = useState<
+    Record<string, string>
+  >({});
+  const [isFetchingRates, setIsFetchingRates] = useState<boolean>(false);
+  const [isSavingRates, setIsSavingRates] = useState<boolean>(false);
+
   // Add Transaction Form state
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState<"$" | "€">("$");
+  const [currency, setCurrency] = useState<string>("USD");
   const [payerId, setPayerId] = useState("");
   const [transactionDate, setTransactionDate] = useState<string>(() =>
     getTodayLocalDate()
@@ -704,39 +764,116 @@ export function SettleUpDashboard({
     return members[0]?.id || "";
   }, [payerId, activeMemberId, members]);
 
-  // Currency totals (strictly aggregate rows where type === 'expense', excluding settlement payments)
-  const usdTotal = useMemo(
+  // Active group currencies & default currency
+  const activeGroupCurrencies: string[] = useMemo(() => {
+    const expenseCurrencies = expenses.map((e) =>
+      normalizeCurrencyCode(e.currency)
+    );
+    return buildGroupCurrencies(
+      activeGroup?.currencies || ["USD"],
+      activeGroup?.default_currency || "USD",
+      expenseCurrencies
+    );
+  }, [activeGroup, expenses]);
+
+  const activeDefaultCurrency: string = useMemo(
     () =>
-      expenses
-        .filter(
-          (e) =>
-            e.type === "expense" &&
-            (e.currency === "$" || e.currency === "USD")
-        )
-        .reduce((acc, e) => acc + e.amount, 0),
-    [expenses]
+      normalizeCurrencyCode(
+        activeGroup?.default_currency || activeGroupCurrencies[0] || "USD"
+      ),
+    [activeGroup, activeGroupCurrencies]
   );
 
-  const eurTotal = useMemo(
-    () =>
-      expenses
-        .filter(
-          (e) =>
-            e.type === "expense" &&
-            (e.currency === "€" || e.currency === "EUR")
-        )
-        .reduce((acc, e) => acc + e.amount, 0),
-    [expenses]
+  // Sync default transaction currency, unified target currency, and saved exchange rates when switching groups
+  const [syncedGroupId, setSyncedGroupId] = useState<string>("");
+  if (activeGroup && activeGroup.id !== syncedGroupId) {
+    setSyncedGroupId(activeGroup.id);
+    const defCur = normalizeCurrencyCode(
+      activeGroup.default_currency || activeGroup.currencies?.[0] || "USD"
+    );
+    setCurrency(defCur);
+    setUnifiedTargetCurrency(defCur);
+    setHistoryCurrencyFilter("all");
+    setIsUnifiedMode(false);
+
+    const savedRates = activeGroup.exchange_rates || {};
+    const initialInputs: Record<string, string> = { [defCur]: "1" };
+    for (const [k, v] of Object.entries(savedRates)) {
+      if (typeof v === "number" && v > 0) {
+        initialInputs[normalizeCurrencyCode(k)] = String(v);
+      }
+    }
+    setExchangeRatesInput(initialInputs);
+  }
+
+  // Helper to automatically append newly discovered currencies (e.g. from AI receipt scan or CSV import) to the group
+  const ensureCurrenciesInGroup = useCallback(
+    async (newCurrencyCodes: string[], targetGrp?: Group | null) => {
+      const grp = targetGrp || activeGroup;
+      if (!grp) return;
+      const merged = buildGroupCurrencies(
+        grp.currencies || ["USD"],
+        grp.default_currency || "USD",
+        newCurrencyCodes
+      );
+      const currentList = grp.currencies || ["USD"];
+      const hasNew =
+        merged.length !== currentList.length ||
+        merged.some((c, i) => c !== currentList[i]);
+      if (!hasNew) return;
+
+      setGroups((prev) =>
+        prev.map((g) => (g.id === grp.id ? { ...g, currencies: merged } : g))
+      );
+
+      await supabase
+        .from("groups")
+        .update({ currencies: merged })
+        .eq("id", grp.id);
+    },
+    [activeGroup, supabase]
+  );
+
+  // Currency totals (strictly aggregate rows where type === 'expense', excluding settlement payments)
+  const currencyTotalsCents = useMemo(() => {
+    const totals: Record<string, number> = {};
+    for (const code of activeGroupCurrencies) {
+      totals[code] = 0;
+    }
+    for (const e of expenses) {
+      if (e.type !== "expense") continue;
+      const code = normalizeCurrencyCode(e.currency);
+      const cents =
+        typeof e.amountCents === "number"
+          ? e.amountCents
+          : Math.round(Number(e.amount || 0) * 100);
+      totals[code] = (totals[code] || 0) + cents;
+    }
+    return totals;
+  }, [expenses, activeGroupCurrencies]);
+
+  // Currencies that should be displayed in breakdowns/ledgers (enabled on group OR have transactions)
+  const displayCurrencies = useMemo(() => {
+    if (activeGroupCurrencies.length <= 1) {
+      return activeGroupCurrencies;
+    }
+    const withActivity = activeGroupCurrencies.filter((code) =>
+      expenses.some((e) => normalizeCurrencyCode(e.currency) === code)
+    );
+    return withActivity.length > 0 ? withActivity : activeGroupCurrencies;
+  }, [activeGroupCurrencies, expenses]);
+
+  const hasMultipleCurrencies = useMemo(
+    () => activeGroupCurrencies.length > 1 || displayCurrencies.length > 1,
+    [activeGroupCurrencies, displayCurrencies]
   );
 
   // Filtered transactions for the ledger
   const filteredExpenses = useMemo(() => {
     if (historyCurrencyFilter === "all") return expenses;
+    const filterCode = normalizeCurrencyCode(historyCurrencyFilter);
     return expenses.filter(
-      (e) =>
-        e.currency === historyCurrencyFilter ||
-        (historyCurrencyFilter === "$" && e.currency === "USD") ||
-        (historyCurrencyFilter === "€" && e.currency === "EUR")
+      (e) => normalizeCurrencyCode(e.currency) === filterCode
     );
   }, [expenses, historyCurrencyFilter]);
 
@@ -748,41 +885,276 @@ export function SettleUpDashboard({
     return [];
   }, [members, expenses]);
 
-  // Isolate settlements by currency
-  const usdSettlements = useMemo(
+  // Isolate settlements by currency code
+  const settlementsByCurrency = useMemo(() => {
+    const map: Record<string, SettlementInstruction[]> = {};
+    for (const code of activeGroupCurrencies) {
+      map[code] = [];
+    }
+    for (const s of settlements) {
+      const code = normalizeCurrencyCode(s.currency);
+      if (!map[code]) map[code] = [];
+      map[code].push(s);
+    }
+    return map;
+  }, [settlements, activeGroupCurrencies]);
+
+  // Cumulative Member Breakdown per currency
+  const memberBreakdownByCurrency = useMemo(() => {
+    const map: Record<string, MemberSummaryRecord[]> = {};
+    for (const code of activeGroupCurrencies) {
+      map[code] = calculateMemberBreakdown(members, expenses, code);
+    }
+    return map;
+  }, [members, expenses, activeGroupCurrencies]);
+
+  // Spend by Category Breakdown per currency
+  const categorySpendByCurrency = useMemo(() => {
+    const map: Record<string, CategorySpendRecord[]> = {};
+    for (const code of activeGroupCurrencies) {
+      map[code] = calculateCategorySpend(expenses, code);
+    }
+    return map;
+  }, [expenses, activeGroupCurrencies]);
+
+  // Numeric exchange rates map for Unified Reconciliation (1 unifiedTargetCurrency = X otherCurrency)
+  const numericExchangeRates = useMemo(() => {
+    const target = normalizeCurrencyCode(unifiedTargetCurrency);
+    const map: Record<string, number> = { [target]: 1 };
+    for (const code of activeGroupCurrencies) {
+      if (code === target) {
+        map[code] = 1;
+        continue;
+      }
+      const raw = parseFloat(exchangeRatesInput[code] || "");
+      if (!isNaN(raw) && raw > 0) {
+        map[code] = raw;
+      } else if (
+        activeGroup?.exchange_rates?.[code] &&
+        activeGroup.exchange_rates[code] > 0
+      ) {
+        map[code] = activeGroup.exchange_rates[code];
+      } else {
+        map[code] = 1;
+      }
+    }
+    return map;
+  }, [
+    unifiedTargetCurrency,
+    activeGroupCurrencies,
+    exchangeRatesInput,
+    activeGroup,
+  ]);
+
+  // Unified Cross-Currency Reconciliation Result
+  const unifiedResult = useMemo(
     () =>
-      settlements.filter((s) => s.currency === "$" || s.currency === "USD"),
-    [settlements]
-  );
-  const eurSettlements = useMemo(
-    () =>
-      settlements.filter((s) => s.currency === "€" || s.currency === "EUR"),
-    [settlements]
+      calculateUnifiedReconciliation(
+        members,
+        expenses,
+        unifiedTargetCurrency,
+        numericExchangeRates
+      ),
+    [members, expenses, unifiedTargetCurrency, numericExchangeRates]
   );
 
-  // Cumulative Member Breakdown (Paid Out-of-Pocket vs. Accrued Share vs. Net Balance) per currency
-  const usdMemberBreakdown: MemberSummaryRecord[] = useMemo(
-    () => calculateMemberBreakdown(members, expenses, "USD"),
-    [members, expenses]
-  );
-  const eurMemberBreakdown: MemberSummaryRecord[] = useMemo(
-    () => calculateMemberBreakdown(members, expenses, "EUR"),
-    [members, expenses]
-  );
-  const hasEurActivity = useMemo(
-    () => expenses.some((e) => e.currency === "€" || e.currency === "EUR"),
-    [expenses]
-  );
+  // Switch target currency in Unified Settlement mode and rebase existing rates so 1 newTarget = X otherCur remains consistent
+  const handleSelectUnifiedTargetCurrency = (nextTargetRaw: string) => {
+    const nextTarget = normalizeCurrencyCode(nextTargetRaw);
+    const prevTarget = normalizeCurrencyCode(unifiedTargetCurrency);
+    if (nextTarget === prevTarget) return;
 
-  // Spend by Category Breakdown per currency (strictly type === 'expense', sorted descending)
-  const usdCategorySpend: CategorySpendRecord[] = useMemo(
-    () => calculateCategorySpend(expenses, "USD"),
-    [expenses]
-  );
-  const eurCategorySpend: CategorySpendRecord[] = useMemo(
-    () => calculateCategorySpend(expenses, "EUR"),
-    [expenses]
-  );
+    const pivotRate = numericExchangeRates[nextTarget];
+    if (pivotRate && pivotRate > 0) {
+      const rebased: Record<string, string> = { [nextTarget]: "1" };
+      for (const code of activeGroupCurrencies) {
+        if (code === nextTarget) {
+          rebased[code] = "1";
+        } else {
+          const oldRate = numericExchangeRates[code] || 1;
+          const newRate = Number((oldRate / pivotRate).toFixed(4));
+          rebased[code] = String(newRate);
+        }
+      }
+      setExchangeRatesInput(rebased);
+    }
+    setUnifiedTargetCurrency(nextTarget);
+  };
+
+  // Fetch live exchange rates from open.er-api.com and persist to group
+  const handleFetchLiveRates = async () => {
+    const baseCode = normalizeCurrencyCode(unifiedTargetCurrency);
+    setIsFetchingRates(true);
+    try {
+      const res = await fetch(
+        `https://open.er-api.com/v6/latest/${encodeURIComponent(baseCode)}`
+      );
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} fetching exchange rates`);
+      }
+      const data = await res.json();
+      if (!data?.rates || typeof data.rates !== "object") {
+        throw new Error("Invalid exchange rate payload");
+      }
+
+      const nextInputs: Record<string, string> = {
+        ...exchangeRatesInput,
+        [baseCode]: "1",
+      };
+      const numericToSave: Record<string, number> = {
+        ...(activeGroup?.exchange_rates || {}),
+        [baseCode]: 1,
+      };
+
+      for (const code of activeGroupCurrencies) {
+        if (code === baseCode) {
+          nextInputs[code] = "1";
+          numericToSave[code] = 1;
+        } else if (
+          typeof data.rates[code] === "number" &&
+          data.rates[code] > 0
+        ) {
+          const cleanRate = Number(Number(data.rates[code]).toFixed(4));
+          nextInputs[code] = String(cleanRate);
+          numericToSave[code] = cleanRate;
+        }
+      }
+
+      setExchangeRatesInput(nextInputs);
+
+      if (activeGroup) {
+        setGroups((prev) =>
+          prev.map((g) =>
+            g.id === activeGroup.id
+              ? { ...g, exchange_rates: numericToSave }
+              : g
+          )
+        );
+        await supabase
+          .from("groups")
+          .update({ exchange_rates: numericToSave })
+          .eq("id", activeGroup.id);
+      }
+
+      setNotification({
+        type: "success",
+        message: `Updated live exchange rates for ${baseCode}.`,
+      });
+    } catch (err: unknown) {
+      setNotification({
+        type: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : "Could not fetch live exchange rates.",
+      });
+    } finally {
+      setIsFetchingRates(false);
+    }
+  };
+
+  // Save custom exchange rate overrides to Supabase
+  const handleSaveExchangeRates = async () => {
+    if (!activeGroup) return;
+    setIsSavingRates(true);
+    try {
+      const baseCode = normalizeCurrencyCode(unifiedTargetCurrency);
+      const toSave: Record<string, number> = {
+        ...(activeGroup.exchange_rates || {}),
+        [baseCode]: 1,
+      };
+      for (const code of activeGroupCurrencies) {
+        if (code === baseCode) {
+          toSave[code] = 1;
+        } else {
+          const parsed = parseFloat(exchangeRatesInput[code] || "");
+          if (!isNaN(parsed) && parsed > 0) {
+            toSave[code] = parsed;
+          }
+        }
+      }
+
+      const { error } = await supabase
+        .from("groups")
+        .update({ exchange_rates: toSave })
+        .eq("id", activeGroup.id);
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      setGroups((prev) =>
+        prev.map((g) =>
+          g.id === activeGroup.id ? { ...g, exchange_rates: toSave } : g
+        )
+      );
+      setNotification({
+        type: "success",
+        message: "Saved group exchange rates.",
+      });
+    } catch (err: unknown) {
+      setNotification({
+        type: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : "Failed to save exchange rates.",
+      });
+    } finally {
+      setIsSavingRates(false);
+    }
+  };
+
+  // Save per-group currencies & default_currency (Super-Admin modal)
+  const handleSaveGroupCurrencies = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isSuperAdmin || !activeGroup) return;
+    setIsSavingCurrencies(true);
+    try {
+      const defCur = normalizeCurrencyCode(editingDefaultCurrency || "USD");
+      const finalCurrencies = buildGroupCurrencies(
+        editingGroupCurrencies,
+        defCur
+      );
+
+      const { error } = await supabase
+        .from("groups")
+        .update({
+          currencies: finalCurrencies,
+          default_currency: defCur,
+        })
+        .eq("id", activeGroup.id);
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      setGroups((prev) =>
+        prev.map((g) =>
+          g.id === activeGroup.id
+            ? {
+                ...g,
+                currencies: finalCurrencies,
+                default_currency: defCur,
+              }
+            : g
+        )
+      );
+      setCurrency(defCur);
+      setIsCurrencyModalOpen(false);
+      setNotification({
+        type: "success",
+        message: `Updated currencies for "${activeGroup.name}" (${finalCurrencies.join(", ")} • Default: ${defCur}).`,
+      });
+    } catch (err: unknown) {
+      alert(
+        "Error saving group currencies: " +
+          (err instanceof Error ? err.message : "Unknown error")
+      );
+    } finally {
+      setIsSavingCurrencies(false);
+    }
+  };
 
   // Dynamic per-group category options (merges EXPENSE_CATEGORIES presets with any unique custom categories in the group)
   const groupCategories: string[] = useMemo(
@@ -864,7 +1236,9 @@ export function SettleUpDashboard({
           setDescription(parsed.description);
         }
         if (parsed.currency) {
-          setCurrency(parsed.currency === "EUR" ? "€" : "$");
+          const detectedIso = normalizeCurrencyCode(parsed.currency);
+          setCurrency(detectedIso);
+          await ensureCurrenciesInGroup([detectedIso]);
         }
         if (parsed.date) {
           setTransactionDate(parsed.date);
@@ -1073,6 +1447,11 @@ export function SettleUpDashboard({
 
     try {
       let targetGroup: Group | null = null;
+      const csvCurrencies = Array.from(
+        new Set(
+          parsedCsv.transactions.map((t) => normalizeCurrencyCode(t.currency))
+        )
+      );
 
       if (csvTargetMode === "new" || !activeGroup) {
         const trimmedName =
@@ -1080,6 +1459,8 @@ export function SettleUpDashboard({
           deriveGroupNameFromCsvFilename(csvFileName) ||
           "Imported Group";
         const generatedSlug = generateGroupSlug(trimmedName);
+        const defaultCur = csvCurrencies[0] || "USD";
+        const groupCurrencies = buildGroupCurrencies(csvCurrencies, defaultCur);
 
         let { data: newGroupRow, error: groupError } = await supabase
           .from("groups")
@@ -1087,11 +1468,13 @@ export function SettleUpDashboard({
             name: trimmedName,
             slug: generatedSlug,
             created_by: user.id,
+            currencies: groupCurrencies,
+            default_currency: defaultCur,
           })
           .select("*")
           .single();
 
-        if (groupError && groupError.message?.toLowerCase().includes("slug")) {
+        if (groupError) {
           const retry = await supabase
             .from("groups")
             .insert({
@@ -1115,6 +1498,8 @@ export function SettleUpDashboard({
         targetGroup = normalizeGroup({
           ...newGroupRow,
           slug: newGroupRow.slug || generatedSlug,
+          currencies: newGroupRow.currencies || groupCurrencies,
+          default_currency: newGroupRow.default_currency || defaultCur,
         });
       } else {
         targetGroup = activeGroup;
@@ -1193,7 +1578,8 @@ export function SettleUpDashboard({
                 return v.toString(16);
               });
 
-        fallbackCurrencyById.set(expenseId, txn.currency);
+        const isoCur = normalizeCurrencyCode(txn.currency);
+        fallbackCurrencyById.set(expenseId, getCurrencySymbol(isoCur));
         amountDollarsById.set(
           expenseId,
           Number((txn.amountCents / 100).toFixed(2))
@@ -1209,7 +1595,7 @@ export function SettleUpDashboard({
               ? "Payment"
               : (txn.category || "").trim() || "General",
           amount_cents: txn.amountCents,
-          currency: txn.currencySymbol,
+          currency: isoCur,
           type: txn.type,
           date: txn.date || getTodayLocalDate(),
         });
@@ -1338,10 +1724,27 @@ export function SettleUpDashboard({
         }
       }
 
+      // Auto-enable any currencies present in the CSV on targetGroup
+      if (csvCurrencies.length > 0) {
+        const updatedCurrencies = buildGroupCurrencies(
+          targetGroup.currencies || ["USD"],
+          targetGroup.default_currency || "USD",
+          csvCurrencies
+        );
+        targetGroup = {
+          ...targetGroup,
+          currencies: updatedCurrencies,
+        };
+        await supabase
+          .from("groups")
+          .update({ currencies: updatedCurrencies })
+          .eq("id", targetGroup.id);
+      }
+
       // Refresh state & select targetGroup
       setGroups((prev) =>
         prev.some((g) => g.id === targetGroup!.id)
-          ? prev
+          ? prev.map((g) => (g.id === targetGroup!.id ? targetGroup! : g))
           : [targetGroup!, ...prev]
       );
       handleSelectGroup(targetGroup);
@@ -1372,20 +1775,27 @@ export function SettleUpDashboard({
 
     const trimmedName = newGroupName.trim();
     const generatedSlug = generateGroupSlug(trimmedName);
+    const defaultCur = normalizeCurrencyCode(newGroupDefaultCurrency || "USD");
+    const groupCurrencies = buildGroupCurrencies(
+      newGroupCurrencies,
+      defaultCur
+    );
 
-    // 1. Try inserting with slug column included
+    // 1. Try inserting with slug and currencies columns included
     let { data: newGroupRow, error: groupError } = await supabase
       .from("groups")
       .insert({
         name: trimmedName,
         slug: generatedSlug,
         created_by: user.id,
+        currencies: groupCurrencies,
+        default_currency: defaultCur,
       })
       .select("*")
       .single();
 
-    // Fallback if slug column has not yet been added in Supabase SQL
-    if (groupError && groupError.message?.toLowerCase().includes("slug")) {
+    // Fallback if slug or currency columns have not yet been added in Supabase SQL
+    if (groupError) {
       const retry = await supabase
         .from("groups")
         .insert({
@@ -1408,6 +1818,8 @@ export function SettleUpDashboard({
     const normalizedNewGroup = normalizeGroup({
       ...newGroupRow,
       slug: newGroupRow.slug || generatedSlug,
+      currencies: newGroupRow.currencies || groupCurrencies,
+      default_currency: newGroupRow.default_currency || defaultCur,
     });
 
     if (addAdminAsMember) {
@@ -1419,6 +1831,9 @@ export function SettleUpDashboard({
 
     setNewGroupName("");
     setAddAdminAsMember(true);
+    setNewGroupCurrencies(["USD"]);
+    setNewGroupDefaultCurrency("USD");
+    setShowNewGroupCurrencies(false);
     setGroups((prev) => [normalizedNewGroup, ...prev]);
     handleSelectGroup(normalizedNewGroup);
     setIsInviteModalOpen(true);
@@ -1542,6 +1957,8 @@ export function SettleUpDashboard({
       ? customCategoryInput.trim() || category.trim() || "General"
       : (category || "").trim() || "General";
 
+    const normalizedIsoCurrency = normalizeCurrencyCode(currency);
+
     const expensePayload: Record<string, unknown> = {
       group_id: activeGroupId,
       paid_by_member_id: finalPayerId,
@@ -1552,7 +1969,7 @@ export function SettleUpDashboard({
         type === "payment" ? "Payment" : effectiveExpenseCategory,
       receipt_url: type === "payment" ? null : receiptUrl,
       amount_cents: totalCents,
-      currency,
+      currency: normalizedIsoCurrency,
       type,
       date: transactionDate || getTodayLocalDate(),
     };
@@ -1567,12 +1984,12 @@ export function SettleUpDashboard({
     for (let attempt = 0; attempt < 4 && expError; attempt++) {
       const msg = expError.message?.toLowerCase() || "";
       let updated = false;
-      const isoCurrency = currency === "€" ? "EUR" : "USD";
+      const symbolFallback = getCurrencySymbol(normalizedIsoCurrency);
       if (
         (msg.includes("expenses_currency_check") || msg.includes("currency")) &&
-        expensePayload.currency !== isoCurrency
+        expensePayload.currency !== symbolFallback
       ) {
-        expensePayload.currency = isoCurrency;
+        expensePayload.currency = symbolFallback;
         updated = true;
       }
       if (msg.includes('"amount"') && !("amount" in expensePayload)) {
@@ -1957,6 +2374,85 @@ export function SettleUpDashboard({
                   />
                   <span>Add me as a member</span>
                 </label>
+
+                {/* Optional Multi-Currency Selector for New Groups (defaults to USD only) */}
+                <div className="space-y-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setShowNewGroupCurrencies((prev) => !prev)
+                    }
+                    className="text-[11px] font-semibold text-slate-500 hover:text-blue-600 flex items-center gap-1 cursor-pointer"
+                  >
+                    <Globe className="w-3 h-3" />
+                    <span>
+                      Currencies: {newGroupCurrencies.join(", ")} (Default:{" "}
+                      {newGroupDefaultCurrency})
+                    </span>
+                  </button>
+                  {showNewGroupCurrencies && (
+                    <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
+                      <div className="flex flex-wrap gap-1">
+                        {SUPPORTED_CURRENCIES.map((cur) => {
+                          const isSelected = newGroupCurrencies.includes(
+                            cur.code
+                          );
+                          return (
+                            <button
+                              key={cur.code}
+                              type="button"
+                              onClick={() => {
+                                setNewGroupCurrencies((prev) => {
+                                  if (prev.includes(cur.code)) {
+                                    if (prev.length === 1) return prev;
+                                    const next = prev.filter(
+                                      (c) => c !== cur.code
+                                    );
+                                    if (newGroupDefaultCurrency === cur.code) {
+                                      setNewGroupDefaultCurrency(
+                                        next[0] || "USD"
+                                      );
+                                    }
+                                    return next;
+                                  }
+                                  return [...prev, cur.code];
+                                });
+                              }}
+                              className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border transition cursor-pointer ${
+                                isSelected
+                                  ? "bg-blue-600 text-white border-blue-600"
+                                  : "bg-white text-slate-600 border-slate-200 hover:bg-slate-100"
+                              }`}
+                            >
+                              {cur.symbol} {cur.code}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {newGroupCurrencies.length > 1 && (
+                        <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80 text-[11px]">
+                          <span className="font-semibold text-slate-600">
+                            Default:
+                          </span>
+                          <select
+                            value={newGroupDefaultCurrency}
+                            onChange={(e) =>
+                              setNewGroupDefaultCurrency(e.target.value)
+                            }
+                            className="border border-slate-300 rounded-md px-1.5 py-0.5 text-[11px] font-bold text-slate-800 bg-white"
+                          >
+                            {newGroupCurrencies.map((code) => (
+                              <option key={code} value={code}>
+                                {code} ({getCurrencySymbol(code)})
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <button
                   type="submit"
                   className="w-full bg-blue-600 text-white py-2 rounded-lg text-xs font-semibold hover:bg-blue-700 transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
@@ -2003,7 +2499,7 @@ export function SettleUpDashboard({
                   )}
                 </div>
 
-                {/* Action Buttons: Copy Group Link, Export CSV (All Users), Archive Toggle & Manage Members (Super-Admin) */}
+                {/* Action Buttons: Copy Group Link, Export CSV (All Users), Currencies, Archive Toggle & Manage Members (Super-Admin) */}
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
@@ -2035,6 +2531,25 @@ export function SettleUpDashboard({
                     <Download className="w-3.5 h-3.5 shrink-0" />
                     <span>Export CSV</span>
                   </button>
+
+                  {isSuperAdmin && !activeGroup.is_archived && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingGroupCurrencies(activeGroupCurrencies);
+                        setEditingDefaultCurrency(activeDefaultCurrency);
+                        setCustomIsoInput("");
+                        setIsCurrencyModalOpen(true);
+                      }}
+                      title="Configure enabled currencies for this group"
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
+                    >
+                      <Settings2 className="w-3.5 h-3.5 shrink-0" />
+                      <span>
+                        Currencies ({activeGroupCurrencies.join(", ")})
+                      </span>
+                    </button>
+                  )}
 
                   {isSuperAdmin && (
                     <button
@@ -2168,25 +2683,28 @@ export function SettleUpDashboard({
                 </div>
               )}
 
-              {/* Multi-Currency Ledger Summary Metrics */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-100 text-xs">
+              {/* Per-Group Currency Ledger Summary Metrics (Clean single-currency UX when only 1 currency is enabled) */}
+              <div
+                className={`grid grid-cols-2 ${
+                  displayCurrencies.length >= 2
+                    ? "sm:grid-cols-3"
+                    : "sm:grid-cols-2"
+                } gap-3 pt-2 border-t border-slate-100 text-xs`}
+              >
+                {displayCurrencies.map((code) => (
+                  <div
+                    key={code}
+                    className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100"
+                  >
+                    <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
+                      {code} Spent
+                    </span>
+                    <span className="text-base font-bold text-slate-900">
+                      {formatCurrency(currencyTotalsCents[code] || 0, code)}
+                    </span>
+                  </div>
+                ))}
                 <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100">
-                  <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
-                    USD Spent
-                  </span>
-                  <span className="text-base font-bold text-slate-900">
-                    ${usdTotal.toFixed(2)}
-                  </span>
-                </div>
-                <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100">
-                  <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
-                    EUR Spent
-                  </span>
-                  <span className="text-base font-bold text-slate-900">
-                    €{eurTotal.toFixed(2)}
-                  </span>
-                </div>
-                <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100 col-span-2 sm:col-span-1">
                   <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
                     Total Transactions
                   </span>
@@ -2218,7 +2736,7 @@ export function SettleUpDashboard({
 
           {activeGroup && (
             <>
-              {/* Cumulative Member Summary Card (Paid vs. Share vs. Net Balance per active currency ledger) */}
+              {/* Cumulative Member Summary Card (Supports Isolated Per-Currency or Unified Converted View) */}
               {members.length > 0 && (
                 <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
                   <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -2226,126 +2744,84 @@ export function SettleUpDashboard({
                       <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
                         <Users className="w-4 h-4 text-blue-600" />
                         Member Summary
+                        {hasMultipleCurrencies && isUnifiedMode && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            <Globe className="w-3 h-3" />
+                            Unified in {unifiedTargetCurrency} (
+                            {getCurrencySymbol(unifiedTargetCurrency)})
+                          </span>
+                        )}
                       </h3>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        Cumulative out-of-pocket expenses paid vs. accrued share
-                        consumed vs. net balance (including settlement payments)
+                        {hasMultipleCurrencies && isUnifiedMode
+                          ? `All expenses and payments converted into ${unifiedTargetCurrency} using your active exchange rates`
+                          : "Cumulative out-of-pocket expenses paid vs. accrued share consumed vs. net balance (including settlement payments)"}
                       </p>
                     </div>
-                  </div>
 
-                  {/* USD ($) Member Breakdown Table */}
-                  <div className="space-y-2">
-                    {hasEurActivity && (
-                      <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-blue-600"></span>
-                        USD ($) Breakdown
-                      </div>
+                    {hasMultipleCurrencies && (
+                      <button
+                        type="button"
+                        onClick={() => setIsUnifiedMode((prev) => !prev)}
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
+                          isUnifiedMode
+                            ? "bg-emerald-600 text-white border-emerald-600 shadow-2xs"
+                            : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                        }`}
+                      >
+                        <Globe className="w-3.5 h-3.5" />
+                        <span>
+                          {isUnifiedMode
+                            ? `Showing Unified (${unifiedTargetCurrency})`
+                            : "🌐 Unified Settlement (Convert All)"}
+                        </span>
+                      </button>
                     )}
-                    <div className="overflow-x-auto border border-slate-100 rounded-xl">
-                      <table className="w-full text-left border-collapse text-xs">
-                        <thead>
-                          <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
-                            <th className="py-2.5 px-3">Member</th>
-                            <th className="py-2.5 px-3 text-right">
-                              Paid (Out-of-Pocket)
-                            </th>
-                            <th className="py-2.5 px-3 text-right">
-                              Share (Accrued Cost)
-                            </th>
-                            <th className="py-2.5 px-3 text-right">
-                              Net Balance
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {usdMemberBreakdown.map((row) => {
-                            const paidStr = `$${(row.paidCents / 100).toFixed(2)}`;
-                            const shareStr = `$${(row.shareCents / 100).toFixed(2)}`;
-                            const netDollars = (
-                              Math.abs(row.netBalanceCents) / 100
-                            ).toFixed(2);
-                            const netStr =
-                              row.netBalanceCents > 0
-                                ? `+$${netDollars}`
-                                : row.netBalanceCents < 0
-                                  ? `-$${netDollars}`
-                                  : "$0.00";
-                            const netColorClass =
-                              row.netBalanceCents > 0
-                                ? "text-emerald-600 font-bold"
-                                : row.netBalanceCents < 0
-                                  ? "text-rose-600 font-bold"
-                                  : "text-slate-400 font-medium";
-
-                            return (
-                              <tr
-                                key={row.memberId}
-                                className="hover:bg-slate-50/60 transition"
-                              >
-                                <td className="py-2.5 px-3 font-semibold text-slate-900">
-                                  {row.memberName}
-                                  {row.memberId === activeMemberId && (
-                                    <span className="ml-1.5 text-[10px] font-semibold text-blue-600">
-                                      (You)
-                                    </span>
-                                  )}
-                                </td>
-                                <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
-                                  {paidStr}
-                                </td>
-                                <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
-                                  {shareStr}
-                                </td>
-                                <td
-                                  className={`py-2.5 px-3 text-right ${netColorClass}`}
-                                >
-                                  {netStr}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
                   </div>
 
-                  {/* EUR (€) Member Breakdown Table (Rendered when EUR transactions exist) */}
-                  {hasEurActivity && (
-                    <div className="space-y-2 pt-2 border-t border-slate-100">
-                      <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
-                        EUR (€) Breakdown
+                  {hasMultipleCurrencies && isUnifiedMode ? (
+                    <div className="space-y-2">
+                      <div className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                        Unified {unifiedTargetCurrency} (
+                        {getCurrencySymbol(unifiedTargetCurrency)}) Breakdown
                       </div>
-                      <div className="overflow-x-auto border border-slate-100 rounded-xl">
+                      <div className="overflow-x-auto border border-emerald-100 rounded-xl">
                         <table className="w-full text-left border-collapse text-xs">
                           <thead>
-                            <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
+                            <tr className="bg-emerald-50/60 border-b border-emerald-100 text-slate-600 font-semibold">
                               <th className="py-2.5 px-3">Member</th>
                               <th className="py-2.5 px-3 text-right">
-                                Paid (Out-of-Pocket)
+                                Paid (Converted)
                               </th>
                               <th className="py-2.5 px-3 text-right">
-                                Share (Accrued Cost)
+                                Share (Converted)
                               </th>
                               <th className="py-2.5 px-3 text-right">
-                                Net Balance
+                                Unified Net Balance
                               </th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
-                            {eurMemberBreakdown.map((row) => {
-                              const paidStr = `€${(row.paidCents / 100).toFixed(2)}`;
-                              const shareStr = `€${(row.shareCents / 100).toFixed(2)}`;
-                              const netEuros = (
-                                Math.abs(row.netBalanceCents) / 100
-                              ).toFixed(2);
+                            {unifiedResult.memberBreakdown.map((row) => {
+                              const paidStr = formatCurrency(
+                                row.paidCents,
+                                unifiedTargetCurrency
+                              );
+                              const shareStr = formatCurrency(
+                                row.shareCents,
+                                unifiedTargetCurrency
+                              );
+                              const absFormatted = formatCurrency(
+                                Math.abs(row.netBalanceCents),
+                                unifiedTargetCurrency
+                              );
                               const netStr =
                                 row.netBalanceCents > 0
-                                  ? `+€${netEuros}`
+                                  ? `+${absFormatted}`
                                   : row.netBalanceCents < 0
-                                    ? `-€${netEuros}`
-                                    : "€0.00";
+                                    ? `-${absFormatted}`
+                                    : formatCurrency(0, unifiedTargetCurrency);
                               const netColorClass =
                                 row.netBalanceCents > 0
                                   ? "text-emerald-600 font-bold"
@@ -2384,6 +2860,105 @@ export function SettleUpDashboard({
                         </table>
                       </div>
                     </div>
+                  ) : (
+                    displayCurrencies.map((code, idx) => {
+                      const rows = memberBreakdownByCurrency[code] || [];
+                      const sym = getCurrencySymbol(code);
+                      return (
+                        <div
+                          key={code}
+                          className={`space-y-2 ${
+                            idx > 0 ? "pt-3 border-t border-slate-100" : ""
+                          }`}
+                        >
+                          {displayCurrencies.length > 1 && (
+                            <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                              <span
+                                className={`w-2 h-2 rounded-full ${
+                                  idx % 2 === 0
+                                    ? "bg-blue-600"
+                                    : "bg-indigo-600"
+                                }`}
+                              ></span>
+                              {code} ({sym}) Breakdown
+                            </div>
+                          )}
+                          <div className="overflow-x-auto border border-slate-100 rounded-xl">
+                            <table className="w-full text-left border-collapse text-xs">
+                              <thead>
+                                <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
+                                  <th className="py-2.5 px-3">Member</th>
+                                  <th className="py-2.5 px-3 text-right">
+                                    Paid (Out-of-Pocket)
+                                  </th>
+                                  <th className="py-2.5 px-3 text-right">
+                                    Share (Accrued Cost)
+                                  </th>
+                                  <th className="py-2.5 px-3 text-right">
+                                    Net Balance
+                                  </th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100">
+                                {rows.map((row) => {
+                                  const paidStr = formatCurrency(
+                                    row.paidCents,
+                                    code
+                                  );
+                                  const shareStr = formatCurrency(
+                                    row.shareCents,
+                                    code
+                                  );
+                                  const absFormatted = formatCurrency(
+                                    Math.abs(row.netBalanceCents),
+                                    code
+                                  );
+                                  const netStr =
+                                    row.netBalanceCents > 0
+                                      ? `+${absFormatted}`
+                                      : row.netBalanceCents < 0
+                                        ? `-${absFormatted}`
+                                        : formatCurrency(0, code);
+                                  const netColorClass =
+                                    row.netBalanceCents > 0
+                                      ? "text-emerald-600 font-bold"
+                                      : row.netBalanceCents < 0
+                                        ? "text-rose-600 font-bold"
+                                        : "text-slate-400 font-medium";
+
+                                  return (
+                                    <tr
+                                      key={row.memberId}
+                                      className="hover:bg-slate-50/60 transition"
+                                    >
+                                      <td className="py-2.5 px-3 font-semibold text-slate-900">
+                                        {row.memberName}
+                                        {row.memberId === activeMemberId && (
+                                          <span className="ml-1.5 text-[10px] font-semibold text-blue-600">
+                                            (You)
+                                          </span>
+                                        )}
+                                      </td>
+                                      <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
+                                        {paidStr}
+                                      </td>
+                                      <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
+                                        {shareStr}
+                                      </td>
+                                      <td
+                                        className={`py-2.5 px-3 text-right ${netColorClass}`}
+                                      >
+                                        {netStr}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      );
+                    })
                   )}
                 </div>
               )}
@@ -2641,12 +3216,15 @@ export function SettleUpDashboard({
 
                   <div>
                     <label className="text-xs font-semibold text-slate-600 block mb-1">
-                      Amount & Currency{isExactMode ? " (Auto-Summed)" : ""}
+                      {activeGroupCurrencies.length > 1
+                        ? "Amount & Currency"
+                        : `Amount (${currency})`}
+                      {isExactMode ? " (Auto-Summed)" : ""}
                     </label>
                     <div className="flex gap-2">
                       <div className="relative flex-1">
                         <span className="absolute left-3 top-2 text-sm font-semibold text-slate-400">
-                          {currency}
+                          {getCurrencySymbol(currency)}
                         </span>
                         <input
                           type="number"
@@ -2670,7 +3248,11 @@ export function SettleUpDashboard({
                               ? "Automatically summed from individual $ Exact member amounts below"
                               : undefined
                           }
-                          className={`w-full pl-7 pr-3 py-2 border border-slate-300 rounded-lg text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition ${
+                          className={`w-full ${
+                            getCurrencySymbol(currency).length > 1
+                              ? "pl-9"
+                              : "pl-7"
+                          } pr-3 py-2 border border-slate-300 rounded-lg text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition ${
                             isExactMode
                               ? "bg-slate-50 text-slate-700 font-semibold cursor-default"
                               : "bg-white text-slate-900"
@@ -2678,30 +3260,23 @@ export function SettleUpDashboard({
                           required={!isExactMode}
                         />
                       </div>
-                      <div className="flex border border-slate-300 rounded-lg p-0.5 bg-slate-100">
-                        <button
-                          type="button"
-                          onClick={() => setCurrency("$")}
-                          className={`px-3 py-1 text-xs font-bold rounded-md transition cursor-pointer ${
-                            currency === "$"
-                              ? "bg-white text-blue-700 shadow-2xs"
-                              : "text-slate-500 hover:text-slate-800"
-                          }`}
+                      {activeGroupCurrencies.length > 1 && (
+                        <select
+                          value={normalizeCurrencyCode(currency)}
+                          onChange={(e) => setCurrency(e.target.value)}
+                          aria-label="Transaction currency"
+                          className="border border-slate-300 rounded-lg px-2.5 py-2 text-xs font-bold text-slate-800 bg-slate-50 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition cursor-pointer shrink-0"
                         >
-                          $ USD
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setCurrency("€")}
-                          className={`px-3 py-1 text-xs font-bold rounded-md transition cursor-pointer ${
-                            currency === "€"
-                              ? "bg-white text-blue-700 shadow-2xs"
-                              : "text-slate-500 hover:text-slate-800"
-                          }`}
-                        >
-                          € EUR
-                        </button>
-                      </div>
+                          {activeGroupCurrencies.map((code) => {
+                            const info = getCurrencyInfo(code);
+                            return (
+                              <option key={info.code} value={info.code}>
+                                {info.symbol} {info.code}
+                              </option>
+                            );
+                          })}
+                        </select>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -2814,7 +3389,7 @@ export function SettleUpDashboard({
                           ? `Split Among (${selectedMembers.length} selected)`
                           : splitMode === "percentage"
                             ? "Split by Percentage (%)"
-                            : `Split by Exact Amount (${currency})`
+                            : `Split by Exact Amount (${getCurrencySymbol(currency)})`
                         : "Paid To (Recipient)"}
                     </label>
 
@@ -2942,7 +3517,7 @@ export function SettleUpDashboard({
                             </span>
                           </span>
                           <span className="font-bold text-blue-900 text-sm">
-                            {currency}
+                            {getCurrencySymbol(currency)}
                             {perPersonAmount} each
                           </span>
                         </div>
@@ -2965,8 +3540,7 @@ export function SettleUpDashboard({
                                 </span>
                                 {totalCents > 0 && allocCents > 0 && (
                                   <span className="text-[11px] text-slate-500">
-                                    {currency}
-                                    {(allocCents / 100).toFixed(2)}
+                                    {formatCurrency(allocCents, currency)}
                                   </span>
                                 )}
                               </div>
@@ -3033,7 +3607,7 @@ export function SettleUpDashboard({
                             </span>
                             <div className="relative w-28 shrink-0">
                               <span className="absolute left-2.5 top-1.5 text-xs text-slate-400 font-semibold">
-                                {currency}
+                                {getCurrencySymbol(currency)}
                               </span>
                               <input
                                 type="number"
@@ -3063,7 +3637,11 @@ export function SettleUpDashboard({
                                       : ""
                                   );
                                 }}
-                                className="w-full pl-6 pr-2 py-1 border border-slate-300 rounded-lg text-xs text-right text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                className={`w-full ${
+                                  getCurrencySymbol(currency).length > 1
+                                    ? "pl-7"
+                                    : "pl-6"
+                                } pr-2 py-1 border border-slate-300 rounded-lg text-xs text-right text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500`}
                               />
                             </div>
                           </div>
@@ -3084,8 +3662,11 @@ export function SettleUpDashboard({
                             <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                           )}
                           <span>
-                            Auto-Summed Total: {currency}
-                            {(exactSummary.totalSplitCents / 100).toFixed(2)}
+                            Auto-Summed Total:{" "}
+                            {formatCurrency(
+                              exactSummary.totalSplitCents,
+                              currency
+                            )}
                           </span>
                         </span>
                         <span className="font-bold">
@@ -3124,54 +3705,42 @@ export function SettleUpDashboard({
                     </p>
                   </div>
 
-                  {/* Currency Segmented Tabs */}
-                  <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setHistoryCurrencyFilter("all")}
-                      className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
-                        historyCurrencyFilter === "all"
-                          ? "bg-white text-slate-900 shadow-2xs"
-                          : "text-slate-500 hover:text-slate-800"
-                      }`}
-                    >
-                      All
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setHistoryCurrencyFilter("$")}
-                      className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
-                        historyCurrencyFilter === "$"
-                          ? "bg-white text-blue-700 shadow-2xs"
-                          : "text-slate-500 hover:text-slate-800"
-                      }`}
-                    >
-                      $ USD (
-                      {
-                        expenses.filter(
-                          (e) => e.currency === "$" || e.currency === "USD"
-                        ).length
-                      }
-                      )
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setHistoryCurrencyFilter("€")}
-                      className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
-                        historyCurrencyFilter === "€"
-                          ? "bg-white text-blue-700 shadow-2xs"
-                          : "text-slate-500 hover:text-slate-800"
-                      }`}
-                    >
-                      € EUR (
-                      {
-                        expenses.filter(
-                          (e) => e.currency === "€" || e.currency === "EUR"
-                        ).length
-                      }
-                      )
-                    </button>
-                  </div>
+                  {/* Currency Segmented Tabs (Only shown when group has 2+ currencies) */}
+                  {activeGroupCurrencies.length > 1 && (
+                    <div className="flex flex-wrap bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setHistoryCurrencyFilter("all")}
+                        className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          historyCurrencyFilter === "all"
+                            ? "bg-white text-slate-900 shadow-2xs"
+                            : "text-slate-500 hover:text-slate-800"
+                        }`}
+                      >
+                        All
+                      </button>
+                      {activeGroupCurrencies.map((code) => {
+                        const count = expenses.filter(
+                          (e) => normalizeCurrencyCode(e.currency) === code
+                        ).length;
+                        const sym = getCurrencySymbol(code);
+                        return (
+                          <button
+                            key={code}
+                            type="button"
+                            onClick={() => setHistoryCurrencyFilter(code)}
+                            className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                              historyCurrencyFilter === code
+                                ? "bg-white text-blue-700 shadow-2xs"
+                                : "text-slate-500 hover:text-slate-800"
+                            }`}
+                          >
+                            {sym} {code} ({count})
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
 
                 <div className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
@@ -3185,6 +3754,10 @@ export function SettleUpDashboard({
                       const payerMember = members.find(
                         (m) =>
                           m.id === exp.paidByMemberId || m.id === exp.payerId
+                      );
+                      const expFormatted = formatCurrency(
+                        exp.amountCents,
+                        exp.currency
                       );
 
                       return (
@@ -3228,7 +3801,7 @@ export function SettleUpDashboard({
                                         url: exp.receiptUrl!,
                                         title: exp.description || "Receipt",
                                         date: formatTransactionDate(exp.date),
-                                        amountFormatted: `${exp.currency}${exp.amount.toFixed(2)}`,
+                                        amountFormatted: expFormatted,
                                       })
                                     }
                                     title="View attached receipt"
@@ -3260,8 +3833,7 @@ export function SettleUpDashboard({
                           <div className="flex items-center gap-3 shrink-0">
                             <div className="text-right">
                               <span className="font-bold text-slate-900 text-sm">
-                                {exp.currency}
-                                {exp.amount.toFixed(2)}
+                                {expFormatted}
                               </span>
                               <span
                                 className={`block text-[10px] uppercase font-bold tracking-wider mt-0.5 ${
@@ -3306,96 +3878,274 @@ export function SettleUpDashboard({
           )}
         </section>
 
-        {/* Multi-Currency Settlement Minimization Plan */}
+        {/* Multi-Currency & Unified Settlement Minimization Plan */}
         <aside className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs h-fit space-y-4">
-          <div>
-            <h2 className="font-bold text-slate-900 text-base flex items-center gap-2">
-              <Wallet className="w-4 h-4 text-blue-600" />
-              Settlement Plan
-            </h2>
-            <p className="text-xs text-slate-500 mt-1">
-              Greedy cash-flow minimization pairing largest debtors with largest
-              creditors across isolated currency ledgers.
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-bold text-slate-900 text-base flex items-center gap-2">
+                <Wallet className="w-4 h-4 text-blue-600" />
+                Settlement Plan
+              </h2>
+            </div>
+            <p className="text-xs text-slate-500">
+              {hasMultipleCurrencies && isUnifiedMode
+                ? `Unified cross-currency cash-flow minimization converted into ${unifiedTargetCurrency}.`
+                : "Greedy cash-flow minimization pairing largest debtors with largest creditors."}
             </p>
-          </div>
 
-          {/* USD ($) Settlements */}
-          <div className="space-y-2 pt-3 border-t border-slate-100">
-            <div className="flex items-center justify-between text-xs font-bold text-slate-800">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-blue-600"></span>
-                USD ($) Ledger
-              </span>
-              <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
-                {usdSettlements.length === 0
-                  ? "Settled"
-                  : `${usdSettlements.length} transfer(s)`}
-              </span>
-            </div>
-
-            {usdSettlements.length === 0 ? (
-              <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                All USD debts are settled up.
-              </div>
-            ) : (
-              usdSettlements.map((s, idx) => (
-                <div
-                  key={idx}
-                  className="p-3 bg-blue-50/50 border border-blue-100 rounded-xl text-xs space-y-1"
+            {/* 🌐 Unified Settlement (Convert All) Toggle & Exchange Rate Controls */}
+            {hasMultipleCurrencies && (
+              <div className="pt-1 space-y-2.5">
+                <button
+                  type="button"
+                  onClick={() => setIsUnifiedMode((prev) => !prev)}
+                  className={`w-full py-2 px-3 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                    isUnifiedMode
+                      ? "bg-emerald-600 text-white border-emerald-600 shadow-2xs"
+                      : "bg-emerald-50/70 hover:bg-emerald-100/80 text-emerald-900 border-emerald-200"
+                  }`}
                 >
-                  <div className="text-slate-700">
-                    <span className="font-bold text-slate-900">
-                      {s.fromUser}
-                    </span>{" "}
-                    pays{" "}
-                    <span className="font-bold text-slate-900">{s.toUser}</span>
+                  <Globe className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {isUnifiedMode
+                      ? "🌐 Unified Settlement Active"
+                      : "🌐 Unified Settlement (Convert All)"}
+                  </span>
+                </button>
+
+                {isUnifiedMode && (
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-3 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="font-semibold text-slate-700">
+                        Settle All In:
+                      </label>
+                      <select
+                        value={normalizeCurrencyCode(unifiedTargetCurrency)}
+                        onChange={(e) =>
+                          handleSelectUnifiedTargetCurrency(e.target.value)
+                        }
+                        className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+                      >
+                        {activeGroupCurrencies.map((code) => (
+                          <option key={code} value={code}>
+                            {code} ({getCurrencySymbol(code)})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-2 pt-2 border-t border-slate-200/80">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold text-slate-600">
+                          Exchange Rates
+                        </span>
+                        <button
+                          type="button"
+                          disabled={isFetchingRates}
+                          onClick={handleFetchLiveRates}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 transition cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${
+                              isFetchingRates ? "animate-spin" : ""
+                            }`}
+                          />
+                          <span>
+                            {isFetchingRates
+                              ? "Fetching..."
+                              : "Fetch Live Rates"}
+                          </span>
+                        </button>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        {activeGroupCurrencies
+                          .filter(
+                            (code) =>
+                              code !==
+                              normalizeCurrencyCode(unifiedTargetCurrency)
+                          )
+                          .map((otherCode) => (
+                            <div
+                              key={otherCode}
+                              className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
+                            >
+                              <span className="text-[11px] font-medium text-slate-600 shrink-0">
+                                1 {unifiedTargetCurrency} =
+                              </span>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="number"
+                                  step="any"
+                                  min="0.000001"
+                                  value={
+                                    exchangeRatesInput[otherCode] ??
+                                    String(
+                                      numericExchangeRates[otherCode] ?? 1
+                                    )
+                                  }
+                                  onChange={(e) =>
+                                    setExchangeRatesInput((prev) => ({
+                                      ...prev,
+                                      [otherCode]: e.target.value,
+                                    }))
+                                  }
+                                  className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                />
+                                <span className="text-[11px] font-bold text-slate-700 w-8">
+                                  {otherCode}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                      </div>
+
+                      {!activeGroup?.is_archived && (
+                        <button
+                          type="button"
+                          disabled={isSavingRates}
+                          onClick={handleSaveExchangeRates}
+                          className="w-full py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white transition cursor-pointer disabled:opacity-50"
+                        >
+                          {isSavingRates
+                            ? "Saving Rates..."
+                            : "Save Exchange Rates"}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <div className="text-sm font-bold text-blue-700">
-                    ${s.amount.toFixed(2)}
-                  </div>
-                </div>
-              ))
+                )}
+              </div>
             )}
           </div>
 
-          {/* EUR (€) Settlements */}
-          <div className="space-y-2 pt-3 border-t border-slate-100">
-            <div className="flex items-center justify-between text-xs font-bold text-slate-800">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
-                EUR (€) Ledger
-              </span>
-              <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
-                {eurSettlements.length === 0
-                  ? "Settled"
-                  : `${eurSettlements.length} transfer(s)`}
-              </span>
-            </div>
-
-            {eurSettlements.length === 0 ? (
-              <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                All EUR debts are settled up.
+          {hasMultipleCurrencies && isUnifiedMode ? (
+            <div className="space-y-2 pt-3 border-t border-slate-100">
+              <div className="flex items-center justify-between text-xs font-bold text-emerald-900">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                  Unified ({unifiedTargetCurrency}) Plan
+                </span>
+                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                  {unifiedResult.settlements.length === 0
+                    ? "Settled"
+                    : `${unifiedResult.settlements.length} transfer(s)`}
+                </span>
               </div>
-            ) : (
-              eurSettlements.map((s, idx) => (
-                <div
-                  key={idx}
-                  className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl text-xs space-y-1"
-                >
-                  <div className="text-slate-700">
-                    <span className="font-bold text-slate-900">
-                      {s.fromUser}
-                    </span>{" "}
-                    pays{" "}
-                    <span className="font-bold text-slate-900">{s.toUser}</span>
-                  </div>
-                  <div className="text-sm font-bold text-indigo-700">
-                    €{s.amount.toFixed(2)}
-                  </div>
+
+              {unifiedResult.settlements.length === 0 ? (
+                <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                  All combined cross-currency debts are settled up.
                 </div>
-              ))
-            )}
-          </div>
+              ) : (
+                unifiedResult.settlements.map((s, idx) => {
+                  const otherCodes = activeGroupCurrencies.filter(
+                    (c) => c !== normalizeCurrencyCode(unifiedTargetCurrency)
+                  );
+                  const secondaryEquivalents = otherCodes
+                    .map((otherCode) => {
+                      const rate = numericExchangeRates[otherCode];
+                      if (!rate || rate <= 0) return null;
+                      const eqCents = Math.round(s.amountCents * rate);
+                      return formatCurrency(eqCents, otherCode);
+                    })
+                    .filter(Boolean);
+
+                  return (
+                    <div
+                      key={idx}
+                      className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl text-xs space-y-1"
+                    >
+                      <div className="text-slate-700">
+                        <span className="font-bold text-slate-900">
+                          {s.fromUser}
+                        </span>{" "}
+                        pays{" "}
+                        <span className="font-bold text-slate-900">
+                          {s.toUser}
+                        </span>
+                      </div>
+                      <div className="text-sm font-bold text-emerald-800 flex items-baseline gap-1.5 flex-wrap">
+                        <span>
+                          {formatCurrency(
+                            s.amountCents,
+                            unifiedTargetCurrency
+                          )}
+                        </span>
+                        {secondaryEquivalents.length > 0 && (
+                          <span className="text-[11px] font-medium text-emerald-700/80">
+                            (≈ {secondaryEquivalents.join(" • ")})
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          ) : (
+            displayCurrencies.map((code, idx) => {
+              const list = settlementsByCurrency[code] || [];
+              const sym = getCurrencySymbol(code);
+              const isSecondary = idx % 2 === 1;
+              return (
+                <div
+                  key={code}
+                  className="space-y-2 pt-3 border-t border-slate-100"
+                >
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                        }`}
+                      ></span>
+                      {code} ({sym}) Ledger
+                    </span>
+                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                      {list.length === 0
+                        ? "Settled"
+                        : `${list.length} transfer(s)`}
+                    </span>
+                  </div>
+
+                  {list.length === 0 ? (
+                    <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                      All {code} debts are settled up.
+                    </div>
+                  ) : (
+                    list.map((s, sIdx) => (
+                      <div
+                        key={sIdx}
+                        className={`p-3 rounded-xl text-xs space-y-1 border ${
+                          isSecondary
+                            ? "bg-indigo-50/50 border-indigo-100"
+                            : "bg-blue-50/50 border-blue-100"
+                        }`}
+                      >
+                        <div className="text-slate-700">
+                          <span className="font-bold text-slate-900">
+                            {s.fromUser}
+                          </span>{" "}
+                          pays{" "}
+                          <span className="font-bold text-slate-900">
+                            {s.toUser}
+                          </span>
+                        </div>
+                        <div
+                          className={`text-sm font-bold ${
+                            isSecondary ? "text-indigo-700" : "text-blue-700"
+                          }`}
+                        >
+                          {formatCurrency(s.amountCents, code)}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              );
+            })
+          )}
 
           {/* Spend by Category Breakdown (Per Currency, Strictly Expenses) */}
           {activeGroup && (
@@ -3411,86 +4161,68 @@ export function SettleUpDashboard({
                 </p>
               </div>
 
-              {/* USD ($) Category Spend */}
-              <div className="space-y-2.5">
-                {hasEurActivity && (
-                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-blue-600"></span>
-                    USD ($) Categories
-                  </div>
-                )}
+              {displayCurrencies.map((code, idx) => {
+                const catList = categorySpendByCurrency[code] || [];
+                const sym = getCurrencySymbol(code);
+                const isSecondary = idx % 2 === 1;
+                if (idx > 0 && catList.length === 0) return null;
 
-                {usdCategorySpend.length === 0 ? (
-                  <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                    No USD expenses recorded yet.
-                  </div>
-                ) : (
-                  <div className="space-y-2.5">
-                    {usdCategorySpend.map((c) => (
-                      <div key={c.category} className="space-y-1 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-semibold text-slate-800 truncate">
-                            {c.category}
-                          </span>
-                          <span className="text-slate-600 font-medium shrink-0">
-                            <strong className="text-slate-900">
-                              ${c.amountFormatted}
-                            </strong>{" "}
-                            <span className="text-[11px] text-slate-400">
-                              ({c.percentage.toFixed(1)}%)
-                            </span>
-                          </span>
-                        </div>
-                        <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-blue-600 rounded-full transition-all"
-                            style={{
-                              width: `${Math.min(100, Math.max(2, c.percentage))}%`,
-                            }}
-                          />
-                        </div>
+                return (
+                  <div
+                    key={code}
+                    className={`space-y-2.5 ${
+                      idx > 0 ? "pt-3 border-t border-slate-100" : ""
+                    }`}
+                  >
+                    {displayCurrencies.length > 1 && (
+                      <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                        <span
+                          className={`w-2 h-2 rounded-full ${
+                            isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                          }`}
+                        ></span>
+                        {code} ({sym}) Categories
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                    )}
 
-              {/* EUR (€) Category Spend */}
-              {eurCategorySpend.length > 0 && (
-                <div className="space-y-2.5 pt-3 border-t border-slate-100">
-                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
-                    EUR (€) Categories
-                  </div>
-                  <div className="space-y-2.5">
-                    {eurCategorySpend.map((c) => (
-                      <div key={c.category} className="space-y-1 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-semibold text-slate-800 truncate">
-                            {c.category}
-                          </span>
-                          <span className="text-slate-600 font-medium shrink-0">
-                            <strong className="text-slate-900">
-                              €{c.amountFormatted}
-                            </strong>{" "}
-                            <span className="text-[11px] text-slate-400">
-                              ({c.percentage.toFixed(1)}%)
-                            </span>
-                          </span>
-                        </div>
-                        <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-indigo-600 rounded-full transition-all"
-                            style={{
-                              width: `${Math.min(100, Math.max(2, c.percentage))}%`,
-                            }}
-                          />
-                        </div>
+                    {catList.length === 0 ? (
+                      <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                        No {code} expenses recorded yet.
                       </div>
-                    ))}
+                    ) : (
+                      <div className="space-y-2.5">
+                        {catList.map((c) => (
+                          <div key={c.category} className="space-y-1 text-xs">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-semibold text-slate-800 truncate">
+                                {c.category}
+                              </span>
+                              <span className="text-slate-600 font-medium shrink-0">
+                                <strong className="text-slate-900">
+                                  {formatCurrency(c.amountCents, code)}
+                                </strong>{" "}
+                                <span className="text-[11px] text-slate-400">
+                                  ({c.percentage.toFixed(1)}%)
+                                </span>
+                              </span>
+                            </div>
+                            <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all ${
+                                  isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                                }`}
+                                style={{
+                                  width: `${Math.min(100, Math.max(2, c.percentage))}%`,
+                                }}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                </div>
-              )}
+                );
+              })}
             </div>
           )}
         </aside>
@@ -3523,6 +4255,155 @@ export function SettleUpDashboard({
           }
         }}
       />
+
+      {/* Manage Group Currencies Modal (Super-Admin Only) */}
+      {isSuperAdmin && isCurrencyModalOpen && activeGroup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-4">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-blue-50 text-blue-600 rounded-xl">
+                  <Globe className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">
+                    Manage Group Currencies
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    Enable travel currencies for &ldquo;{activeGroup.name}&rdquo;
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCurrencyModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveGroupCurrencies} className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-slate-600 block">
+                  Enabled Currencies (tap to toggle)
+                </label>
+                <div className="flex flex-wrap gap-1.5">
+                  {Array.from(
+                    new Set([
+                      ...SUPPORTED_CURRENCIES.map((c) => c.code),
+                      ...editingGroupCurrencies,
+                    ])
+                  ).map((code) => {
+                    const info = getCurrencyInfo(code);
+                    const isSelected = editingGroupCurrencies.includes(
+                      info.code
+                    );
+                    return (
+                      <button
+                        key={info.code}
+                        type="button"
+                        onClick={() => {
+                          setEditingGroupCurrencies((prev) => {
+                            if (prev.includes(info.code)) {
+                              if (prev.length === 1) return prev;
+                              const next = prev.filter((c) => c !== info.code);
+                              if (editingDefaultCurrency === info.code) {
+                                setEditingDefaultCurrency(next[0] || "USD");
+                              }
+                              return next;
+                            }
+                            return [...prev, info.code];
+                          });
+                        }}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer flex items-center gap-1.5 ${
+                          isSelected
+                            ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                            : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                        }`}
+                      >
+                        <span>{info.symbol}</span>
+                        <span>{info.code}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Custom 3-Letter ISO Currency Code Input */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-600 block">
+                  Add Custom 3-Letter ISO Currency (optional)
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    maxLength={3}
+                    placeholder="e.g. SGD, HKD, ZAR"
+                    value={customIsoInput}
+                    onChange={(e) =>
+                      setCustomIsoInput(e.target.value.toUpperCase())
+                    }
+                    className="flex-1 border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-mono uppercase text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const clean = customIsoInput.trim().toUpperCase();
+                      if (/^[A-Z]{3}$/.test(clean)) {
+                        setEditingGroupCurrencies((prev) =>
+                          prev.includes(clean) ? prev : [...prev, clean]
+                        );
+                        setCustomIsoInput("");
+                      }
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
+                  >
+                    + Add ISO
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-600 block">
+                  Default Currency for New Transactions
+                </label>
+                <select
+                  value={editingDefaultCurrency}
+                  onChange={(e) => setEditingDefaultCurrency(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  {editingGroupCurrencies.map((code) => {
+                    const info = getCurrencyInfo(code);
+                    return (
+                      <option key={info.code} value={info.code}>
+                        {info.label}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              <div className="pt-2 border-t border-slate-100 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsCurrencyModalOpen(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingCurrencies}
+                  className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-xl transition cursor-pointer shadow-xs disabled:opacity-50"
+                >
+                  {isSavingCurrencies ? "Saving..." : "Save Currencies"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Unified CSV Import Modal (Super-Admin Only) */}
       {isSuperAdmin && isCsvModalOpen && (
@@ -3666,12 +4547,19 @@ export function SettleUpDashboard({
           groupId={activeGroupId}
           members={members}
           existingCategories={groupCategories}
+          groupCurrencies={activeGroupCurrencies}
+          onCurrencyAdded={(code) => {
+            ensureCurrenciesInGroup([code]);
+          }}
           onViewReceipt={(url, title) =>
             setViewingReceipt({
               url,
               title: title || editingExpense.description || "Receipt",
               date: formatTransactionDate(editingExpense.date),
-              amountFormatted: `${editingExpense.currency}${editingExpense.amount.toFixed(2)}`,
+              amountFormatted: formatCurrency(
+                editingExpense.amountCents,
+                editingExpense.currency
+              ),
             })
           }
           onSaved={() => {

@@ -14,14 +14,14 @@ Analyze the attached receipt image or PDF and extract the transaction details in
 {
   "description": "Merchant name + brief summary (e.g. 'Dunnes Stores - Groceries' or 'Delta Air Lines - Flights')",
   "amount": 42.50,
-  "currency": "USD" | "EUR",
+  "currency": "USD" | "EUR" | "AUD" | "THB" | "GBP" | "CAD" | "JPY" | "NZD" | "CHF" | "MXN",
   "date": "YYYY-MM-DD",
   "category": "Category name"
 }
 
 Rules:
 1. "amount": Use the final total charged (including tax and tip if shown), as a positive number with up to 2 decimal places.
-2. "currency": Return "EUR" if the receipt uses € or EUR; otherwise return "USD".
+2. "currency": Return the 3-letter ISO currency code detected on the receipt (e.g. "THB" if ฿ / Baht / Thailand, "AUD" if A$ / GST in Australia, "EUR" if € / Euro, "GBP" if £, "CAD" if C$, "JPY" if ¥, "NZD" if NZ$, "CHF", "MXN", or "USD" if $ / default).
 3. "date": Return the transaction date in strict YYYY-MM-DD format. If no year is printed, infer the current year. If no date is visible, omit or return an empty string.
 4. "category": Prefer one of our standard categories [${EXPENSE_CATEGORIES.join(", ")}], OR if the receipt clearly belongs to another specific category (e.g. "Parking", "Tolls", "Golf", "Pharmacy"), return that concise 1-2 word category name.
 5. Return ONLY valid JSON.`;

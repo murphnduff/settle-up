@@ -11,10 +11,15 @@ import {
   calculateBalancesByCurrency,
   calculateMemberBreakdown,
   calculateCategorySpend,
+  calculateUnifiedReconciliation,
   buildGroupCategories,
   EXPENSE_CATEGORIES,
   canDeleteMember,
 } from './reconciliation.ts';
+import {
+  formatCurrency,
+  normalizeCurrencyCode,
+} from './currencies.ts';
 import {
   normalizeParsedReceipt,
   isPdfReceiptUrl,
@@ -775,5 +780,118 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
       false
     );
   });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 15: Multi-Currency Formatting & Cross-Currency Unified Reconciliation (USD, AUD, THB)
+  // --------------------------------------------------------------------------
+  it('Edge Case 15: formatCurrency and calculateUnifiedReconciliation convert USD, AUD, and THB into a single zero-sum unified settlement plan', () => {
+    // 1. Verify formatCurrency and normalizeCurrencyCode
+    assert.strictEqual(formatCurrency(2500, 'USD'), '$25.00');
+    assert.strictEqual(formatCurrency(4000, 'AUD'), 'A$40.00');
+    assert.strictEqual(formatCurrency(125000, 'THB'), '฿1,250.00');
+    assert.strictEqual(formatCurrency(1500, 'EUR'), '€15.00');
+    assert.strictEqual(normalizeCurrencyCode('฿'), 'THB');
+    assert.strictEqual(normalizeCurrencyCode('A$'), 'AUD');
+
+    // 2. Multi-currency trip expenses across USD, AUD, and THB:
+    // Exchange rates relative to USD: 1 USD = 1.50 AUD, 1 USD = 34.00 THB
+    const exchangeRates = {
+      USD: 1,
+      AUD: 1.5,
+      THB: 34,
+    };
+
+    const tripExpenses: ExpenseRecord[] = [
+      // Expense 1 (USD): Murph pays $90.00 USD split equally ($30.00 USD each)
+      {
+        id: 'exp-usd-90',
+        paidByMemberId: murph.id,
+        amountCents: 9000,
+        currency: 'USD',
+        type: 'expense',
+        splits: [
+          { memberId: murph.id, splitAmountCents: 3000 },
+          { memberId: kev.id, splitAmountCents: 3000 },
+          { memberId: fitz.id, splitAmountCents: 3000 },
+        ],
+      },
+      // Expense 2 (AUD): Kev pays A$90.00 AUD (= $60.00 USD at 1.50) split equally (A$30.00 AUD = $20.00 USD each)
+      {
+        id: 'exp-aud-90',
+        paidByMemberId: kev.id,
+        amountCents: 9000,
+        currency: 'AUD',
+        type: 'expense',
+        splits: [
+          { memberId: murph.id, splitAmountCents: 3000 },
+          { memberId: kev.id, splitAmountCents: 3000 },
+          { memberId: fitz.id, splitAmountCents: 3000 },
+        ],
+      },
+      // Expense 3 (THB): Fitz pays ฿1,020.00 THB (= $30.00 USD at 34.00) split equally (฿340.00 THB = $10.00 USD each)
+      {
+        id: 'exp-thb-1020',
+        paidByMemberId: fitz.id,
+        amountCents: 102000,
+        currency: 'THB',
+        type: 'expense',
+        splits: [
+          { memberId: murph.id, splitAmountCents: 34000 },
+          { memberId: kev.id, splitAmountCents: 34000 },
+          { memberId: fitz.id, splitAmountCents: 34000 },
+        ],
+      },
+    ];
+
+    const unified = calculateUnifiedReconciliation(
+      allMembers,
+      tripExpenses,
+      'USD',
+      exchangeRates
+    );
+
+    assert.strictEqual(unified.targetCurrency, 'USD');
+
+    // Total trip spend in USD: $90 + $60 + $30 = $180.00 ($60.00 share per member)
+    // Murph: Paid $90.00 (9000c), Share $60.00 (6000c), Net = +$30.00 (+3000c)
+    // Kev:   Paid $60.00 (6000c), Share $60.00 (6000c), Net = $0.00 (0c)
+    // Fitz:  Paid $30.00 (3000c), Share $60.00 (6000c), Net = -$30.00 (-3000c)
+    const murphSummary = unified.memberBreakdown.find((m) => m.memberId === murph.id)!;
+    const kevSummary = unified.memberBreakdown.find((m) => m.memberId === kev.id)!;
+    const fitzSummary = unified.memberBreakdown.find((m) => m.memberId === fitz.id)!;
+
+    assert.strictEqual(murphSummary.paidCents, 9000);
+    assert.strictEqual(murphSummary.shareCents, 6000);
+    assert.strictEqual(murphSummary.netBalanceCents, 3000);
+
+    assert.strictEqual(kevSummary.paidCents, 6000);
+    assert.strictEqual(kevSummary.shareCents, 6000);
+    assert.strictEqual(kevSummary.netBalanceCents, 0);
+
+    assert.strictEqual(fitzSummary.paidCents, 3000);
+    assert.strictEqual(fitzSummary.shareCents, 6000);
+    assert.strictEqual(fitzSummary.netBalanceCents, -3000);
+
+    // Instead of 6 separate per-currency transfers, unified settlement produces 1 transfer: Fitz pays Murph $30.00
+    assert.strictEqual(unified.settlements.length, 1);
+    assert.strictEqual(unified.settlements[0].fromMemberId, fitz.id);
+    assert.strictEqual(unified.settlements[0].toMemberId, murph.id);
+    assert.strictEqual(unified.settlements[0].amountCents, 3000);
+    assert.strictEqual(unified.settlements[0].currency, 'USD');
+
+    // 3. Verify 1-cent rounding remainder conservation on non-divisible exchange rates (e.g. 1 USD = 33.85 THB)
+    const oddRateResult = calculateUnifiedReconciliation(
+      allMembers,
+      tripExpenses,
+      'USD',
+      { USD: 1, AUD: 1.52, THB: 33.85 }
+    );
+    const sumUnifiedBalances = oddRateResult.memberBreakdown.reduce(
+      (acc, r) => acc + r.netBalanceCents,
+      0
+    );
+    assert.strictEqual(sumUnifiedBalances, 0);
+  });
 });
+
 

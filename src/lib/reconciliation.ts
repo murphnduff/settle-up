@@ -3,8 +3,13 @@
  *
  * All monetary calculations operate strictly on integers representing cents
  * (e.g. $10.00 = 1000 cents) to prevent floating-point rounding errors.
- * Currencies (USD vs EUR) are strictly isolated.
+ * Supports isolated multi-currency ledgers as well as unified cross-currency reconciliation.
  */
+
+import {
+  normalizeCurrencyCode,
+  getCurrencySymbol,
+} from './currencies.ts';
 
 export const EXPENSE_CATEGORIES = [
   'General',
@@ -154,12 +159,8 @@ export function calculateBalancesByCurrency(
   members: MemberRecord[],
   expenses: ExpenseRecord[]
 ): Map<string, Map<string, number>> {
-  const normalizeCurrencyFamily = (rawCur?: string): 'USD' | 'EUR' | string => {
-    const c = (rawCur || 'USD').trim();
-    if (c === '$' || c.toUpperCase() === 'USD') return 'USD';
-    if (c === '€' || c.toUpperCase() === 'EUR') return 'EUR';
-    return c;
-  };
+  const normalizeCurrencyFamily = (rawCur?: string): string =>
+    normalizeCurrencyCode(rawCur);
 
   // Preserve the caller's preferred label ('$' vs 'USD', '€' vs 'EUR') per currency family
   const familyLabelMap = new Map<string, string>();
@@ -261,12 +262,8 @@ export function calculateMemberBreakdown(
   expenses: ExpenseRecord[],
   targetCurrency: string = 'USD'
 ): MemberSummaryRecord[] {
-  const normalizeCurrencyFamily = (rawCur?: string): string => {
-    const c = (rawCur || 'USD').trim();
-    if (c === '$' || c.toUpperCase() === 'USD') return 'USD';
-    if (c === '€' || c.toUpperCase() === 'EUR') return 'EUR';
-    return c;
-  };
+  const normalizeCurrencyFamily = (rawCur?: string): string =>
+    normalizeCurrencyCode(rawCur);
 
   const targetFamily = normalizeCurrencyFamily(targetCurrency);
   const paidMap = new Map<string, number>();
@@ -364,12 +361,8 @@ export function calculateCategorySpend(
   expenses: ExpenseRecord[],
   targetCurrency: string = 'USD'
 ): CategorySpendRecord[] {
-  const normalizeCurrencyFamily = (rawCur?: string): string => {
-    const c = (rawCur || 'USD').trim();
-    if (c === '$' || c.toUpperCase() === 'USD') return 'USD';
-    if (c === '€' || c.toUpperCase() === 'EUR') return 'EUR';
-    return c;
-  };
+  const normalizeCurrencyFamily = (rawCur?: string): string =>
+    normalizeCurrencyCode(rawCur);
 
   const targetFamily = normalizeCurrencyFamily(targetCurrency);
   const categoryTotals = new Map<string, number>();
@@ -475,6 +468,242 @@ export function calculateSettlements(
   }
 
   return instructions;
+}
+
+export interface UnifiedReconciliationResult {
+  targetCurrency: string;
+  memberBreakdown: MemberSummaryRecord[];
+  settlements: SettlementInstruction[];
+}
+
+/**
+ * Converts a cent amount from `fromCurrency` into `targetCurrency` using `exchangeRates`.
+ *
+ * `exchangeRates` maps currency codes (e.g. 'AUD', 'THB', 'EUR') to how many units of that
+ * currency equal 1 unit of the rate base (typically `1 targetCurrency = rate fromCurrency`,
+ * so `targetAmount = fromAmount / rate`, or `fromAmount * (rates[target] / rates[from])` if cross-rates exist).
+ */
+export function convertCentsToTargetCurrency(
+  amountCents: number,
+  fromCurrency: string,
+  targetCurrency: string,
+  exchangeRates: Record<string, number> = {}
+): number {
+  const fromCode = normalizeCurrencyCode(fromCurrency);
+  const targetCode = normalizeCurrencyCode(targetCurrency);
+  if (fromCode === targetCode || amountCents === 0) {
+    return amountCents;
+  }
+
+  const rawFromRate = Number(exchangeRates[fromCode]);
+  const rawTargetRate = Number(exchangeRates[targetCode]);
+
+  const fromRate =
+    Number.isFinite(rawFromRate) && rawFromRate > 0 ? rawFromRate : 1;
+  const targetRate =
+    Number.isFinite(rawTargetRate) && rawTargetRate > 0 ? rawTargetRate : 1;
+
+  // When rates are quoted as `1 targetCurrency = X fromCurrency`, targetRate is 1 and fromRate is X -> amountCents / X
+  return amountCents * (targetRate / fromRate);
+}
+
+/**
+ * Calculates a unified cross-currency Member Breakdown and greedy Cash-Flow Minimization
+ * Settlement Plan converted into `targetCurrency`.
+ *
+ * Deterministically resolves any 1-cent rounding remainder across members so that
+ * `SUM(netBalanceCents) === 0` before running the greedy settlement algorithm.
+ */
+export function calculateUnifiedReconciliation(
+  members: MemberRecord[],
+  expenses: ExpenseRecord[],
+  targetCurrency: string = 'USD',
+  exchangeRates: Record<string, number> = {}
+): UnifiedReconciliationResult {
+  const targetCode = normalizeCurrencyCode(targetCurrency);
+  if (!members || members.length === 0) {
+    return {
+      targetCurrency: targetCode,
+      memberBreakdown: [],
+      settlements: [],
+    };
+  }
+
+  // Discover all distinct currencies present in expenses
+  const activeCurrencies = Array.from(
+    new Set(expenses.map((e) => normalizeCurrencyCode(e.currency)))
+  );
+  if (activeCurrencies.length === 0) {
+    activeCurrencies.push(targetCode);
+  }
+
+  const exactPaidByMember = new Map<string, number>();
+  const exactShareByMember = new Map<string, number>();
+  const exactNetByMember = new Map<string, number>();
+
+  for (const m of members) {
+    exactPaidByMember.set(m.id, 0);
+    exactShareByMember.set(m.id, 0);
+    exactNetByMember.set(m.id, 0);
+  }
+
+  for (const curCode of activeCurrencies) {
+    const curBreakdown = calculateMemberBreakdown(members, expenses, curCode);
+    for (const rec of curBreakdown) {
+      const paidTarget = convertCentsToTargetCurrency(
+        rec.paidCents,
+        curCode,
+        targetCode,
+        exchangeRates
+      );
+      const shareTarget = convertCentsToTargetCurrency(
+        rec.shareCents,
+        curCode,
+        targetCode,
+        exchangeRates
+      );
+      const netTarget = convertCentsToTargetCurrency(
+        rec.netBalanceCents,
+        curCode,
+        targetCode,
+        exchangeRates
+      );
+
+      exactPaidByMember.set(
+        rec.memberId,
+        (exactPaidByMember.get(rec.memberId) || 0) + paidTarget
+      );
+      exactShareByMember.set(
+        rec.memberId,
+        (exactShareByMember.get(rec.memberId) || 0) + shareTarget
+      );
+      exactNetByMember.set(
+        rec.memberId,
+        (exactNetByMember.get(rec.memberId) || 0) + netTarget
+      );
+    }
+  }
+
+  // Round each member's converted Paid, Share, and Net Balance to integer cents
+  const roundedEntries = members.map((m, index) => {
+    const exactNet = exactNetByMember.get(m.id) || 0;
+    const roundedNet = Math.round(exactNet);
+    const roundingError = roundedNet - exactNet; // positive if rounded up, negative if rounded down
+    return {
+      memberId: m.id,
+      memberName: m.name,
+      index,
+      paidCents: Math.round(exactPaidByMember.get(m.id) || 0),
+      shareCents: Math.round(exactShareByMember.get(m.id) || 0),
+      exactNet,
+      netBalanceCents: roundedNet,
+      roundingError,
+    };
+  });
+
+  // Deterministic 1-cent remainder resolution so SUM(netBalanceCents) === 0 holds strictly
+  const residualCents = roundedEntries.reduce(
+    (sum, item) => sum + item.netBalanceCents,
+    0
+  );
+
+  if (residualCents !== 0 && roundedEntries.length > 0) {
+    const step = residualCents > 0 ? -1 : 1;
+    let remainingToAdjust = Math.abs(residualCents);
+
+    // Sort candidates by who was rounded most in the direction of the residual, then by largest |exactNet|, then by member order
+    const candidates = [...roundedEntries].sort((a, b) => {
+      const errDiff =
+        residualCents > 0
+          ? b.roundingError - a.roundingError
+          : a.roundingError - b.roundingError;
+      if (Math.abs(errDiff) > 1e-7) return errDiff;
+      const magDiff = Math.abs(b.exactNet) - Math.abs(a.exactNet);
+      if (Math.abs(magDiff) > 1e-7) return magDiff;
+      return a.index - b.index;
+    });
+
+    let cIdx = 0;
+    while (remainingToAdjust > 0) {
+      candidates[cIdx % candidates.length].netBalanceCents += step;
+      remainingToAdjust--;
+      cIdx++;
+    }
+  }
+
+  const memberBreakdown: MemberSummaryRecord[] = roundedEntries.map((item) => ({
+    memberId: item.memberId,
+    memberName: item.memberName,
+    paidCents: item.paidCents,
+    shareCents: item.shareCents,
+    netBalanceCents: item.netBalanceCents,
+  }));
+
+  // Run greedy cash-flow minimization on unified balances
+  const debtors: { memberId: string; memberName: string; amountCents: number }[] =
+    [];
+  const creditors: {
+    memberId: string;
+    memberName: string;
+    amountCents: number;
+  }[] = [];
+
+  for (const item of memberBreakdown) {
+    if (item.netBalanceCents < 0) {
+      debtors.push({
+        memberId: item.memberId,
+        memberName: item.memberName,
+        amountCents: Math.abs(item.netBalanceCents),
+      });
+    } else if (item.netBalanceCents > 0) {
+      creditors.push({
+        memberId: item.memberId,
+        memberName: item.memberName,
+        amountCents: item.netBalanceCents,
+      });
+    }
+  }
+
+  debtors.sort((a, b) => b.amountCents - a.amountCents);
+  creditors.sort((a, b) => b.amountCents - a.amountCents);
+
+  const settlements: SettlementInstruction[] = [];
+  let d = 0;
+  let c = 0;
+
+  while (d < debtors.length && c < creditors.length) {
+    const debtor = debtors[d];
+    const creditor = creditors[c];
+    const transferCents = Math.min(debtor.amountCents, creditor.amountCents);
+
+    if (transferCents > 0) {
+      const amountFormatted = (transferCents / 100).toFixed(2);
+      settlements.push({
+        fromMemberId: debtor.memberId,
+        fromMemberName: debtor.memberName,
+        toMemberId: creditor.memberId,
+        toMemberName: creditor.memberName,
+        amountCents: transferCents,
+        amountFormatted,
+        currency: targetCode,
+        fromUser: debtor.memberName,
+        toUser: creditor.memberName,
+        amount: Number(amountFormatted),
+      });
+    }
+
+    debtor.amountCents -= transferCents;
+    creditor.amountCents -= transferCents;
+
+    if (debtor.amountCents === 0) d++;
+    if (creditor.amountCents === 0) c++;
+  }
+
+  return {
+    targetCurrency: targetCode,
+    memberBreakdown,
+    settlements,
+  };
 }
 
 /**
@@ -617,8 +846,8 @@ export interface ParsedCsvTransaction {
   description: string;
   category: string;
   amountCents: number;
-  currency: 'USD' | 'EUR';
-  currencySymbol: '$' | '€';
+  currency: string;
+  currencySymbol: string;
   type: 'expense' | 'payment';
   paidByMemberName: string;
   splits: {
@@ -725,10 +954,8 @@ export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
     const amountCents = Math.round(parsedCost * 100);
     const type: 'expense' | 'payment' =
       rawCategory.toLowerCase() === 'payment' ? 'payment' : 'expense';
-    const isEur =
-      rawCurrency.toUpperCase() === 'EUR' || rawCurrency === '€';
-    const currency: 'USD' | 'EUR' = isEur ? 'EUR' : 'USD';
-    const currencySymbol: '$' | '€' = isEur ? '€' : '$';
+    const currency = normalizeCurrencyCode(rawCurrency);
+    const currencySymbol = getCurrencySymbol(currency).trim();
 
     let paidByMemberName = '';
     const splits: { memberName: string; splitAmountCents: number }[] = [];
@@ -851,8 +1078,7 @@ export function generateGroupCsv(
         : Math.round((exp.amount || 0) * 100);
     if (!payerId || totalCents <= 0) continue;
 
-    const isEur = exp.currency === '€' || exp.currency === 'EUR';
-    const currencyCode = isEur ? 'EUR' : 'USD';
+    const currencyCode = normalizeCurrencyCode(exp.currency);
     const category =
       exp.type === 'payment' ? 'Payment' : exp.category || 'General';
     const costFormatted = (totalCents / 100).toFixed(2);

@@ -1,10 +1,11 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { EXPENSE_CATEGORIES } from "./reconciliation.ts";
+import { normalizeCurrencyCode } from "./currencies.ts";
 
 export interface ParsedReceiptData {
   description?: string;
   amount?: number;
-  currency?: "USD" | "EUR";
+  currency?: string;
   date?: string;
   category?: string;
 }
@@ -50,13 +51,8 @@ export function normalizeParsedReceipt(raw: unknown): ParsedReceiptData {
     result.amount = Math.round(rawAmount * 100) / 100;
   }
 
-  if (typeof record.currency === "string") {
-    const upper = record.currency.trim().toUpperCase();
-    if (upper === "EUR" || upper === "€" || upper.includes("EUR")) {
-      result.currency = "EUR";
-    } else if (upper === "USD" || upper === "$" || upper.includes("USD")) {
-      result.currency = "USD";
-    }
+  if (typeof record.currency === "string" && record.currency.trim().length > 0) {
+    result.currency = normalizeCurrencyCode(record.currency);
   }
 
   if (typeof record.date === "string") {

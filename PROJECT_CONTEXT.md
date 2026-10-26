@@ -27,18 +27,19 @@
   - Global `noindex, nofollow, noarchive, nosnippet` metadata in `src/app/layout.tsx` and `X-Robots-Tag` HTTP headers in `next.config.ts`.
 
 ### 2.2 Database Tables & Schema
-- **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `created_at` (TIMESTAMPTZ).
+- **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `currencies` (TEXT[] DEFAULT `ARRAY['USD']`), `default_currency` (TEXT DEFAULT `'USD'`), `exchange_rates` (JSONB DEFAULT `'{}'`), `created_at` (TIMESTAMPTZ).
 - **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ). Unique constraint on `(group_id, lower(display_name))`.
-- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
+- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (TEXT — any 3-letter ISO currency code such as `'USD'`, `'EUR'`, `'AUD'`, `'THB'`, `'GBP'`, `'CAD'`, `'JPY'`, `'NZD'`, `'CHF'`, `'MXN'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
 - **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
 
 ---
 
-## 3. Core Math Engine & Reconciliation Rules (`src/lib/reconciliation.ts`)
+## 3. Core Math Engine & Reconciliation Rules (`src/lib/reconciliation.ts` & `src/lib/currencies.ts`)
 
-### 3.1 Strict Integer-Cent Arithmetic
+### 3.1 Strict Integer-Cent Arithmetic, Isolated Ledgers & Unified Cross-Currency Reconciliation
 - All financial math is computed in integer cents to prevent floating-point drift.
-- Isolated ledgers: `USD` and `EUR` calculate and settle independently.
+- **Per-Currency Isolated Mode (Default):** Each currency enabled on a group (`USD`, `AUD`, `THB`, `EUR`, etc.) calculates and settles independently.
+- **Cross-Currency Unified Reconciliation (`calculateUnifiedReconciliation`):** When a group has 2+ currencies, users can toggle **🌐 Unified Settlement (Convert All)** to convert each member's Paid, Accrued Share, and Net Balance into any selected target currency using live exchange rates (`https://open.er-api.com/v6/latest/${targetCurrency}`) or custom overrides stored in `groups.exchange_rates`. Any 1-cent rounding remainder is resolved deterministically on the member with the largest absolute balance so $\sum \text{netBalanceCents} = 0$, outputting a single unified Settlement Plan (with secondary currency equivalents).
 
 ### 3.2 Net Balance Calculation
 For each user $u$ and currency $c$:
@@ -110,6 +111,16 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Ledger Receipt Badge & Lightbox Modal:**
   - Transactions with a non-null `receipt_url` display a clickable `Receipt` badge in the ledger that opens a `<dialog closedby="any">` Lightbox Modal for full-size images or embedded/linked PDFs.
 
+### 4.7 Per-Group Custom Currencies & Cross-Currency Unified Settlement (`src/lib/currencies.ts` & `src/lib/reconciliation.ts`)
+- **Supported Currency Catalog (`SUPPORTED_CURRENCIES`):**
+  - First-class support for `USD` (`$`), `EUR` (`€`), `AUD` (`A$`), `THB` (`฿`), `GBP` (`£`), `CAD` (`C$`), `JPY` (`¥`), `NZD` (`NZ$`), `CHF` (`CHF`), `MXN` (`Mex$`), plus any custom 3-letter ISO currency code via `formatCurrency(cents, currencyCode)`.
+- **Per-Group Currency Management:**
+  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency selection in Create Group and a **Manage Group Currencies** modal (`Currencies (...)` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
+  - **Clean Single-Currency UX:** Groups with only 1 currency enabled hide currency switcher tabs and dropdowns so the UI stays minimal.
+  - **Auto-Enable on AI Receipt Scan & CSV Import:** Scanning a receipt or importing a CSV with a new currency automatically appends that currency to `group.currencies`.
+- **Cross-Currency Conversion & "🌐 Unified Settlement (Convert All)" Mode:**
+  - Available whenever a group has 2+ currencies. Includes a target currency selector, **Fetch Live Rates** (`https://open.er-api.com/v6/latest/${targetCurrency}`), editable exchange rate overrides persisted in `groups.exchange_rates`, and unified Member Summary + Settlement Plan with secondary currency equivalents (tested in Edge Case 15).
+
 ---
 
 ## 5. Active Backlog & Future Development Roadmap
@@ -136,8 +147,13 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 ### Phase 1.4: Receipts & AI Vision (Completed ✅)
 7. ✅ **Receipt Attachments & AI Receipt Extraction (OCR):**
    - Client-side HTML5 `<canvas>` compression (`1600px`, `0.80` JPEG quality) + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
-   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`gemini-2.5-flash` with fallback to `gemini-2.0-flash`) with parallel upload + auto-fill in Add/Edit Transaction forms, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
+   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`gemini-flash-latest` / `gemini-3.8-flash` / `gemini-flash-lite-latest` / `gemini-2.5-flash` with dynamic model auto-discovery) with parallel upload + auto-fill in Add/Edit Transaction forms, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
+
+### Phase 1.5: Per-Group Custom Currencies & Cross-Currency Unified Reconciliation (Completed ✅)
+8. ✅ **Per-Group Custom Currencies & Unified Settlement:**
+   - `src/lib/currencies.ts` catalog (`USD`, `EUR`, `AUD`, `THB`, `GBP`, `CAD`, `JPY`, `NZD`, `CHF`, `MXN`, + custom ISO codes) and `formatCurrency` helper.
+   - Per-group `currencies`, `default_currency`, and `exchange_rates` management, clean single-currency UX, auto-enable on AI scan/CSV import, and **🌐 Unified Settlement (Convert All)** with live exchange rates (`open.er-api.com`), editable rate overrides, and zero-sum unified reconciliation (`calculateUnifiedReconciliation` tested in Edge Case 15).
 
 ### Future Enhancements
-8. **PWA Web Share Target Integration:**
+9. **PWA Web Share Target Integration:**
    - Allow sharing a receipt photo directly from the Android/iOS system gallery or camera app into the installed Settle Up Chrome PWA (`manifest.json` `share_target`) to initiate a new transaction with the shared receipt pre-attached.
