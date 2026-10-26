@@ -3,8 +3,9 @@ import { EXPENSE_CATEGORIES } from "@/lib/reconciliation";
 import { normalizeParsedReceipt } from "@/lib/receipts";
 
 const CANDIDATE_MODELS = [
-  "gemini-3.8-flash",
   "gemini-flash-latest",
+  "gemini-3.8-flash",
+  "gemini-flash-lite-latest",
   "gemini-2.5-flash",
 ];
 
@@ -24,6 +25,72 @@ Rules:
 3. "date": Return the transaction date in strict YYYY-MM-DD format. If no year is printed, infer the current year. If no date is visible, omit or return an empty string.
 4. "category": Prefer one of our standard categories [${EXPENSE_CATEGORIES.join(", ")}], OR if the receipt clearly belongs to another specific category (e.g. "Parking", "Tolls", "Golf", "Pharmacy"), return that concise 1-2 word category name.
 5. Return ONLY valid JSON.`;
+
+function isRetryableOrCascadeError(status: number, errMsg: string): boolean {
+  if (
+    status === 404 ||
+    status === 429 ||
+    status === 500 ||
+    status === 503
+  ) {
+    return true;
+  }
+  const lower = errMsg.toLowerCase();
+  return (
+    lower.includes("not found") ||
+    lower.includes("no longer available") ||
+    lower.includes("high demand") ||
+    lower.includes("overloaded") ||
+    lower.includes("is not supported for generatecontent")
+  );
+}
+
+async function discoverLatestFlashModels(
+  apiKey: string,
+  alreadyTried: Set<string>
+): Promise<string[]> {
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+        apiKey
+      )}`
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    const models = Array.isArray(data?.models) ? data.models : [];
+
+    const discovered: string[] = [];
+    for (const m of models) {
+      const rawName = typeof m?.name === "string" ? m.name : "";
+      const shortName = rawName.replace(/^models\//i, "").trim();
+      const lower = shortName.toLowerCase();
+      const methods: string[] = Array.isArray(m?.supportedGenerationMethods)
+        ? m.supportedGenerationMethods
+        : [];
+
+      if (
+        shortName &&
+        !alreadyTried.has(shortName) &&
+        methods.includes("generateContent") &&
+        lower.includes("flash") &&
+        !lower.includes("2.0-flash") &&
+        !lower.includes("1.5") &&
+        !lower.includes("tts") &&
+        !lower.includes("image") &&
+        !lower.includes("audio") &&
+        !lower.includes("live") &&
+        !lower.includes("transcribe")
+      ) {
+        discovered.push(shortName);
+      }
+    }
+
+    // Sort descending so newest versioned Flash models are tried first
+    return discovered.sort((a, b) => b.localeCompare(a)).slice(0, 3);
+  } catch {
+    return [];
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -55,10 +122,7 @@ export async function POST(request: NextRequest) {
 
     const envModel = process.env.GEMINI_MODEL?.trim();
     const modelsToTry = Array.from(
-      new Set([
-        ...(envModel ? [envModel] : []),
-        ...CANDIDATE_MODELS,
-      ])
+      new Set([...(envModel ? [envModel] : []), ...CANDIDATE_MODELS])
     );
 
     const requestBody = {
@@ -86,47 +150,56 @@ export async function POST(request: NextRequest) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let geminiJson: any = null;
     let primaryErrorMsg = "";
+    const triedModels = new Set<string>();
 
-    for (let i = 0; i < modelsToTry.length; i++) {
-      const modelName = modelsToTry[i];
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-        modelName
-      )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const tryModelList = async (candidates: string[]): Promise<boolean> => {
+      for (const modelName of candidates) {
+        triedModels.add(modelName);
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+          modelName
+        )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-      const geminiRes = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-      });
+        const geminiRes = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+        });
 
-      if (geminiRes.ok) {
-        geminiJson = await geminiRes.json();
-        break;
+        if (geminiRes.ok) {
+          geminiJson = await geminiRes.json();
+          return true;
+        }
+
+        const errData = await geminiRes.json().catch(() => ({}));
+        const currentErrorMsg =
+          errData?.error?.message ||
+          `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+
+        if (!primaryErrorMsg) {
+          primaryErrorMsg = currentErrorMsg;
+        }
+
+        if (!isRetryableOrCascadeError(geminiRes.status, currentErrorMsg)) {
+          primaryErrorMsg = currentErrorMsg;
+          return false;
+        }
       }
+      return false;
+    };
 
-      const errData = await geminiRes.json().catch(() => ({}));
-      const currentErrorMsg =
-        errData?.error?.message ||
-        `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+    // 1. Try configured/rolling candidate models
+    await tryModelList(modelsToTry);
 
-      if (i === 0 || !primaryErrorMsg) {
-        primaryErrorMsg = currentErrorMsg;
-      }
-
-      // Only try the next model if the current model returned a 404 or model-not-found error
-      const lowerMsg = currentErrorMsg.toLowerCase();
-      const isModelNotFound =
-        geminiRes.status === 404 ||
-        lowerMsg.includes("not found") ||
-        lowerMsg.includes("no longer available") ||
-        lowerMsg.includes("is not supported for generatecontent");
-
-      if (!isModelNotFound) {
-        // Non-model error (e.g. invalid key, quota, payload); keep primary error unless a non-404 error occurred on the active model
-        primaryErrorMsg = currentErrorMsg;
-        break;
+    // 2. Dynamic auto-discovery fallback if all static candidates failed
+    if (!geminiJson) {
+      const discoveredModels = await discoverLatestFlashModels(
+        apiKey,
+        triedModels
+      );
+      if (discoveredModels.length > 0) {
+        await tryModelList(discoveredModels);
       }
     }
 
@@ -148,7 +221,10 @@ export async function POST(request: NextRequest) {
 
     if (!rawText) {
       return NextResponse.json(
-        { ok: false, error: "Gemini returned an empty response for this receipt." },
+        {
+          ok: false,
+          error: "Gemini returned an empty response for this receipt.",
+        },
         { status: 422 }
       );
     }
@@ -163,7 +239,6 @@ export async function POST(request: NextRequest) {
     try {
       parsedObj = JSON.parse(cleanedJsonText);
     } catch {
-      // Attempt to extract first {...} JSON object if extra text surrounded it
       const firstBrace = cleanedJsonText.indexOf("{");
       const lastBrace = cleanedJsonText.lastIndexOf("}");
       if (firstBrace >= 0 && lastBrace > firstBrace) {
