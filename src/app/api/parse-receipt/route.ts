@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { EXPENSE_CATEGORIES } from "@/lib/reconciliation";
 import { normalizeParsedReceipt } from "@/lib/receipts";
 
-const CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const CANDIDATE_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-flash-latest",
+  "gemini-2.5-flash",
+];
 
 const RECEIPT_EXTRACTION_PROMPT = `You are an expert financial receipt parser for a group expense-splitting app.
 Analyze the attached receipt image or PDF and extract the transaction details into strict JSON with the following exact keys:
@@ -81,9 +85,10 @@ export async function POST(request: NextRequest) {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let geminiJson: any = null;
-    let lastErrorMsg = "Gemini API request failed.";
+    let primaryErrorMsg = "";
 
-    for (const modelName of modelsToTry) {
+    for (let i = 0; i < modelsToTry.length; i++) {
+      const modelName = modelsToTry[i];
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
         modelName
       )}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -102,25 +107,35 @@ export async function POST(request: NextRequest) {
       }
 
       const errData = await geminiRes.json().catch(() => ({}));
-      lastErrorMsg =
+      const currentErrorMsg =
         errData?.error?.message ||
         `Gemini API (${modelName}) returned status ${geminiRes.status}`;
 
-      // If 404 or model not found/supported, try the next fallback model
-      const isModelError =
-        geminiRes.status === 404 ||
-        geminiRes.status === 400 ||
-        lastErrorMsg.toLowerCase().includes("not found") ||
-        lastErrorMsg.toLowerCase().includes("not supported");
+      if (i === 0 || !primaryErrorMsg) {
+        primaryErrorMsg = currentErrorMsg;
+      }
 
-      if (!isModelError) {
+      // Only try the next model if the current model returned a 404 or model-not-found error
+      const lowerMsg = currentErrorMsg.toLowerCase();
+      const isModelNotFound =
+        geminiRes.status === 404 ||
+        lowerMsg.includes("not found") ||
+        lowerMsg.includes("no longer available") ||
+        lowerMsg.includes("is not supported for generatecontent");
+
+      if (!isModelNotFound) {
+        // Non-model error (e.g. invalid key, quota, payload); keep primary error unless a non-404 error occurred on the active model
+        primaryErrorMsg = currentErrorMsg;
         break;
       }
     }
 
     if (!geminiJson) {
       return NextResponse.json(
-        { ok: false, error: lastErrorMsg },
+        {
+          ok: false,
+          error: primaryErrorMsg || "Gemini API request failed.",
+        },
         { status: 502 }
       );
     }
