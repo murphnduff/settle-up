@@ -125,6 +125,7 @@ export default function EditExpenseModal({
 }: EditExpenseModalProps) {
   const supabase = createClient();
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const receiptCameraInputRef = useRef<HTMLInputElement>(null);
   const receiptFileInputRef = useRef<HTMLInputElement>(null);
   const receiptPdfInputRef = useRef<HTMLInputElement>(null);
 
@@ -197,6 +198,19 @@ export default function EditExpenseModal({
   const [receiptStatusMessage, setReceiptStatusMessage] = useState<
     string | null
   >(null);
+  const [receiptScanError, setReceiptScanError] = useState<string | null>(null);
+  const [scannedCategories, setScannedCategories] = useState<string[]>([]);
+
+  // Combine default preset categories with group-wide categories and current category
+  const categoryOptions = useMemo(
+    () =>
+      buildGroupCategories([], [
+        ...existingCategories,
+        category,
+        ...scannedCategories,
+      ]),
+    [existingCategories, category, scannedCategories]
+  );
 
   const handleReceiptFileChange = async (
     e: React.ChangeEvent<HTMLInputElement>
@@ -206,6 +220,7 @@ export default function EditExpenseModal({
     if (!file) return;
 
     setError(null);
+    setReceiptScanError(null);
     setReceiptFileName(file.name);
     setIsScanningReceipt(true);
     setIsUploadingReceipt(true);
@@ -251,8 +266,21 @@ export default function EditExpenseModal({
           setDate(parsed.date);
         }
         if (parsed.category) {
+          const cleanScannedCat = parsed.category.trim();
+          const existingMatch = categoryOptions.find(
+            (c) => c.toLowerCase() === cleanScannedCat.toLowerCase()
+          );
+          const resolvedCat = existingMatch || cleanScannedCat;
+          if (!existingMatch && resolvedCat) {
+            setScannedCategories((prev) =>
+              prev.some((c) => c.toLowerCase() === resolvedCat.toLowerCase())
+                ? prev
+                : [...prev, resolvedCat]
+            );
+          }
           setIsCustomCategory(false);
-          setCategory(parsed.category);
+          setCustomCategoryInput("");
+          setCategory(resolvedCat);
         }
         if (
           typeof parsed.amount === "number" &&
@@ -263,12 +291,17 @@ export default function EditExpenseModal({
         }
         setReceiptStatusMessage("Receipt scanned & fields updated!");
       } else {
-        setReceiptStatusMessage("Receipt attached (AI auto-fill unavailable).");
+        const reason =
+          parseOutcome.reason instanceof Error
+            ? parseOutcome.reason.message
+            : "Unknown OCR error";
+        setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
+        setReceiptStatusMessage("Receipt attached.");
       }
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Failed to process receipt file."
-      );
+      const reason =
+        err instanceof Error ? err.message : "Failed to process receipt file.";
+      setReceiptScanError(`Could not auto-scan receipt: ${reason}`);
       setReceiptStatusMessage(null);
     } finally {
       setIsScanningReceipt(false);
@@ -281,13 +314,8 @@ export default function EditExpenseModal({
     setReceiptPreviewUrl(null);
     setReceiptFileName("");
     setReceiptStatusMessage(null);
+    setReceiptScanError(null);
   };
-
-  // Combine default preset categories with group-wide categories and current category
-  const categoryOptions = useMemo(
-    () => buildGroupCategories([], [...existingCategories, category]),
-    [existingCategories, category]
-  );
 
   // Sync native dialog
   useEffect(() => {
@@ -673,6 +701,14 @@ export default function EditExpenseModal({
         {type === "expense" && (
           <div className="p-3.5 rounded-xl border border-blue-200/80 bg-blue-50/40 space-y-2.5">
             <input
+              ref={receiptCameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              onChange={handleReceiptFileChange}
+              className="hidden"
+            />
+            <input
               ref={receiptFileInputRef}
               type="file"
               accept="image/*"
@@ -682,7 +718,7 @@ export default function EditExpenseModal({
             <input
               ref={receiptPdfInputRef}
               type="file"
-              accept="application/pdf,image/*"
+              accept="application/pdf"
               onChange={handleReceiptFileChange}
               className="hidden"
             />
@@ -694,126 +730,151 @@ export default function EditExpenseModal({
                     Receipt Attachment & AI Auto-Fill
                   </span>
                   <span className="text-[11px] text-slate-500">
-                    Pick a photo, snap with camera, or attach a PDF to auto-extract details
+                    Take a photo, pick from your gallery, or attach a PDF to auto-extract details
                   </span>
                 </div>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
                   disabled={isScanningReceipt || isUploadingReceipt}
-                  onClick={() => receiptFileInputRef.current?.click()}
+                  onClick={() => receiptCameraInputRef.current?.click()}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
                 >
                   {isScanningReceipt || isUploadingReceipt ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>Scanning receipt...</span>
+                      <span>Scanning...</span>
                     </>
                   ) : (
                     <>
-                      <Camera className="w-3.5 h-3.5" />
-                      <span>
-                        {receiptPreviewUrl || receiptUrl
-                          ? "Replace Photo"
-                          : "Scan / Attach Photo"}
-                      </span>
+                      <span>📷</span>
+                      <span>Take Photo</span>
                     </>
                   )}
                 </button>
                 <button
                   type="button"
                   disabled={isScanningReceipt || isUploadingReceipt}
-                  onClick={() => receiptPdfInputRef.current?.click()}
-                  title="Attach a PDF or file receipt"
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
+                  onClick={() => receiptFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
                 >
-                  <FileText className="w-3.5 h-3.5" />
-                  <span>PDF / File</span>
+                  <span>🖼️</span>
+                  <span>Photo Library</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isScanningReceipt || isUploadingReceipt}
+                  onClick={() => receiptPdfInputRef.current?.click()}
+                  title="Attach a PDF receipt"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-slate-700 border border-slate-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
+                >
+                  <span>📄</span>
+                  <span>PDF</span>
                 </button>
               </div>
             </div>
 
-            {(receiptPreviewUrl || receiptUrl || isScanningReceipt) && (
-              <div className="flex items-center justify-between gap-3 pt-2 border-t border-blue-100">
-                <div className="flex items-center gap-3 min-w-0">
-                  {receiptPreviewUrl &&
-                  !isPdfReceiptUrl(receiptUrl || receiptPreviewUrl) &&
-                  !receiptFileName.toLowerCase().endsWith(".pdf") ? (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const targetUrl = receiptUrl || receiptPreviewUrl;
-                        if (targetUrl && onViewReceipt) {
-                          onViewReceipt(targetUrl, description || "Receipt");
-                        } else if (targetUrl) {
-                          window.open(targetUrl, "_blank", "noopener,noreferrer");
-                        }
-                      }}
-                      title="View full receipt"
-                      className="relative w-12 h-12 rounded-lg overflow-hidden border border-slate-200 bg-white shrink-0 group cursor-pointer"
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={receiptPreviewUrl}
-                        alt="Receipt preview"
-                        className="w-full h-full object-cover group-hover:opacity-90 transition"
-                      />
-                    </button>
-                  ) : (
-                    <div className="w-12 h-12 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-blue-600 shrink-0">
-                      <FileText className="w-5 h-5" />
-                    </div>
-                  )}
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold text-slate-800 truncate">
-                      {receiptFileName || "Attached Receipt"}
-                    </div>
-                    {isScanningReceipt || isUploadingReceipt ? (
-                      <div className="text-[11px] text-blue-600 font-medium flex items-center gap-1 mt-0.5">
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        <span>Scanning receipt...</span>
-                      </div>
-                    ) : receiptStatusMessage ? (
-                      <div className="text-[11px] text-emerald-700 font-medium mt-0.5">
-                        {receiptStatusMessage}
-                      </div>
+            {(receiptPreviewUrl ||
+              receiptUrl ||
+              isScanningReceipt ||
+              receiptScanError) && (
+              <div className="space-y-2 pt-2 border-t border-blue-100">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    {receiptPreviewUrl &&
+                    !isPdfReceiptUrl(receiptUrl || receiptPreviewUrl) &&
+                    !receiptFileName.toLowerCase().endsWith(".pdf") ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const targetUrl = receiptUrl || receiptPreviewUrl;
+                          if (targetUrl && onViewReceipt) {
+                            onViewReceipt(targetUrl, description || "Receipt");
+                          } else if (targetUrl) {
+                            window.open(
+                              targetUrl,
+                              "_blank",
+                              "noopener,noreferrer"
+                            );
+                          }
+                        }}
+                        title="View full receipt"
+                        className="relative w-12 h-12 rounded-lg overflow-hidden border border-slate-200 bg-white shrink-0 group cursor-pointer"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={receiptPreviewUrl}
+                          alt="Receipt preview"
+                          className="w-full h-full object-cover group-hover:opacity-90 transition"
+                        />
+                      </button>
                     ) : (
-                      <div className="text-[11px] text-slate-500 mt-0.5">
-                        Saved with this expense
+                      <div className="w-12 h-12 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-blue-600 shrink-0">
+                        <FileText className="w-5 h-5" />
                       </div>
                     )}
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold text-slate-800 truncate">
+                        {receiptFileName || "Attached Receipt"}
+                      </div>
+                      {isScanningReceipt || isUploadingReceipt ? (
+                        <div className="text-[11px] text-blue-600 font-medium flex items-center gap-1 mt-0.5">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          <span>Scanning receipt...</span>
+                        </div>
+                      ) : receiptStatusMessage ? (
+                        <div className="text-[11px] text-emerald-700 font-medium mt-0.5">
+                          {receiptStatusMessage}
+                        </div>
+                      ) : (
+                        <div className="text-[11px] text-slate-500 mt-0.5">
+                          Saved with this expense
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {(receiptUrl || receiptPreviewUrl) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const targetUrl = receiptUrl || receiptPreviewUrl;
+                          if (targetUrl && onViewReceipt) {
+                            onViewReceipt(targetUrl, description || "Receipt");
+                          } else if (targetUrl) {
+                            window.open(
+                              targetUrl,
+                              "_blank",
+                              "noopener,noreferrer"
+                            );
+                          }
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-blue-700 bg-white hover:bg-blue-50 border border-blue-200 transition cursor-pointer"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        <span>View</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleRemoveReceipt}
+                      title="Remove receipt"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-red-600 bg-white hover:bg-red-50 border border-red-200 transition cursor-pointer"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Remove</span>
+                    </button>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1.5 shrink-0">
-                  {(receiptUrl || receiptPreviewUrl) && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const targetUrl = receiptUrl || receiptPreviewUrl;
-                        if (targetUrl && onViewReceipt) {
-                          onViewReceipt(targetUrl, description || "Receipt");
-                        } else if (targetUrl) {
-                          window.open(targetUrl, "_blank", "noopener,noreferrer");
-                        }
-                      }}
-                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-blue-700 bg-white hover:bg-blue-50 border border-blue-200 transition cursor-pointer"
-                    >
-                      <ExternalLink className="w-3 h-3" />
-                      <span>View</span>
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={handleRemoveReceipt}
-                    title="Remove receipt"
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-red-600 bg-white hover:bg-red-50 border border-red-200 transition cursor-pointer"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                    <span>Remove</span>
-                  </button>
-                </div>
+                {receiptScanError && (
+                  <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 flex items-start gap-2">
+                    <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                    <span>{receiptScanError}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>

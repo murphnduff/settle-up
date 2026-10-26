@@ -119,18 +119,19 @@ function loadImageElement(file: File): Promise<HTMLImageElement> {
 }
 
 /**
- * Compresses image files (image/jpeg, image/png, image/webp, etc.) using an HTML5 <canvas>
- * down to maxDimension (1600px) at JPEG quality 0.82 so mobile photos stay under ~400KB.
+ * Compresses image files (image/jpeg, image/png, image/webp, HEIC, Ultra-HDR JPEG, etc.)
+ * using an HTML5 <canvas> down to maxDimension (1600px) at JPEG quality 0.80 so mobile
+ * photos stay under ~400KB. Falls back to raw file base64 if canvas decoding fails.
  * Passes PDFs through as-is.
  */
 export async function compressReceiptFile(
   file: File,
   maxDimension = 1600,
-  quality = 0.82
+  quality = 0.8
 ): Promise<CompressedReceiptResult> {
-  const lowerName = file.name.toLowerCase();
+  const fileName = file.name || "";
   const isPdf =
-    file.type === "application/pdf" || lowerName.endsWith(".pdf");
+    file.type === "application/pdf" || /\.pdf$/i.test(fileName);
 
   if (isPdf) {
     const base64 = await readBlobAsBase64(file);
@@ -145,59 +146,88 @@ export async function compressReceiptFile(
     };
   }
 
-  // Handle image files via HTML5 <canvas>
-  const img = await loadImageElement(file);
-  const origWidth = img.naturalWidth || img.width || 1;
-  const origHeight = img.naturalHeight || img.height || 1;
+  const isLikelyImage =
+    file.type.startsWith("image/") ||
+    /\.(jpe?g|png|webp|heic|heif)$/i.test(fileName) ||
+    !file.type;
 
-  let targetWidth = origWidth;
-  let targetHeight = origHeight;
+  if (isLikelyImage) {
+    try {
+      const img = await loadImageElement(file);
+      const origWidth = img.naturalWidth || img.width || 1;
+      const origHeight = img.naturalHeight || img.height || 1;
 
-  const largestSide = Math.max(origWidth, origHeight);
-  if (largestSide > maxDimension) {
-    const scale = maxDimension / largestSide;
-    targetWidth = Math.max(1, Math.round(origWidth * scale));
-    targetHeight = Math.max(1, Math.round(origHeight * scale));
+      let targetWidth = origWidth;
+      let targetHeight = origHeight;
+
+      const largestSide = Math.max(origWidth, origHeight);
+      if (largestSide > maxDimension) {
+        const scale = maxDimension / largestSide;
+        targetWidth = Math.max(1, Math.round(origWidth * scale));
+        targetHeight = Math.max(1, Math.round(origHeight * scale));
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        throw new Error("Browser 2D canvas context is unavailable.");
+      }
+
+      // Fill white background so transparent PNGs/WebPs render cleanly as JPEG
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, targetWidth, targetHeight);
+      ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+      const dataUrl = canvas.toDataURL("image/jpeg", quality);
+      const cleanBase64 = dataUrl.replace(/^data:[^;]+;base64,/i, "");
+
+      // Convert dataUrl to Blob (faster and avoids a second JPEG encode pass)
+      const byteString = atob(cleanBase64);
+      const byteNumbers = new Uint8Array(byteString.length);
+      for (let i = 0; i < byteString.length; i++) {
+        byteNumbers[i] = byteString.charCodeAt(i);
+      }
+      const blob = new Blob([byteNumbers], { type: "image/jpeg" });
+
+      return {
+        blob,
+        base64: cleanBase64,
+        mimeType: "image/jpeg",
+        extension: "jpg",
+        previewUrl: dataUrl,
+        isPdf: false,
+      };
+    } catch {
+      // Fallback: if <canvas> decoding fails (e.g. raw HEIC or unusual container), read raw file base64
+      const rawBase64 = await readBlobAsBase64(file);
+      const cleanBase64 = rawBase64.replace(/^data:[^;]+;base64,/i, "");
+      const fallbackMime =
+        file.type && file.type.startsWith("image/") ? file.type : "image/jpeg";
+      const extMatch = fileName.match(/\.([a-z0-9]+)$/i);
+      const fallbackExt = extMatch ? extMatch[1].toLowerCase() : "jpg";
+      return {
+        blob: file,
+        base64: cleanBase64,
+        mimeType: fallbackMime,
+        extension: fallbackExt,
+        previewUrl: URL.createObjectURL(file),
+        isPdf: false,
+      };
+    }
   }
 
-  const canvas = document.createElement("canvas");
-  canvas.width = targetWidth;
-  canvas.height = targetHeight;
-
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    throw new Error("Browser 2D canvas context is unavailable.");
-  }
-
-  // Fill white background so transparent PNGs/WebPs render cleanly as JPEG
-  ctx.fillStyle = "#FFFFFF";
-  ctx.fillRect(0, 0, targetWidth, targetHeight);
-  ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
-
-  const dataUrl = canvas.toDataURL("image/jpeg", quality);
-  const commaIdx = dataUrl.indexOf(",");
-  const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
-
-  const blob: Blob = await new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (b) => {
-        if (b) {
-          resolve(b);
-        } else {
-          reject(new Error("Failed to compress image to JPEG blob."));
-        }
-      },
-      "image/jpeg",
-      quality
-    );
-  });
-
+  // Generic fallback for any other file
+  const rawBase64 = await readBlobAsBase64(file);
+  const cleanBase64 = rawBase64.replace(/^data:[^;]+;base64,/i, "");
   return {
-    blob,
-    base64,
-    mimeType: "image/jpeg",
+    blob: file,
+    base64: cleanBase64,
+    mimeType: file.type || "image/jpeg",
     extension: "jpg",
-    previewUrl: dataUrl,
+    previewUrl: URL.createObjectURL(file),
     isPdf: false,
   };
 }
@@ -258,7 +288,7 @@ export async function parseReceiptWithAi(
   });
 
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
+  if (!response.ok || payload?.ok === false) {
     throw new Error(
       typeof payload?.error === "string"
         ? payload.error

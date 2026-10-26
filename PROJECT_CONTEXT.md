@@ -98,12 +98,15 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Lossless CSV Mapping:** Maps `expenses.category` directly to/from the 3rd CSV column (`Category`).
 
 ### 4.6 Receipt Attachments & AI Receipt Extraction (`src/lib/receipts.ts` & `/api/parse-receipt`)
+- **Explicit Mobile & Desktop Capture Inputs:**
+  - Provides three side-by-side buttons in Add/Edit Transaction forms: **📷 Take Photo** (`accept="image/*" capture="environment"`), **🖼️ Photo Library** (`accept="image/*"` without `capture` so Android/iOS open the native photo gallery), and **📄 PDF** (`accept="application/pdf"`).
 - **Client-Side Compression & Storage (`src/lib/receipts.ts`):**
-  - Resizes receipt images (`image/jpeg`, `image/png`, `image/webp`) larger than `1600px` down to `1600px` max dimension at JPEG quality `0.82` via HTML5 `<canvas>` (passing PDFs through as-is).
+  - Resizes receipt images (`image/jpeg`, `image/png`, `image/webp`, HEIC/Ultra-HDR JPEG) larger than `1600px` down to `1600px` max dimension at JPEG quality `0.80` via HTML5 `<canvas>` (with raw base64 fallback if canvas decoding fails, and passing PDFs through as-is).
   - Uploads receipts to the Supabase Storage `'receipts'` bucket at `${groupId}/${crypto.randomUUID()}.${ext}` and persists the public URL in `expenses.receipt_url`.
 - **AI Receipt Extraction Route (`src/app/api/parse-receipt/route.ts`):**
-  - `POST /api/parse-receipt` calls the Gemini REST API (`gemini-3.8-flash` with `GEMINI_API_KEY` and `responseMimeType: "application/json"`) to extract `{ description, amount, currency, date, category }`.
-  - Pre-fills the Add/Edit Transaction form in parallel with the storage upload (preserving auto-summed `Amount` if the user is in `'$ Exact'` split mode).
+  - `POST /api/parse-receipt` calls the Gemini REST API (`gemini-2.5-flash` with automatic fallback to `gemini-2.0-flash`, `GEMINI_API_KEY`, and `responseMimeType: "application/json"`) to extract `{ description, amount, currency, date, category }`.
+  - Prefers preset categories (`General`, `Dining out`, `Groceries`, `Drinks`, `Lodging`, `Flights`, `Car Rental`, `Gas`, `Activities`) or returns a concise 1–2 word custom category (e.g. `Parking`, `Tolls`, `Golf`, `Pharmacy`), which is automatically added to the group's category pills and selected.
+  - Pre-fills the Add/Edit Transaction form in parallel with the storage upload (preserving auto-summed `Amount` if the user is in `'$ Exact'` split mode) and surfaces diagnostic error banners if OCR fails.
 - **Ledger Receipt Badge & Lightbox Modal:**
   - Transactions with a non-null `receipt_url` display a clickable `Receipt` badge in the ledger that opens a `<dialog closedby="any">` Lightbox Modal for full-size images or embedded/linked PDFs.
 
@@ -132,5 +135,9 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 
 ### Phase 1.4: Receipts & AI Vision (Completed ✅)
 7. ✅ **Receipt Attachments & AI Receipt Extraction (OCR):**
-   - Client-side HTML5 `<canvas>` compression (`1600px`, `0.82` JPEG quality) + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
-   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`gemini-3.8-flash`) with parallel upload + auto-fill in Add/Edit Transaction forms, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
+   - Client-side HTML5 `<canvas>` compression (`1600px`, `0.80` JPEG quality) + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
+   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`gemini-2.5-flash` with fallback to `gemini-2.0-flash`) with parallel upload + auto-fill in Add/Edit Transaction forms, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
+
+### Future Enhancements
+8. **PWA Web Share Target Integration:**
+   - Allow sharing a receipt photo directly from the Android/iOS system gallery or camera app into the installed Settle Up Chrome PWA (`manifest.json` `share_target`) to initiate a new transaction with the shared receipt pre-attached.

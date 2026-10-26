@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { EXPENSE_CATEGORIES } from "@/lib/reconciliation";
 import { normalizeParsedReceipt } from "@/lib/receipts";
 
-const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+const CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
 
 const RECEIPT_EXTRACTION_PROMPT = `You are an expert financial receipt parser for a group expense-splitting app.
 Analyze the attached receipt image or PDF and extract the transaction details into strict JSON with the following exact keys:
@@ -11,14 +11,14 @@ Analyze the attached receipt image or PDF and extract the transaction details in
   "amount": 42.50,
   "currency": "USD" | "EUR",
   "date": "YYYY-MM-DD",
-  "category": "One of: General, Dining out, Groceries, Drinks, Lodging, Flights, Car Rental, Gas, Activities"
+  "category": "Category name"
 }
 
 Rules:
 1. "amount": Use the final total charged (including tax and tip if shown), as a positive number with up to 2 decimal places.
 2. "currency": Return "EUR" if the receipt uses € or EUR; otherwise return "USD".
 3. "date": Return the transaction date in strict YYYY-MM-DD format. If no year is printed, infer the current year. If no date is visible, omit or return an empty string.
-4. "category": Choose the best matching preset from [${EXPENSE_CATEGORIES.join(", ")}].
+4. "category": Prefer one of our standard categories [${EXPENSE_CATEGORIES.join(", ")}], OR if the receipt clearly belongs to another specific category (e.g. "Parking", "Tolls", "Golf", "Pharmacy"), return that concise 1-2 word category name.
 5. Return ONLY valid JSON.`;
 
 export async function POST(request: NextRequest) {
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
     if (!apiKey) {
       return NextResponse.json(
-        { error: "Server is missing GEMINI_API_KEY configuration." },
+        { ok: false, error: "Server is missing GEMINI_API_KEY configuration." },
         { status: 500 }
       );
     }
@@ -41,20 +41,21 @@ export async function POST(request: NextRequest) {
 
     if (!rawBase64) {
       return NextResponse.json(
-        { error: "Missing imageBase64 payload." },
+        { ok: false, error: "Missing imageBase64 payload." },
         { status: 400 }
       );
     }
 
     // Strip optional data URI prefix if passed
-    const commaIdx = rawBase64.indexOf(",");
-    const cleanBase64 =
-      rawBase64.startsWith("data:") && commaIdx >= 0
-        ? rawBase64.slice(commaIdx + 1)
-        : rawBase64;
+    const cleanBase64 = rawBase64.replace(/^data:[^;]+;base64,/i, "");
 
-    const configuredModel =
-      process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+    const envModel = process.env.GEMINI_MODEL?.trim();
+    const modelsToTry = Array.from(
+      new Set([
+        ...(envModel ? [envModel] : []),
+        ...CANDIDATE_MODELS,
+      ])
+    );
 
     const requestBody = {
       contents: [
@@ -78,27 +79,52 @@ export async function POST(request: NextRequest) {
       },
     };
 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      configuredModel
-    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let geminiJson: any = null;
+    let lastErrorMsg = "Gemini API request failed.";
 
-    const geminiRes = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(requestBody),
-    });
+    for (const modelName of modelsToTry) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        modelName
+      )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-    if (!geminiRes.ok) {
+      const geminiRes = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (geminiRes.ok) {
+        geminiJson = await geminiRes.json();
+        break;
+      }
+
       const errData = await geminiRes.json().catch(() => ({}));
-      const errMsg =
+      lastErrorMsg =
         errData?.error?.message ||
-        `Gemini API request failed with status ${geminiRes.status}`;
-      return NextResponse.json({ error: errMsg }, { status: 502 });
+        `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+
+      // If 404 or model not found/supported, try the next fallback model
+      const isModelError =
+        geminiRes.status === 404 ||
+        geminiRes.status === 400 ||
+        lastErrorMsg.toLowerCase().includes("not found") ||
+        lastErrorMsg.toLowerCase().includes("not supported");
+
+      if (!isModelError) {
+        break;
+      }
     }
 
-    const geminiJson = await geminiRes.json();
+    if (!geminiJson) {
+      return NextResponse.json(
+        { ok: false, error: lastErrorMsg },
+        { status: 502 }
+      );
+    }
+
     const rawText: string =
       geminiJson?.candidates?.[0]?.content?.parts
         ?.map((p: { text?: string }) => p.text || "")
@@ -107,33 +133,48 @@ export async function POST(request: NextRequest) {
 
     if (!rawText) {
       return NextResponse.json(
-        { error: "Gemini returned an empty response for this receipt." },
+        { ok: false, error: "Gemini returned an empty response for this receipt." },
         { status: 422 }
       );
     }
 
-    // Strip markdown code fences if present
+    // Strip any accidental markdown code fences (```json ... ```) before JSON.parse
     const cleanedJsonText = rawText
       .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/, "")
+      .replace(/\s*```$/i, "")
       .trim();
 
     let parsedObj: unknown;
     try {
       parsedObj = JSON.parse(cleanedJsonText);
     } catch {
-      return NextResponse.json(
-        { error: "Failed to parse JSON from Gemini response." },
-        { status: 422 }
-      );
+      // Attempt to extract first {...} JSON object if extra text surrounded it
+      const firstBrace = cleanedJsonText.indexOf("{");
+      const lastBrace = cleanedJsonText.lastIndexOf("}");
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        try {
+          parsedObj = JSON.parse(
+            cleanedJsonText.slice(firstBrace, lastBrace + 1)
+          );
+        } catch {
+          return NextResponse.json(
+            { ok: false, error: "Failed to parse JSON from Gemini response." },
+            { status: 422 }
+          );
+        }
+      } else {
+        return NextResponse.json(
+          { ok: false, error: "Failed to parse JSON from Gemini response." },
+          { status: 422 }
+        );
+      }
     }
 
     const normalized = normalizeParsedReceipt(parsedObj);
-    return NextResponse.json(normalized, { status: 200 });
+    return NextResponse.json({ ok: true, ...normalized }, { status: 200 });
   } catch (err: unknown) {
     const message =
       err instanceof Error ? err.message : "Unexpected error parsing receipt.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ ok: false, error: message }, { status: 500 });
   }
 }
-
