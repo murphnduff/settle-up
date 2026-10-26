@@ -6,6 +6,17 @@
  * Currencies (USD vs EUR) are strictly isolated.
  */
 
+export const EXPENSE_CATEGORIES = [
+  'General',
+  'Dining out',
+  'Groceries',
+  'Liquor',
+  'Lodging',
+  'Transport',
+  'Activities',
+  'Insurance',
+] as const;
+
 export interface MemberRecord {
   id: string;
   name: string;
@@ -25,6 +36,7 @@ export interface ExpenseRecord {
   amountCents?: number;
   currency: string;
   type: 'expense' | 'payment';
+  category?: string;
   splits: SplitRecord[];
   description?: string;
   /** Backwards compatibility aliases */
@@ -55,6 +67,13 @@ export interface MemberSummaryRecord {
   shareCents: number;
   /** Current net balance in cents including both expenses and direct payments */
   netBalanceCents: number;
+}
+
+export interface CategorySpendRecord {
+  category: string;
+  amountCents: number;
+  amountFormatted: string;
+  percentage: number;
 }
 
 /**
@@ -301,6 +320,57 @@ export function calculateMemberBreakdown(
     shareCents: shareMap.get(m.id) || 0,
     netBalanceCents: netMap.get(m.id) || 0,
   }));
+}
+
+/**
+ * Aggregates spending by category for a specific currency ('USD' / '$' or 'EUR' / '€').
+ * Strictly includes only `type === 'expense'`, excluding settlement transfers (`type === 'payment'`).
+ * Sorted descending by `amountCents` (highest-to-lowest spend).
+ */
+export function calculateCategorySpend(
+  expenses: ExpenseRecord[],
+  targetCurrency: string = 'USD'
+): CategorySpendRecord[] {
+  const normalizeCurrencyFamily = (rawCur?: string): string => {
+    const c = (rawCur || 'USD').trim();
+    if (c === '$' || c.toUpperCase() === 'USD') return 'USD';
+    if (c === '€' || c.toUpperCase() === 'EUR') return 'EUR';
+    return c;
+  };
+
+  const targetFamily = normalizeCurrencyFamily(targetCurrency);
+  const categoryTotals = new Map<string, number>();
+  let totalSpendCents = 0;
+
+  for (const exp of expenses) {
+    if (exp.type !== 'expense') continue;
+    if (normalizeCurrencyFamily(exp.currency) !== targetFamily) continue;
+
+    const cents =
+      typeof exp.amountCents === 'number'
+        ? Math.round(exp.amountCents)
+        : Math.round((exp.amount || 0) * 100);
+    if (cents <= 0) continue;
+
+    const cat = (exp.category || '').trim() || 'General';
+    categoryTotals.set(cat, (categoryTotals.get(cat) || 0) + cents);
+    totalSpendCents += cents;
+  }
+
+  return Array.from(categoryTotals.entries())
+    .map(([category, amountCents]) => ({
+      category,
+      amountCents,
+      amountFormatted: (amountCents / 100).toFixed(2),
+      percentage:
+        totalSpendCents > 0 ? (amountCents / totalSpendCents) * 100 : 0,
+    }))
+    .sort((a, b) => {
+      if (b.amountCents !== a.amountCents) {
+        return b.amountCents - a.amountCents;
+      }
+      return a.category.localeCompare(b.category);
+    });
 }
 
 /**

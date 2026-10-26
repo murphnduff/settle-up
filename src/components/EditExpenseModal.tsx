@@ -6,6 +6,7 @@ import {
   splitAmountEqually,
   splitAmountByPercentage,
   validateExactSplits,
+  EXPENSE_CATEGORIES,
 } from "@/lib/reconciliation";
 import { GroupMember } from "@/components/MemberInviteModal";
 import { X, Sparkles, AlertCircle, Edit3, CheckCircle2 } from "lucide-react";
@@ -49,6 +50,7 @@ export interface ExpenseItem {
   amountCents: number;
   currency: string;
   type: "expense" | "payment";
+  category?: string;
   date: string;
   createdAt?: string;
   createdBy?: string;
@@ -108,6 +110,11 @@ export default function EditExpenseModal({
   const [type, setType] = useState<"expense" | "payment">(
     expense?.type === "payment" ? "payment" : "expense"
   );
+  const [category, setCategory] = useState<string>(() => {
+    if (!expense || expense.type === "payment") return "General";
+    const trimmed = (expense.category || "").trim();
+    return trimmed && trimmed.toLowerCase() !== "payment" ? trimmed : "General";
+  });
   const [payerId, setPayerId] = useState(
     expense?.paidByMemberId || expense?.payerId || ""
   );
@@ -148,6 +155,20 @@ export default function EditExpenseModal({
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Include custom imported category if it isn't in standard EXPENSE_CATEGORIES
+  const categoryOptions = useMemo(() => {
+    const base: string[] = [...EXPENSE_CATEGORIES];
+    const current = (category || "").trim();
+    if (
+      current &&
+      current.toLowerCase() !== "payment" &&
+      !base.some((c) => c.toLowerCase() === current.toLowerCase())
+    ) {
+      return [current, ...base];
+    }
+    return base;
+  }, [category]);
 
   // Sync native dialog
   useEffect(() => {
@@ -322,12 +343,18 @@ export default function EditExpenseModal({
 
     try {
       // 1. Update the expense record
+      const resolvedCategory =
+        type === "payment"
+          ? "Payment"
+          : (category || "").trim() || "General";
+
       const updatePayload: Record<string, unknown> = {
         description:
           description.trim() || (type === "payment" ? "Payment" : "Expense"),
         amount_cents: totalCents,
         currency,
         type,
+        category: resolvedCategory,
         paid_by_member_id: payerId,
         date: date || getTodayLocalDate(),
       };
@@ -617,11 +644,15 @@ export default function EditExpenseModal({
             </label>
             <input
               type="text"
-              placeholder="e.g. Dinner, Fuel, Groceries, Hotel"
+              placeholder={
+                type === "payment"
+                  ? "e.g. Settlement payment (optional)"
+                  : "e.g. Dinner, Fuel, Groceries, Hotel"
+              }
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-              required
+              required={type === "expense"}
             />
           </div>
 
@@ -638,6 +669,34 @@ export default function EditExpenseModal({
             />
           </div>
         </div>
+
+        {/* Category Selector (Strictly for Group Expenses; payments automatically use 'Payment') */}
+        {type === "expense" && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-600 block">
+              Category
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {categoryOptions.map((cat) => {
+                const isSelected = category === cat;
+                return (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setCategory(cat)}
+                    className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
+                      isSelected
+                        ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                        : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Split Mode & Participants selection */}
         <div className="space-y-3">

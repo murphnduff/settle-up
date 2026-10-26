@@ -10,6 +10,7 @@ import {
   calculateSettlements,
   calculateBalancesByCurrency,
   calculateMemberBreakdown,
+  calculateCategorySpend,
   canDeleteMember,
 } from './reconciliation.ts';
 import type {
@@ -645,6 +646,65 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     assert.strictEqual(fitzRow.paidCents, 0);
     assert.strictEqual(fitzRow.shareCents, 5000);
     assert.strictEqual(fitzRow.netBalanceCents, -2500);
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 13: Spending by Category Breakdown (Sorted Descending, Excludes Payments)
+  // --------------------------------------------------------------------------
+  it('Edge Case 13: calculateCategorySpend aggregates expenses by category, sorts descending, and excludes payments', () => {
+    const ledger: ExpenseRecord[] = [
+      {
+        id: 'exp-cat-1',
+        paidByMemberId: murph.id,
+        amountCents: 12000, // $120.00
+        currency: 'USD',
+        type: 'expense',
+        category: 'Lodging',
+        splits: [{ memberId: murph.id, splitAmountCents: 12000 }],
+      },
+      {
+        id: 'exp-cat-2',
+        paidByMemberId: kev.id,
+        amountCents: 5000, // $50.00
+        currency: '$',
+        type: 'expense',
+        category: 'Dining out',
+        splits: [{ memberId: kev.id, splitAmountCents: 5000 }],
+      },
+      {
+        id: 'exp-cat-3',
+        paidByMemberId: fitz.id,
+        amountCents: 3000, // $30.00
+        currency: 'USD',
+        type: 'expense',
+        category: 'Dining out',
+        splits: [{ memberId: fitz.id, splitAmountCents: 3000 }],
+      },
+      {
+        id: 'pay-cat-ignored',
+        paidByMemberId: kev.id,
+        amountCents: 50000, // $500.00 settlement transfer - MUST be excluded
+        currency: 'USD',
+        type: 'payment',
+        category: 'Payment',
+        splits: [{ memberId: murph.id, splitAmountCents: 50000 }],
+      },
+    ];
+
+    const breakdown = calculateCategorySpend(ledger, 'USD');
+    assert.strictEqual(breakdown.length, 2);
+
+    // 1st: Lodging ($120.00 = 60% of $200.00 total expenses)
+    assert.strictEqual(breakdown[0].category, 'Lodging');
+    assert.strictEqual(breakdown[0].amountCents, 12000);
+    assert.strictEqual(breakdown[0].amountFormatted, '120.00');
+    assert.strictEqual(breakdown[0].percentage, 60);
+
+    // 2nd: Dining out ($50.00 + $30.00 = $80.00 = 40% of $200.00 total expenses)
+    assert.strictEqual(breakdown[1].category, 'Dining out');
+    assert.strictEqual(breakdown[1].amountCents, 8000);
+    assert.strictEqual(breakdown[1].amountFormatted, '80.00');
+    assert.strictEqual(breakdown[1].percentage, 40);
   });
 });
 

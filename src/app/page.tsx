@@ -12,15 +12,18 @@ import { createClient } from "@/lib/supabase";
 import {
   calculateSettlements,
   calculateMemberBreakdown,
+  calculateCategorySpend,
   splitAmountEqually,
   splitAmountByPercentage,
   validateExactSplits,
   parseGroupCsv,
   generateGroupCsv,
   deriveGroupNameFromCsvFilename,
+  EXPENSE_CATEGORIES,
   ParsedGroupCsvResult,
   SettlementInstruction,
   MemberSummaryRecord,
+  CategorySpendRecord,
 } from "@/lib/reconciliation";
 import MemberInviteModal, {
   Group,
@@ -59,6 +62,7 @@ import {
   ChevronDown,
   ChevronRight,
   Lock,
+  Tag,
 } from "lucide-react";
 import type { User, SupabaseClient } from "@supabase/supabase-js";
 
@@ -96,6 +100,12 @@ function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
     const curr = e.currency === "EUR" || e.currency === "€" ? "€" : "$";
     const cleanDate =
       typeof e.date === "string" ? e.date.split("T")[0] : getTodayLocalDate();
+    const isPayment = e.type === "payment";
+    const resolvedCategory = isPayment
+      ? "Payment"
+      : typeof e.category === "string" && e.category.trim().length > 0
+        ? e.category.trim()
+        : "General";
     return {
       id: e.id,
       paidByMemberId: e.paid_by_member_id,
@@ -104,9 +114,8 @@ function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
       amount: amt,
       amountCents: amtCents,
       currency: curr,
-      type: (e.type === "payment" ? "payment" : "expense") as
-        | "expense"
-        | "payment",
+      type: (isPayment ? "payment" : "expense") as "expense" | "payment",
+      category: resolvedCategory,
       date: cleanDate,
       createdAt: typeof e.created_at === "string" ? e.created_at : "",
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -273,6 +282,7 @@ export function SettleUpDashboard({
     getTodayLocalDate()
   );
   const [type, setType] = useState<"expense" | "payment">("expense");
+  const [category, setCategory] = useState<string>("General");
   const [splitMode, setSplitMode] = useState<SplitMode>("equal");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [percentageValues, setPercentageValues] = useState<
@@ -716,6 +726,16 @@ export function SettleUpDashboard({
     [expenses]
   );
 
+  // Spend by Category Breakdown per currency (strictly type === 'expense', sorted descending)
+  const usdCategorySpend: CategorySpendRecord[] = useMemo(
+    () => calculateCategorySpend(expenses, "USD"),
+    [expenses]
+  );
+  const eurCategorySpend: CategorySpendRecord[] = useMemo(
+    () => calculateCategorySpend(expenses, "EUR"),
+    [expenses]
+  );
+
   // Live exact split calculation & auto-summed total for Add Transaction form
   const exactSummary = useMemo(() => {
     const centsRecord: Record<string, number> = {};
@@ -996,6 +1016,10 @@ export function SettleUpDashboard({
           group_id: targetGroup.id,
           paid_by_member_id: payerMemberId,
           description: txn.description,
+          category:
+            txn.type === "payment"
+              ? "Payment"
+              : (txn.category || "").trim() || "General",
           amount_cents: txn.amountCents,
           currency: txn.currencySymbol,
           type: txn.type,
@@ -1332,6 +1356,10 @@ export function SettleUpDashboard({
       description:
         description.trim() ||
         (type === "payment" ? "Direct Payment" : "Group Expense"),
+      category:
+        type === "payment"
+          ? "Payment"
+          : (category || "").trim() || "General",
       amount_cents: totalCents,
       currency,
       type,
@@ -1441,6 +1469,7 @@ export function SettleUpDashboard({
     // Refresh UI
     setDescription("");
     setAmount("");
+    setCategory("General");
     setPercentageValues({});
     setExactValues({});
     startTransition(() => {
@@ -2350,6 +2379,34 @@ export function SettleUpDashboard({
                   </div>
                 </div>
 
+                {/* Category Selector (Strictly for Group Expenses; payments automatically use 'Payment') */}
+                {type === "expense" && (
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-600 block">
+                      Category
+                    </label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {EXPENSE_CATEGORIES.map((cat) => {
+                        const isSelected = category === cat;
+                        return (
+                          <button
+                            key={cat}
+                            type="button"
+                            onClick={() => setCategory(cat)}
+                            className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
+                              isSelected
+                                ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
+                                : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                            }`}
+                          >
+                            {cat}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {/* Split Mode (Equal | % Percentage | $ Exact) & Participants */}
                 <div className="space-y-3">
                   <div className="flex items-center justify-between flex-wrap gap-2">
@@ -2756,8 +2813,15 @@ export function SettleUpDashboard({
                               )}
                             </div>
                             <div className="min-w-0">
-                              <div className="font-semibold text-slate-900 truncate">
-                                {exp.description}
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-semibold text-slate-900 truncate">
+                                  {exp.description}
+                                </span>
+                                {!isPayment && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200/80 shrink-0">
+                                    {exp.category || "General"}
+                                  </span>
+                                )}
                               </div>
                               <div className="text-xs text-slate-500 mt-0.5">
                                 Paid by{" "}
@@ -2916,6 +2980,103 @@ export function SettleUpDashboard({
               ))
             )}
           </div>
+
+          {/* Spend by Category Breakdown (Per Currency, Strictly Expenses) */}
+          {activeGroup && (
+            <div className="space-y-4 pt-4 border-t border-slate-200">
+              <div>
+                <h2 className="font-bold text-slate-900 text-base flex items-center gap-2">
+                  <Tag className="w-4 h-4 text-blue-600" />
+                  Spend by Category
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Group expenses aggregated by category (excludes settlement
+                  payments).
+                </p>
+              </div>
+
+              {/* USD ($) Category Spend */}
+              <div className="space-y-2.5">
+                {hasEurActivity && (
+                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-blue-600"></span>
+                    USD ($) Categories
+                  </div>
+                )}
+
+                {usdCategorySpend.length === 0 ? (
+                  <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                    No USD expenses recorded yet.
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {usdCategorySpend.map((c) => (
+                      <div key={c.category} className="space-y-1 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-800 truncate">
+                            {c.category}
+                          </span>
+                          <span className="text-slate-600 font-medium shrink-0">
+                            <strong className="text-slate-900">
+                              ${c.amountFormatted}
+                            </strong>{" "}
+                            <span className="text-[11px] text-slate-400">
+                              ({c.percentage.toFixed(1)}%)
+                            </span>
+                          </span>
+                        </div>
+                        <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-blue-600 rounded-full transition-all"
+                            style={{
+                              width: `${Math.min(100, Math.max(2, c.percentage))}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* EUR (€) Category Spend */}
+              {eurCategorySpend.length > 0 && (
+                <div className="space-y-2.5 pt-3 border-t border-slate-100">
+                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
+                    EUR (€) Categories
+                  </div>
+                  <div className="space-y-2.5">
+                    {eurCategorySpend.map((c) => (
+                      <div key={c.category} className="space-y-1 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-800 truncate">
+                            {c.category}
+                          </span>
+                          <span className="text-slate-600 font-medium shrink-0">
+                            <strong className="text-slate-900">
+                              €{c.amountFormatted}
+                            </strong>{" "}
+                            <span className="text-[11px] text-slate-400">
+                              ({c.percentage.toFixed(1)}%)
+                            </span>
+                          </span>
+                        </div>
+                        <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-indigo-600 rounded-full transition-all"
+                            style={{
+                              width: `${Math.min(100, Math.max(2, c.percentage))}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </aside>
       </div>
       )}

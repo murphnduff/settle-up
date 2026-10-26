@@ -29,7 +29,7 @@
 ### 2.2 Database Tables & Schema
 - **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `created_at` (TIMESTAMPTZ).
 - **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ). Unique constraint on `(group_id, lower(display_name))`.
-- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
+- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
 - **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
 
 ---
@@ -90,6 +90,12 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Super-Admin Toggle:** `Archive Group` / `Unarchive Group` button in the group header toolbar.
 - **Read-Only Lock:** When `activeGroup.is_archived === true`, displays an `"Archived — Read-Only"` badge and banner, hides the "Add Transaction" form, and disables editing/deleting transactions or members while keeping `Export CSV` and `Copy Group Link` active.
 
+### 4.5 Expense Categorization & Spend Breakdown (`calculateCategorySpend`)
+- **Preset Categories (`EXPENSE_CATEGORIES`):** `['General', 'Dining out', 'Groceries', 'Liquor', 'Lodging', 'Transport', 'Activities', 'Insurance']`.
+- **UI & Custom Category Preservation:** Group Expenses show a pill selector defaulting to `'General'` (and preserve any custom imported category string in `EditExpenseModal`). Direct Payments hide the selector and automatically store `'Payment'`.
+- **Spend by Category Breakdown:** Aggregates `amount_cents` grouped by `category` per currency strictly for `type === 'expense'` (excluding payments), sorted descending by spend with formatted totals, percentage of group spend, and progress bars.
+- **Lossless CSV Mapping:** Maps `expenses.category` directly to/from the 3rd CSV column (`Category`).
+
 ---
 
 ## 5. Active Backlog & Future Development Roadmap
@@ -105,11 +111,11 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 4. ✅ **Group Archiving ("Retire Group"):**
    - Collapsible `Archived (N)` sidebar section, Super-Admin `Archive Group` / `Unarchive Group` toggle, and full Read-Only lock (`Archived — Read-Only` badge/banner).
 
-### Phase 1.2: Expense Categorization (Next Up)
-5. **Categories & Category Breakdown:**
-   - Add `category` column to `expenses` (Dining, Groceries, Lodging, Transport, General) with UI pill selectors, category spend totals, and direct CSV column mapping.
+### Phase 1.2: Expense Categorization (Completed ✅)
+5. ✅ **Categories & Category Breakdown:**
+   - Added `category` column support on `expenses` (`General`, `Dining out`, `Groceries`, `Liquor`, `Lodging`, `Transport`, `Activities`, `Insurance`), UI pill selectors in Add/Edit forms, ledger badges, **Spend by Category** summary card (`calculateCategorySpend` tested in Edge Case 13), and lossless CSV `Category` column import/export.
 
-### Phase 1.3: Disaster Recovery & Snapshots
+### Phase 1.3: Disaster Recovery & Snapshots (Next Up)
 6. **Automated Daily Snapshots:**
    - Scheduled GitHub Action or cron task pulling daily table dumps into timestamped private archives.
 
