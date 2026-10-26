@@ -11,6 +11,7 @@ import {
 import { createClient } from "@/lib/supabase";
 import {
   calculateSettlements,
+  calculateMemberBreakdown,
   splitAmountEqually,
   splitAmountByPercentage,
   validateExactSplits,
@@ -19,6 +20,7 @@ import {
   deriveGroupNameFromCsvFilename,
   ParsedGroupCsvResult,
   SettlementInstruction,
+  MemberSummaryRecord,
 } from "@/lib/reconciliation";
 import MemberInviteModal, {
   Group,
@@ -52,6 +54,11 @@ import {
   Upload,
   AlertCircle,
   X,
+  Archive,
+  ArchiveRestore,
+  ChevronDown,
+  ChevronRight,
+  Lock,
 } from "lucide-react";
 import type { User, SupabaseClient } from "@supabase/supabase-js";
 
@@ -73,6 +80,7 @@ function normalizeGroup(row: any): Group {
     name,
     slug,
     created_by: row.created_by ?? null,
+    is_archived: Boolean(row?.is_archived),
     created_at: row.created_at,
   };
 }
@@ -247,6 +255,7 @@ export function SettleUpDashboard({
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
   const [copiedGroupLink, setCopiedGroupLink] = useState(false);
+  const [showArchivedGroups, setShowArchivedGroups] = useState(false);
   const [historyCurrencyFilter, setHistoryCurrencyFilter] = useState<
     "all" | "$" | "€"
   >("all");
@@ -292,6 +301,16 @@ export function SettleUpDashboard({
   const activeGroup = useMemo(
     () => groups.find((g) => g.id === activeGroupId) || null,
     [groups, activeGroupId]
+  );
+
+  // Separate active groups vs. archived groups for sidebar organization
+  const activeGroups = useMemo(
+    () => groups.filter((g) => !g.is_archived),
+    [groups]
+  );
+  const archivedGroups = useMemo(
+    () => groups.filter((g) => g.is_archived),
+    [groups]
   );
 
   // Auth listener
@@ -681,6 +700,20 @@ export function SettleUpDashboard({
     () =>
       settlements.filter((s) => s.currency === "€" || s.currency === "EUR"),
     [settlements]
+  );
+
+  // Cumulative Member Breakdown (Paid Out-of-Pocket vs. Accrued Share vs. Net Balance) per currency
+  const usdMemberBreakdown: MemberSummaryRecord[] = useMemo(
+    () => calculateMemberBreakdown(members, expenses, "USD"),
+    [members, expenses]
+  );
+  const eurMemberBreakdown: MemberSummaryRecord[] = useMemo(
+    () => calculateMemberBreakdown(members, expenses, "EUR"),
+    [members, expenses]
+  );
+  const hasEurActivity = useMemo(
+    () => expenses.some((e) => e.currency === "€" || e.currency === "EUR"),
+    [expenses]
   );
 
   // Live exact split calculation & auto-summed total for Add Transaction form
@@ -1179,6 +1212,37 @@ export function SettleUpDashboard({
     setIsInviteModalOpen(true);
   };
 
+  // Archive / Unarchive group toggle (Strictly Super-Admin only)
+  const handleToggleArchiveGroup = async (group: Group) => {
+    if (!isSuperAdmin) return;
+    const nextArchived = !group.is_archived;
+
+    const { error } = await supabase
+      .from("groups")
+      .update({ is_archived: nextArchived })
+      .eq("id", group.id);
+
+    if (error) {
+      alert("Error updating group archive status: " + error.message);
+      return;
+    }
+
+    setGroups((prev) =>
+      prev.map((g) =>
+        g.id === group.id ? { ...g, is_archived: nextArchived } : g
+      )
+    );
+    if (nextArchived) {
+      setShowArchivedGroups(true);
+    }
+    setNotification({
+      type: "success",
+      message: nextArchived
+        ? `Archived "${group.name}". The group is now locked in Read-Only mode.`
+        : `Unarchived "${group.name}". Editing and adding transactions are re-enabled.`,
+    });
+  };
+
   // Delete group (Strictly Super-Admin only)
   const handleDeleteGroup = async (groupId: string, groupName: string) => {
     if (!isSuperAdmin) return;
@@ -1215,6 +1279,7 @@ export function SettleUpDashboard({
   // Add transaction with penny-split precision (Supports Equal, % Percentage, and $ Exact splits)
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (activeGroup?.is_archived) return;
     const finalPayerId = payerId || effectivePayerId;
     if (!activeGroupId || totalCents <= 0 || !finalPayerId) {
       return;
@@ -1383,8 +1448,9 @@ export function SettleUpDashboard({
     });
   };
 
-  // Delete transaction (Group-wide permission)
+  // Delete transaction (Group-wide permission, disabled when group is archived)
   const handleDeleteExpense = async (expenseId: string, desc: string) => {
+    if (activeGroup?.is_archived) return;
     const confirmed = window.confirm(
       `Are you sure you want to delete "${desc || "this transaction"}"?`
     );
@@ -1523,54 +1589,116 @@ export function SettleUpDashboard({
       <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 md:grid-cols-4 gap-6">
         {/* Groups Sidebar */}
         <aside className="bg-white border border-slate-200 p-4 rounded-2xl h-fit flex flex-col gap-4">
-          <div>
-            <h2 className="font-semibold text-slate-800 mb-3 text-sm flex items-center justify-between">
-              <span>{isSuperAdmin ? "All Groups" : "Your Groups"}</span>
-              <span className="text-xs text-slate-400 font-normal">
-                {groups.length}
-              </span>
-            </h2>
-            <div className="space-y-1">
-              {groups.length === 0 ? (
-                <p className="text-xs text-slate-400 italic py-2">
-                  {isSuperAdmin
-                    ? "No groups yet. Create one below!"
-                    : "Open a shared group link (e.g. /SoCal_2026) to access your group."}
-                </p>
-              ) : (
-                groups.map((g) => (
-                  <div
-                    key={g.id}
-                    className={`group flex items-center justify-between px-3 py-2 text-sm rounded-xl transition ${
-                      activeGroupId === g.id
-                        ? "bg-blue-50 text-blue-700 font-semibold border border-blue-100 shadow-2xs"
-                        : "text-slate-600 hover:bg-slate-100 border border-transparent"
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => handleSelectGroup(g)}
-                      className="flex-1 text-left truncate mr-2 cursor-pointer"
+          <div className="space-y-3">
+            <div>
+              <h2 className="font-semibold text-slate-800 mb-2.5 text-sm flex items-center justify-between">
+                <span>{isSuperAdmin ? "Active Groups" : "Your Groups"}</span>
+                <span className="text-xs text-slate-400 font-normal">
+                  {activeGroups.length}
+                </span>
+              </h2>
+              <div className="space-y-1">
+                {activeGroups.length === 0 ? (
+                  <p className="text-xs text-slate-400 italic py-2">
+                    {isSuperAdmin
+                      ? archivedGroups.length > 0
+                        ? "No active groups. See archived below or create one."
+                        : "No groups yet. Create one below!"
+                      : "Open a shared group link (e.g. /SoCal_2026) to access your group."}
+                  </p>
+                ) : (
+                  activeGroups.map((g) => (
+                    <div
+                      key={g.id}
+                      className={`group flex items-center justify-between px-3 py-2 text-sm rounded-xl transition ${
+                        activeGroupId === g.id
+                          ? "bg-blue-50 text-blue-700 font-semibold border border-blue-100 shadow-2xs"
+                          : "text-slate-600 hover:bg-slate-100 border border-transparent"
+                      }`}
                     >
-                      {g.name}
-                    </button>
-                    {isSuperAdmin && (
                       <button
                         type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDeleteGroup(g.id, g.name);
-                        }}
-                        title="Delete group"
-                        className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
+                        onClick={() => handleSelectGroup(g)}
+                        className="flex-1 text-left truncate mr-2 cursor-pointer"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        {g.name}
                       </button>
-                    )}
-                  </div>
-                ))
-              )}
+                      {isSuperAdmin && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteGroup(g.id, g.name);
+                          }}
+                          title="Delete group"
+                          className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
+
+            {/* Collapsible Archived (N) Groups Section */}
+            {archivedGroups.length > 0 && (
+              <div className="pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowArchivedGroups((prev) => !prev)}
+                  className="w-full flex items-center justify-between text-xs font-semibold text-slate-500 hover:text-slate-800 py-1.5 cursor-pointer transition"
+                >
+                  <span className="flex items-center gap-1.5">
+                    {showArchivedGroups || activeGroup?.is_archived ? (
+                      <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                    ) : (
+                      <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                    )}
+                    <Archive className="w-3.5 h-3.5 text-slate-400" />
+                    <span>Archived ({archivedGroups.length})</span>
+                  </span>
+                </button>
+
+                {(showArchivedGroups || activeGroup?.is_archived) && (
+                  <div className="space-y-1 mt-1.5">
+                    {archivedGroups.map((g) => (
+                      <div
+                        key={g.id}
+                        className={`group flex items-center justify-between px-3 py-1.5 text-xs rounded-xl transition ${
+                          activeGroupId === g.id
+                            ? "bg-amber-50 text-amber-900 font-semibold border border-amber-200 shadow-2xs"
+                            : "text-slate-500 hover:bg-slate-100 border border-transparent"
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => handleSelectGroup(g)}
+                          className="flex-1 text-left truncate mr-2 cursor-pointer flex items-center gap-1.5"
+                        >
+                          <Lock className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span className="truncate">{g.name}</span>
+                        </button>
+                        {isSuperAdmin && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteGroup(g.id, g.name);
+                            }}
+                            title="Delete group"
+                            className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-600 p-1 rounded transition cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Create Group Form & CSV Import: Strictly visible ONLY to Super-Admin (murph@murphnduff.org) */}
@@ -1640,9 +1768,15 @@ export function SettleUpDashboard({
                     {members.length}{" "}
                     {members.length === 1 ? "member" : "members"}
                   </span>
+                  {activeGroup.is_archived && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200 shrink-0">
+                      <Lock className="w-3 h-3" />
+                      Archived — Read-Only
+                    </span>
+                  )}
                 </div>
 
-                {/* Action Buttons: Copy Group Link, Export CSV (All Users), Manage Members (Super-Admin) */}
+                {/* Action Buttons: Copy Group Link, Export CSV (All Users), Archive Toggle & Manage Members (Super-Admin) */}
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
@@ -1678,6 +1812,30 @@ export function SettleUpDashboard({
                   {isSuperAdmin && (
                     <button
                       type="button"
+                      onClick={() => handleToggleArchiveGroup(activeGroup)}
+                      className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer border ${
+                        activeGroup.is_archived
+                          ? "bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200"
+                          : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
+                      }`}
+                    >
+                      {activeGroup.is_archived ? (
+                        <>
+                          <ArchiveRestore className="w-3.5 h-3.5 shrink-0" />
+                          <span>Unarchive Group</span>
+                        </>
+                      ) : (
+                        <>
+                          <Archive className="w-3.5 h-3.5 shrink-0" />
+                          <span>Archive Group</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+
+                  {isSuperAdmin && !activeGroup.is_archived && (
+                    <button
+                      type="button"
                       onClick={() => setIsInviteModalOpen(true)}
                       className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-xs bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
                     >
@@ -1687,6 +1845,19 @@ export function SettleUpDashboard({
                   )}
                 </div>
               </div>
+
+              {activeGroup.is_archived && (
+                <div className="p-3 bg-amber-50/90 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-center justify-between gap-2 flex-wrap">
+                  <span className="flex items-center gap-2 font-medium">
+                    <Lock className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>
+                      <strong>Archived — Read-Only:</strong> This group is
+                      retired and locked. Adding, editing, or deleting
+                      transactions and members is disabled.
+                    </span>
+                  </span>
+                </div>
+              )}
 
               {/* Zero-Login Identity Pill Selector (Non-nagging for non-participant Super-Admin) */}
               {members.length > 0 ? (
@@ -1820,7 +1991,178 @@ export function SettleUpDashboard({
 
           {activeGroup && (
             <>
-              {/* Add Transaction Form */}
+              {/* Cumulative Member Summary Card (Paid vs. Share vs. Net Balance per active currency ledger) */}
+              {members.length > 0 && (
+                <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div>
+                      <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                        <Users className="w-4 h-4 text-blue-600" />
+                        Member Summary
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        Cumulative out-of-pocket expenses paid vs. accrued share
+                        consumed vs. net balance (including settlement payments)
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* USD ($) Member Breakdown Table */}
+                  <div className="space-y-2">
+                    {hasEurActivity && (
+                      <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-blue-600"></span>
+                        USD ($) Breakdown
+                      </div>
+                    )}
+                    <div className="overflow-x-auto border border-slate-100 rounded-xl">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
+                            <th className="py-2.5 px-3">Member</th>
+                            <th className="py-2.5 px-3 text-right">
+                              Paid (Out-of-Pocket)
+                            </th>
+                            <th className="py-2.5 px-3 text-right">
+                              Share (Accrued Cost)
+                            </th>
+                            <th className="py-2.5 px-3 text-right">
+                              Net Balance
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {usdMemberBreakdown.map((row) => {
+                            const paidStr = `$${(row.paidCents / 100).toFixed(2)}`;
+                            const shareStr = `$${(row.shareCents / 100).toFixed(2)}`;
+                            const netDollars = (
+                              Math.abs(row.netBalanceCents) / 100
+                            ).toFixed(2);
+                            const netStr =
+                              row.netBalanceCents > 0
+                                ? `+$${netDollars}`
+                                : row.netBalanceCents < 0
+                                  ? `-$${netDollars}`
+                                  : "$0.00";
+                            const netColorClass =
+                              row.netBalanceCents > 0
+                                ? "text-emerald-600 font-bold"
+                                : row.netBalanceCents < 0
+                                  ? "text-rose-600 font-bold"
+                                  : "text-slate-400 font-medium";
+
+                            return (
+                              <tr
+                                key={row.memberId}
+                                className="hover:bg-slate-50/60 transition"
+                              >
+                                <td className="py-2.5 px-3 font-semibold text-slate-900">
+                                  {row.memberName}
+                                  {row.memberId === activeMemberId && (
+                                    <span className="ml-1.5 text-[10px] font-semibold text-blue-600">
+                                      (You)
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
+                                  {paidStr}
+                                </td>
+                                <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
+                                  {shareStr}
+                                </td>
+                                <td
+                                  className={`py-2.5 px-3 text-right ${netColorClass}`}
+                                >
+                                  {netStr}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* EUR (€) Member Breakdown Table (Rendered when EUR transactions exist) */}
+                  {hasEurActivity && (
+                    <div className="space-y-2 pt-2 border-t border-slate-100">
+                      <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
+                        EUR (€) Breakdown
+                      </div>
+                      <div className="overflow-x-auto border border-slate-100 rounded-xl">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
+                              <th className="py-2.5 px-3">Member</th>
+                              <th className="py-2.5 px-3 text-right">
+                                Paid (Out-of-Pocket)
+                              </th>
+                              <th className="py-2.5 px-3 text-right">
+                                Share (Accrued Cost)
+                              </th>
+                              <th className="py-2.5 px-3 text-right">
+                                Net Balance
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {eurMemberBreakdown.map((row) => {
+                              const paidStr = `€${(row.paidCents / 100).toFixed(2)}`;
+                              const shareStr = `€${(row.shareCents / 100).toFixed(2)}`;
+                              const netEuros = (
+                                Math.abs(row.netBalanceCents) / 100
+                              ).toFixed(2);
+                              const netStr =
+                                row.netBalanceCents > 0
+                                  ? `+€${netEuros}`
+                                  : row.netBalanceCents < 0
+                                    ? `-€${netEuros}`
+                                    : "€0.00";
+                              const netColorClass =
+                                row.netBalanceCents > 0
+                                  ? "text-emerald-600 font-bold"
+                                  : row.netBalanceCents < 0
+                                    ? "text-rose-600 font-bold"
+                                    : "text-slate-400 font-medium";
+
+                              return (
+                                <tr
+                                  key={row.memberId}
+                                  className="hover:bg-slate-50/60 transition"
+                                >
+                                  <td className="py-2.5 px-3 font-semibold text-slate-900">
+                                    {row.memberName}
+                                    {row.memberId === activeMemberId && (
+                                      <span className="ml-1.5 text-[10px] font-semibold text-blue-600">
+                                        (You)
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
+                                    {paidStr}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
+                                    {shareStr}
+                                  </td>
+                                  <td
+                                    className={`py-2.5 px-3 text-right ${netColorClass}`}
+                                  >
+                                    {netStr}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Add Transaction Form (Hidden when group is archived) */}
+              {!activeGroup.is_archived && (
               <form
                 onSubmit={handleAddExpense}
                 className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs space-y-4"
@@ -2309,6 +2651,7 @@ export function SettleUpDashboard({
                   Save Transaction
                 </button>
               </form>
+              )}
 
               {/* Ledger Table with Currency Isolation Filter and Group-Wide Editing */}
               <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
@@ -2319,7 +2662,10 @@ export function SettleUpDashboard({
                     </h3>
                     <p className="text-xs text-slate-400">
                       Showing {filteredExpenses.length} of {expenses.length}{" "}
-                      records • Anyone with the group link can edit or delete
+                      records •{" "}
+                      {activeGroup.is_archived
+                        ? "Archived (Read-Only)"
+                        : "Anyone with the group link can edit or delete"}
                     </p>
                   </div>
 
@@ -2446,27 +2792,29 @@ export function SettleUpDashboard({
                               </span>
                             </div>
 
-                            {/* Group-Wide Transaction Edit & Delete Actions */}
-                            <div className="flex items-center gap-1 pl-2 border-l border-slate-200">
-                              <button
-                                type="button"
-                                onClick={() => setEditingExpense(exp)}
-                                title="Edit transaction"
-                                className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition cursor-pointer"
-                              >
-                                <Edit3 className="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  handleDeleteExpense(exp.id, exp.description)
-                                }
-                                title="Delete transaction"
-                                className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
+                            {/* Group-Wide Transaction Edit & Delete Actions (Hidden when archived) */}
+                            {!activeGroup.is_archived && (
+                              <div className="flex items-center gap-1 pl-2 border-l border-slate-200">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingExpense(exp)}
+                                  title="Edit transaction"
+                                  className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition cursor-pointer"
+                                >
+                                  <Edit3 className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleDeleteExpense(exp.id, exp.description)
+                                  }
+                                  title="Delete transaction"
+                                  className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            )}
                           </div>
                         </div>
                       );

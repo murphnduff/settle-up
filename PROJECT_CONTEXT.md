@@ -78,22 +78,34 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Summary footer:** Ignores and generates trailing blank line + `<Date>,Total balance, , ,<Currency>,<Net 1>,...`.
 - **High-Speed Bulk Insert:** Import pre-generates client UUIDs and commits all members, expenses, and splits in three batched Supabase calls (< 0.5s).
 
+### 4.3 Cumulative Member Breakdown (`calculateMemberBreakdown`)
+- Displays a per-currency **Member Summary** table on the group dashboard with three columns:
+  - **Paid (Out-of-Pocket):** Sum of `amount_cents` for `type === 'expense'` paid by the member (strictly excluding `type === 'payment'`).
+  - **Share (Accrued Cost):** Sum of `split_amount_cents` for `type === 'expense'` allocated to the member (strictly excluding `type === 'payment'`).
+  - **Net Balance:** Current net balance (including both expenses and direct settlement payments), color-coded green (`+$` owed to them), red (`-$` they owe), or gray (`$0.00` settled).
+
+### 4.4 Group Archiving ("Retire Group" + Read-Only Lock)
+- Uses `is_archived BOOLEAN NOT NULL DEFAULT false` on `public.groups`.
+- **Sidebar Organization:** Active groups appear at the top; archived groups are organized in a collapsible `Archived (N)` section at the bottom.
+- **Super-Admin Toggle:** `Archive Group` / `Unarchive Group` button in the group header toolbar.
+- **Read-Only Lock:** When `activeGroup.is_archived === true`, displays an `"Archived — Read-Only"` badge and banner, hides the "Add Transaction" form, and disables editing/deleting transactions or members while keeping `Export CSV` and `Copy Group Link` active.
+
 ---
 
 ## 5. Active Backlog & Future Development Roadmap
 
-### Phase 1.1: Core Polish & Settlement Integrity (Next Up)
-1. **Fix Direct Payment Overpayment Inversion:**
-   - Ensure direct payments allow net balances to invert past zero without clamping.
-   - Add automated test in `src/lib/reconciliation.test.ts`: Kevin owes $20, pays $22 $\rightarrow$ Murph owes Kevin $2.
-2. **Exclude Payments from Running Spent Metric:**
-   - Filter `type === 'expense'` on `USD Spent` and `EUR Spent` calculations.
-3. **Cumulative Member Breakdown:**
-   - Display a card/table showing each member's **Out-of-Pocket Fronted** vs. **Accrued Cost Consumed** vs. **Net Balance**.
-4. **Group Archiving ("Retire Group"):**
-   - Add `is_archived` column to `groups`. Archived groups move to a collapsed sidebar folder and lock to read-only.
+### Phase 1.1: Core Polish & Settlement Integrity (Completed ✅)
+1. ✅ **Fix Direct Payment Overpayment Inversion:**
+   - Direct payments allow net balances to invert past zero without clamping, plus zero-sum safeguard if an expense has empty splits.
+   - Automated tests in `src/lib/reconciliation.test.ts` (Edge Cases 10 & 11).
+2. ✅ **Exclude Payments from Running Spent Metric:**
+   - `USD Spent` and `EUR Spent` strictly aggregate `type === 'expense'`.
+3. ✅ **Cumulative Member Breakdown:**
+   - `calculateMemberBreakdown` in `src/lib/reconciliation.ts` (tested in Edge Case 12) + dashboard **Member Summary** card showing **Paid (Out-of-Pocket)** vs. **Share (Accrued Cost)** vs. **Net Balance**.
+4. ✅ **Group Archiving ("Retire Group"):**
+   - Collapsible `Archived (N)` sidebar section, Super-Admin `Archive Group` / `Unarchive Group` toggle, and full Read-Only lock (`Archived — Read-Only` badge/banner).
 
-### Phase 1.2: Expense Categorization
+### Phase 1.2: Expense Categorization (Next Up)
 5. **Categories & Category Breakdown:**
    - Add `category` column to `expenses` (Dining, Groceries, Lodging, Transport, General) with UI pill selectors, category spend totals, and direct CSV column mapping.
 

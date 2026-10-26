@@ -36,6 +36,7 @@ export interface Group {
   name: string;
   slug?: string | null;
   created_by?: string | null;
+  is_archived?: boolean;
   created_at?: string;
 }
 
@@ -430,8 +431,16 @@ export default function MemberInviteModal({
           </div>
         )}
 
-        {/* Section 1: Add Member Form (Strictly Super-Admin Only, display_name only) */}
-        {isSuperAdmin ? (
+        {/* Section 1: Add Member Form (Strictly Super-Admin Only, display_name only, disabled if archived) */}
+        {group?.is_archived ? (
+          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              This group is archived (Read-Only). Unarchive the group to add,
+              rename, or remove members.
+            </span>
+          </div>
+        ) : isSuperAdmin ? (
           <form onSubmit={handleAddMember} className="space-y-2.5">
             <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
               <UserPlus className="w-3.5 h-3.5 text-slate-500" />
@@ -488,8 +497,9 @@ export default function MemberInviteModal({
               currentMembers.map((member) => {
                 const isSelectedIdentity = member.id === activeMemberId;
                 const isEditing = editingMemberId === member.id;
-                const canEditThisMember = isSuperAdmin || isSelectedIdentity;
-                const hasTx = !canDeleteMember(member.id, expenses);
+                const canEditThisMember =
+                  !group?.is_archived && (isSuperAdmin || isSelectedIdentity);
+                const hasTx = !canDeleteMember(member.id, expenses).canDelete;
 
                 const initials = (member.name || "M")
                   .split(" ")
@@ -593,7 +603,7 @@ export default function MemberInviteModal({
                         )}
                       </button>
 
-                      {isSuperAdmin && (
+                      {isSuperAdmin && !group?.is_archived && (
                         <button
                           type="button"
                           onClick={() => handleDeleteMember(member)}

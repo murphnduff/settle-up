@@ -9,6 +9,7 @@ import {
   deriveGroupNameFromCsvFilename,
   calculateSettlements,
   calculateBalancesByCurrency,
+  calculateMemberBreakdown,
   canDeleteMember,
 } from './reconciliation.ts';
 import type {
@@ -581,6 +582,69 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     assert.strictEqual(balances.get(murph.id), -2430);
     assert.strictEqual(balances.get(kev.id), -2430);
     assert.strictEqual(balances.get(fitz.id), 4860);
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 12: Cumulative Member Breakdown (Paid vs. Share vs. Net Balance)
+  // --------------------------------------------------------------------------
+  it('Edge Case 12: calculateMemberBreakdown computes Paid vs. Share strictly from expenses and includes payments in Net Balance', () => {
+    const ledger: ExpenseRecord[] = [
+      // Expense 1: Murph pays $90.00 (9000c), split equally ($30.00 each)
+      {
+        id: 'exp-1',
+        paidByMemberId: murph.id,
+        amountCents: 9000,
+        currency: 'USD',
+        type: 'expense',
+        splits: [
+          { memberId: murph.id, splitAmountCents: 3000 },
+          { memberId: kev.id, splitAmountCents: 3000 },
+          { memberId: fitz.id, splitAmountCents: 3000 },
+        ],
+      },
+      // Expense 2: Kev pays $30.00 (3000c), split between Kev ($10.00) and Fitz ($20.00)
+      {
+        id: 'exp-2',
+        paidByMemberId: kev.id,
+        amountCents: 3000,
+        currency: '$',
+        type: 'expense',
+        splits: [
+          { memberId: kev.id, splitAmountCents: 1000 },
+          { memberId: fitz.id, splitAmountCents: 2000 },
+        ],
+      },
+      // Direct Payment: Fitz pays Murph $25.00 (2500c)
+      // Must NOT increment Fitz's paidCents or Murph's shareCents, but MUST adjust netBalanceCents
+      {
+        id: 'pay-1',
+        paidByMemberId: fitz.id,
+        amountCents: 2500,
+        currency: 'USD',
+        type: 'payment',
+        splits: [{ memberId: murph.id, splitAmountCents: 2500 }],
+      },
+    ];
+
+    const summary = calculateMemberBreakdown(allMembers, ledger, 'USD');
+    const murphRow = summary.find((r) => r.memberId === murph.id)!;
+    const kevRow = summary.find((r) => r.memberId === kev.id)!;
+    const fitzRow = summary.find((r) => r.memberId === fitz.id)!;
+
+    // Murph: Paid $90.00 (9000c), Share $30.00 (3000c), Net = +6000c - 2500c (payment received) = +3500c (+$35.00)
+    assert.strictEqual(murphRow.paidCents, 9000);
+    assert.strictEqual(murphRow.shareCents, 3000);
+    assert.strictEqual(murphRow.netBalanceCents, 3500);
+
+    // Kev: Paid $30.00 (3000c), Share $40.00 (3000c + 1000c = 4000c), Net = -1000c (-$10.00)
+    assert.strictEqual(kevRow.paidCents, 3000);
+    assert.strictEqual(kevRow.shareCents, 4000);
+    assert.strictEqual(kevRow.netBalanceCents, -1000);
+
+    // Fitz: Paid $0.00 (0c expenses), Share $50.00 (3000c + 2000c = 5000c), Net = -5000c + 2500c (payment sent) = -2500c (-$25.00)
+    assert.strictEqual(fitzRow.paidCents, 0);
+    assert.strictEqual(fitzRow.shareCents, 5000);
+    assert.strictEqual(fitzRow.netBalanceCents, -2500);
   });
 });
 

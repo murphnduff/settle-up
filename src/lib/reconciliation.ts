@@ -46,6 +46,17 @@ export interface SettlementInstruction {
   amount: number;
 }
 
+export interface MemberSummaryRecord {
+  memberId: string;
+  memberName: string;
+  /** Sum of amount_cents for all type === 'expense' paid by member (excludes payments) */
+  paidCents: number;
+  /** Sum of split_amount_cents for all type === 'expense' allocated to member (excludes payments) */
+  shareCents: number;
+  /** Current net balance in cents including both expenses and direct payments */
+  netBalanceCents: number;
+}
+
 /**
  * Evenly distributes an integer amount in cents among a set of members.
  * Remainder pennies are distributed one-by-one to the first members so that:
@@ -183,6 +194,113 @@ export function calculateBalancesByCurrency(
   }
 
   return currencyBalances;
+}
+
+/**
+ * Calculates cumulative per-member breakdown (Paid Out-of-Pocket vs. Accrued Share vs. Net Balance)
+ * for a specific currency family ('USD' / '$' or 'EUR' / '€').
+ *
+ * - `paidCents`: Sum of `amountCents` for `type === 'expense'` where `paidByMemberId === member.id` (excludes `type === 'payment'`)
+ * - `shareCents`: Sum of `splitAmountCents` for `type === 'expense'` allocated to `member.id` (excludes `type === 'payment'`)
+ * - `netBalanceCents`: Net balance in cents including both expenses and direct settlement payments
+ */
+export function calculateMemberBreakdown(
+  members: MemberRecord[],
+  expenses: ExpenseRecord[],
+  targetCurrency: string = 'USD'
+): MemberSummaryRecord[] {
+  const normalizeCurrencyFamily = (rawCur?: string): string => {
+    const c = (rawCur || 'USD').trim();
+    if (c === '$' || c.toUpperCase() === 'USD') return 'USD';
+    if (c === '€' || c.toUpperCase() === 'EUR') return 'EUR';
+    return c;
+  };
+
+  const targetFamily = normalizeCurrencyFamily(targetCurrency);
+  const paidMap = new Map<string, number>();
+  const shareMap = new Map<string, number>();
+  const netMap = new Map<string, number>();
+
+  for (const m of members) {
+    paidMap.set(m.id, 0);
+    shareMap.set(m.id, 0);
+    netMap.set(m.id, 0);
+  }
+
+  const curExpenses = expenses.filter(
+    (e) => normalizeCurrencyFamily(e.currency) === targetFamily
+  );
+
+  for (const exp of curExpenses) {
+    const payerId = exp.paidByMemberId || exp.payerId || '';
+    const totalCents =
+      typeof exp.amountCents === 'number'
+        ? Math.round(exp.amountCents)
+        : Math.round((exp.amount || 0) * 100);
+
+    if (!payerId || totalCents <= 0) continue;
+
+    const effectiveSplits =
+      exp.splits && exp.splits.length > 0
+        ? exp.splits
+        : exp.type !== 'payment' && members.length > 0
+          ? splitAmountEqually(
+              totalCents,
+              members.map((m) => m.id)
+            )
+          : [];
+
+    if (effectiveSplits.length === 0) continue;
+
+    let allocatedTotalCents = 0;
+
+    for (const split of effectiveSplits) {
+      const participantId = split.memberId || split.userId || '';
+      if (!participantId) continue;
+
+      const rawSplitCents =
+        typeof split.splitAmountCents === 'number'
+          ? Math.round(split.splitAmountCents)
+          : Math.round((split.amount || 0) * 100);
+
+      const splitCents =
+        exp.type === 'payment' &&
+        effectiveSplits.length === 1 &&
+        rawSplitCents <= 0
+          ? totalCents
+          : rawSplitCents;
+
+      if (splitCents <= 0) continue;
+
+      allocatedTotalCents += splitCents;
+      netMap.set(participantId, (netMap.get(participantId) || 0) - splitCents);
+
+      if (exp.type === 'expense') {
+        shareMap.set(
+          participantId,
+          (shareMap.get(participantId) || 0) + splitCents
+        );
+      }
+    }
+
+    if (allocatedTotalCents > 0) {
+      netMap.set(payerId, (netMap.get(payerId) || 0) + allocatedTotalCents);
+      if (exp.type === 'expense') {
+        paidMap.set(
+          payerId,
+          (paidMap.get(payerId) || 0) + allocatedTotalCents
+        );
+      }
+    }
+  }
+
+  return members.map((m) => ({
+    memberId: m.id,
+    memberName: m.name,
+    paidCents: paidMap.get(m.id) || 0,
+    shareCents: shareMap.get(m.id) || 0,
+    netBalanceCents: netMap.get(m.id) || 0,
+  }));
 }
 
 /**
