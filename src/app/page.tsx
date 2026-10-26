@@ -6,6 +6,7 @@ import {
   useTransition,
   useMemo,
   useCallback,
+  useRef,
   Suspense,
 } from "react";
 import { createClient } from "@/lib/supabase";
@@ -38,6 +39,12 @@ import EditExpenseModal, {
   formatTransactionDate,
 } from "@/components/EditExpenseModal";
 import {
+  compressReceiptFile,
+  uploadReceiptToStorage,
+  parseReceiptWithAi,
+  isPdfReceiptUrl,
+} from "@/lib/receipts";
+import {
   UserPlus,
   Users,
   CheckCircle2,
@@ -64,6 +71,10 @@ import {
   ChevronRight,
   Lock,
   Tag,
+  Camera,
+  FileText,
+  ExternalLink,
+  Loader2,
 } from "lucide-react";
 import type { User, SupabaseClient } from "@supabase/supabase-js";
 
@@ -107,8 +118,13 @@ function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
       : typeof e.category === "string" && e.category.trim().length > 0
         ? e.category.trim()
         : "General";
+    const resolvedReceiptUrl =
+      typeof e.receipt_url === "string" && e.receipt_url.trim().length > 0
+        ? e.receipt_url.trim()
+        : null;
     return {
       id: e.id,
+      groupId: e.group_id,
       paidByMemberId: e.paid_by_member_id,
       payerId: e.paid_by_member_id,
       description: e.description,
@@ -117,6 +133,7 @@ function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
       currency: curr,
       type: (isPayment ? "payment" : "expense") as "expense" | "payment",
       category: resolvedCategory,
+      receiptUrl: resolvedReceiptUrl,
       date: cleanDate,
       createdAt: typeof e.created_at === "string" ? e.created_at : "",
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -287,11 +304,35 @@ export function SettleUpDashboard({
   const [isCustomCategory, setIsCustomCategory] = useState<boolean>(false);
   const [customCategoryInput, setCustomCategoryInput] = useState<string>("");
   const [splitMode, setSplitMode] = useState<SplitMode>("equal");
+  const splitModeRef = useRef<SplitMode>("equal");
+  useEffect(() => {
+    splitModeRef.current = splitMode;
+  }, [splitMode]);
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [percentageValues, setPercentageValues] = useState<
     Record<string, string>
   >({});
   const [exactValues, setExactValues] = useState<Record<string, string>>({});
+
+  // Add Transaction Receipt & AI Extraction state
+  const addReceiptInputRef = useRef<HTMLInputElement>(null);
+  const receiptLightboxRef = useRef<HTMLDialogElement>(null);
+  const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
+  const [receiptPreviewUrl, setReceiptPreviewUrl] = useState<string | null>(
+    null
+  );
+  const [receiptFileName, setReceiptFileName] = useState<string>("");
+  const [isScanningReceipt, setIsScanningReceipt] = useState<boolean>(false);
+  const [isUploadingReceipt, setIsUploadingReceipt] = useState<boolean>(false);
+  const [receiptStatusMessage, setReceiptStatusMessage] = useState<
+    string | null
+  >(null);
+  const [viewingReceipt, setViewingReceipt] = useState<{
+    url: string;
+    title: string;
+    date?: string;
+    amountFormatted?: string;
+  } | null>(null);
 
   // CSV Import Modal state (Super-Admin only)
   const [isCsvModalOpen, setIsCsvModalOpen] = useState(false);
@@ -741,9 +782,130 @@ export function SettleUpDashboard({
 
   // Dynamic per-group category options (merges EXPENSE_CATEGORIES presets with any unique custom categories in the group)
   const groupCategories: string[] = useMemo(
-    () => buildGroupCategories(expenses),
-    [expenses]
+    () => buildGroupCategories(expenses, [category]),
+    [expenses, category]
   );
+
+  // Sync Receipt Lightbox native dialog
+  useEffect(() => {
+    const dialog = receiptLightboxRef.current;
+    if (!dialog) return;
+    if (viewingReceipt) {
+      if (!dialog.open) {
+        dialog.showModal();
+      }
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [viewingReceipt]);
+
+  const handleReceiptLightboxBackdropClick = (
+    e: React.MouseEvent<HTMLDialogElement>
+  ) => {
+    const dialog = receiptLightboxRef.current;
+    if (!dialog || e.target !== dialog) return;
+    const rect = dialog.getBoundingClientRect();
+    const isInside =
+      rect.top <= e.clientY &&
+      e.clientY <= rect.top + rect.height &&
+      rect.left <= e.clientX &&
+      e.clientX <= rect.left + rect.width;
+    if (!isInside) {
+      setViewingReceipt(null);
+    }
+  };
+
+  // Scan / Attach Receipt Handler in Add Transaction Form
+  const handleAddReceiptFileChange = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !activeGroupId) return;
+
+    setReceiptFileName(file.name);
+    setIsScanningReceipt(true);
+    setIsUploadingReceipt(true);
+    setReceiptStatusMessage("Scanning receipt...");
+
+    try {
+      const compressed = await compressReceiptFile(file);
+      setReceiptPreviewUrl(compressed.previewUrl);
+
+      const [uploadOutcome, parseOutcome] = await Promise.allSettled([
+        uploadReceiptToStorage(
+          supabase,
+          activeGroupId,
+          compressed.blob,
+          compressed.extension,
+          compressed.mimeType
+        ),
+        parseReceiptWithAi(compressed.base64, compressed.mimeType),
+      ]);
+
+      if (uploadOutcome.status === "fulfilled") {
+        setReceiptUrl(uploadOutcome.value);
+      } else {
+        const msg =
+          uploadOutcome.reason instanceof Error
+            ? uploadOutcome.reason.message
+            : "Failed to upload receipt to storage.";
+        setNotification({ type: "error", message: msg });
+      }
+
+      if (parseOutcome.status === "fulfilled") {
+        const parsed = parseOutcome.value;
+        if (parsed.description) {
+          setDescription(parsed.description);
+        }
+        if (parsed.currency) {
+          setCurrency(parsed.currency === "EUR" ? "€" : "$");
+        }
+        if (parsed.date) {
+          setTransactionDate(parsed.date);
+        }
+        if (parsed.category) {
+          setIsCustomCategory(false);
+          setCustomCategoryInput("");
+          setCategory(parsed.category);
+        }
+        // Only pre-fill Amount when NOT in '$ Exact' split mode (where Amount is auto-summed from member inputs)
+        if (
+          typeof parsed.amount === "number" &&
+          parsed.amount > 0 &&
+          splitModeRef.current !== "exact"
+        ) {
+          setAmount(parsed.amount.toFixed(2));
+        }
+        setReceiptStatusMessage(
+          "Receipt scanned — fields pre-filled for review!"
+        );
+      } else {
+        setReceiptStatusMessage(
+          "Receipt attached (fill in details below to save)."
+        );
+      }
+    } catch (err: unknown) {
+      setNotification({
+        type: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : "Could not process receipt file.",
+      });
+      setReceiptStatusMessage(null);
+    } finally {
+      setIsScanningReceipt(false);
+      setIsUploadingReceipt(false);
+    }
+  };
+
+  const handleRemoveAddReceipt = () => {
+    setReceiptUrl(null);
+    setReceiptPreviewUrl(null);
+    setReceiptFileName("");
+    setReceiptStatusMessage(null);
+  };
 
   // Live exact split calculation & auto-summed total for Add Transaction form
   const exactSummary = useMemo(() => {
@@ -1371,6 +1533,7 @@ export function SettleUpDashboard({
         (type === "payment" ? "Direct Payment" : "Group Expense"),
       category:
         type === "payment" ? "Payment" : effectiveExpenseCategory,
+      receipt_url: type === "payment" ? null : receiptUrl,
       amount_cents: totalCents,
       currency,
       type,
@@ -1483,6 +1646,10 @@ export function SettleUpDashboard({
     setCategory("General");
     setIsCustomCategory(false);
     setCustomCategoryInput("");
+    setReceiptUrl(null);
+    setReceiptPreviewUrl(null);
+    setReceiptFileName("");
+    setReceiptStatusMessage(null);
     setPercentageValues({});
     setExactValues({});
     startTransition(() => {
@@ -2259,6 +2426,121 @@ export function SettleUpDashboard({
                   </div>
                 </div>
 
+                {/* Prominent Scan / Attach Receipt Section (Strictly for Group Expenses) */}
+                {type === "expense" && (
+                  <div className="p-3.5 rounded-xl border border-blue-200/80 bg-blue-50/40 space-y-2.5">
+                    <input
+                      ref={addReceiptInputRef}
+                      type="file"
+                      accept="image/*,application/pdf"
+                      onChange={handleAddReceiptFileChange}
+                      className="hidden"
+                    />
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-2">
+                        <div className="p-1.5 rounded-lg bg-blue-100 text-blue-700 shrink-0">
+                          <Camera className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <span className="text-xs font-bold text-slate-900 block">
+                            Scan / Attach Receipt
+                          </span>
+                          <span className="text-[11px] text-slate-500">
+                            Snap a photo or upload a PDF to auto-fill merchant,
+                            amount, date & category
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isScanningReceipt || isUploadingReceipt}
+                        onClick={() => addReceiptInputRef.current?.click()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
+                      >
+                        {isScanningReceipt || isUploadingReceipt ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Scanning receipt...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Camera className="w-3.5 h-3.5" />
+                            <span>
+                              {receiptPreviewUrl || receiptUrl
+                                ? "Replace Receipt"
+                                : "Scan / Attach Receipt"}
+                            </span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {(receiptPreviewUrl || receiptUrl || isScanningReceipt) && (
+                      <div className="flex items-center justify-between gap-3 pt-2 border-t border-blue-100">
+                        <div className="flex items-center gap-3 min-w-0">
+                          {receiptPreviewUrl &&
+                          !isPdfReceiptUrl(receiptUrl || receiptPreviewUrl) &&
+                          !receiptFileName.toLowerCase().endsWith(".pdf") ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const targetUrl =
+                                  receiptUrl || receiptPreviewUrl;
+                                if (targetUrl) {
+                                  setViewingReceipt({
+                                    url: targetUrl,
+                                    title:
+                                      description.trim() ||
+                                      receiptFileName ||
+                                      "Receipt Preview",
+                                  });
+                                }
+                              }}
+                              title="Click to view full receipt"
+                              className="relative w-12 h-12 rounded-lg overflow-hidden border border-slate-200 bg-white shrink-0 group cursor-pointer"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={receiptPreviewUrl}
+                                alt="Receipt thumbnail"
+                                className="w-full h-full object-cover group-hover:opacity-90 transition"
+                              />
+                            </button>
+                          ) : (
+                            <div className="w-12 h-12 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-blue-600 shrink-0">
+                              <FileText className="w-5 h-5" />
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-slate-800 truncate">
+                              {receiptFileName || "Receipt attached"}
+                            </div>
+                            {isScanningReceipt || isUploadingReceipt ? (
+                              <div className="text-[11px] text-blue-600 font-medium flex items-center gap-1 mt-0.5">
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                                <span>Scanning receipt...</span>
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-emerald-700 font-medium mt-0.5">
+                                {receiptStatusMessage ||
+                                  "Ready to save with transaction"}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleRemoveAddReceipt}
+                          title="Remove receipt"
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition cursor-pointer shrink-0"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="text-xs font-semibold text-slate-600 block mb-1">
@@ -2874,6 +3156,24 @@ export function SettleUpDashboard({
                                     {exp.category || "General"}
                                   </span>
                                 )}
+                                {exp.receiptUrl && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setViewingReceipt({
+                                        url: exp.receiptUrl!,
+                                        title: exp.description || "Receipt",
+                                        date: formatTransactionDate(exp.date),
+                                        amountFormatted: `${exp.currency}${exp.amount.toFixed(2)}`,
+                                      })
+                                    }
+                                    title="View attached receipt"
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200 transition cursor-pointer shrink-0"
+                                  >
+                                    <Receipt className="w-3 h-3" />
+                                    <span>Receipt</span>
+                                  </button>
+                                )}
                               </div>
                               <div className="text-xs text-slate-500 mt-0.5">
                                 Paid by{" "}
@@ -3299,8 +3599,17 @@ export function SettleUpDashboard({
           isOpen={true}
           onClose={() => setEditingExpense(null)}
           expense={editingExpense}
+          groupId={activeGroupId}
           members={members}
           existingCategories={groupCategories}
+          onViewReceipt={(url, title) =>
+            setViewingReceipt({
+              url,
+              title: title || editingExpense.description || "Receipt",
+              date: formatTransactionDate(editingExpense.date),
+              amountFormatted: `${editingExpense.currency}${editingExpense.amount.toFixed(2)}`,
+            })
+          }
           onSaved={() => {
             if (activeGroupId) {
               refreshExpenses(activeGroupId);
@@ -3308,6 +3617,102 @@ export function SettleUpDashboard({
           }}
         />
       )}
+
+      {/* Receipt Viewer Lightbox Modal */}
+      <dialog
+        ref={receiptLightboxRef}
+        closedby="any"
+        aria-labelledby="receipt-lightbox-title"
+        onClick={handleReceiptLightboxBackdropClick}
+        onCancel={(e) => {
+          e.preventDefault();
+          setViewingReceipt(null);
+        }}
+        className="m-auto p-0 rounded-2xl shadow-2xl border border-slate-200 bg-white max-w-2xl w-full backdrop:bg-slate-900/70 backdrop:backdrop-blur-xs open:animate-in open:fade-in-0 open:zoom-in-95"
+      >
+        {viewingReceipt && (
+          <div className="flex flex-col max-h-[90vh]">
+            <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-slate-200">
+              <div className="min-w-0">
+                <h2
+                  id="receipt-lightbox-title"
+                  className="text-sm font-bold text-slate-900 truncate"
+                >
+                  {viewingReceipt.title}
+                </h2>
+                {(viewingReceipt.date || viewingReceipt.amountFormatted) && (
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {[viewingReceipt.date, viewingReceipt.amountFormatted]
+                      .filter(Boolean)
+                      .join(" • ")}
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <a
+                  href={viewingReceipt.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 transition"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open in New Tab</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setViewingReceipt(null)}
+                  aria-label="Close receipt viewer"
+                  className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-5 bg-slate-50 overflow-y-auto flex-1 flex flex-col items-center justify-center min-h-[280px]">
+              {isPdfReceiptUrl(viewingReceipt.url) ? (
+                <div className="w-full space-y-4 text-center py-6">
+                  <div className="w-16 h-16 rounded-2xl bg-blue-50 border border-blue-200 text-blue-600 flex items-center justify-center mx-auto">
+                    <FileText className="w-8 h-8" />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-sm font-bold text-slate-900">
+                      PDF Receipt Document
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      View the embedded document below or open it in a new
+                      browser tab.
+                    </p>
+                  </div>
+                  <iframe
+                    src={viewingReceipt.url}
+                    title={viewingReceipt.title}
+                    className="w-full h-[55vh] rounded-xl border border-slate-200 bg-white"
+                  />
+                  <div>
+                    <a
+                      href={viewingReceipt.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-xs transition"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Open PDF in New Tab</span>
+                    </a>
+                  </div>
+                </div>
+              ) : (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={viewingReceipt.url}
+                  alt={viewingReceipt.title}
+                  className="max-w-full max-h-[72vh] w-auto h-auto object-contain rounded-xl border border-slate-200 bg-white shadow-xs"
+                />
+              )}
+            </div>
+          </div>
+        )}
+      </dialog>
     </div>
   );
 }

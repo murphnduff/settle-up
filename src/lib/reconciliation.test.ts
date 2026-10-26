@@ -15,6 +15,10 @@ import {
   EXPENSE_CATEGORIES,
   canDeleteMember,
 } from './reconciliation.ts';
+import {
+  normalizeParsedReceipt,
+  isPdfReceiptUrl,
+} from './receipts.ts';
 import type {
   MemberRecord,
   ExpenseRecord,
@@ -728,6 +732,48 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     assert.ok(mergedCategories.includes('Golf'));
     assert.ok(mergedCategories.includes('Ski Passes'));
     assert.ok(!mergedCategories.includes('Payment'));
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 14: AI Receipt Extraction Normalization & PDF Detection
+  // --------------------------------------------------------------------------
+  it('Edge Case 14: normalizeParsedReceipt sanitizes Gemini OCR output and matches preset/custom categories', () => {
+    const parsedEur = normalizeParsedReceipt({
+      description: '  Dunnes Stores - Groceries  ',
+      amount: 42.5,
+      currency: '€',
+      date: '2026-10-26T14:22:00Z',
+      category: 'groceries',
+    });
+
+    assert.strictEqual(parsedEur.description, 'Dunnes Stores - Groceries');
+    assert.strictEqual(parsedEur.amount, 42.5);
+    assert.strictEqual(parsedEur.currency, 'EUR');
+    assert.strictEqual(parsedEur.date, '2026-10-26');
+    assert.strictEqual(parsedEur.category, 'Groceries');
+
+    const parsedCustom = normalizeParsedReceipt({
+      description: 'Pebble Beach Pro Shop',
+      amount: '295.75',
+      currency: 'USD',
+      date: 'invalid-date',
+      category: 'Golf',
+    });
+
+    assert.strictEqual(parsedCustom.description, 'Pebble Beach Pro Shop');
+    assert.strictEqual(parsedCustom.amount, 295.75);
+    assert.strictEqual(parsedCustom.currency, 'USD');
+    assert.strictEqual(parsedCustom.date, undefined);
+    assert.strictEqual(parsedCustom.category, 'Golf');
+
+    assert.strictEqual(
+      isPdfReceiptUrl('https://xyz.supabase.co/storage/v1/object/public/receipts/grp/abc.pdf?token=1'),
+      true
+    );
+    assert.strictEqual(
+      isPdfReceiptUrl('https://xyz.supabase.co/storage/v1/object/public/receipts/grp/abc.jpg'),
+      false
+    );
   });
 });
 

@@ -9,7 +9,25 @@ import {
   buildGroupCategories,
 } from "@/lib/reconciliation";
 import { GroupMember } from "@/components/MemberInviteModal";
-import { X, Sparkles, AlertCircle, Edit3, CheckCircle2, Plus } from "lucide-react";
+import {
+  compressReceiptFile,
+  uploadReceiptToStorage,
+  parseReceiptWithAi,
+  isPdfReceiptUrl,
+} from "@/lib/receipts";
+import {
+  X,
+  Sparkles,
+  AlertCircle,
+  Edit3,
+  CheckCircle2,
+  Plus,
+  Camera,
+  FileText,
+  ExternalLink,
+  Loader2,
+  Trash2,
+} from "lucide-react";
 
 export type SplitMode = "equal" | "percentage" | "exact";
 
@@ -43,6 +61,7 @@ export function formatTransactionDate(dateStr?: string): string {
 
 export interface ExpenseItem {
   id: string;
+  groupId?: string;
   paidByMemberId?: string;
   payerId?: string;
   description: string;
@@ -51,6 +70,7 @@ export interface ExpenseItem {
   currency: string;
   type: "expense" | "payment";
   category?: string;
+  receiptUrl?: string | null;
   date: string;
   createdAt?: string;
   createdBy?: string;
@@ -66,8 +86,10 @@ interface EditExpenseModalProps {
   isOpen: boolean;
   onClose: () => void;
   expense: ExpenseItem | null;
+  groupId?: string;
   members: GroupMember[];
   existingCategories?: string[];
+  onViewReceipt?: (url: string, title?: string) => void;
   onSaved: () => void;
 }
 
@@ -95,12 +117,15 @@ export default function EditExpenseModal({
   isOpen,
   onClose,
   expense,
+  groupId,
   members,
   existingCategories = [],
+  onViewReceipt,
   onSaved,
 }: EditExpenseModalProps) {
   const supabase = createClient();
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const receiptFileInputRef = useRef<HTMLInputElement>(null);
 
   const [description, setDescription] = useState(expense?.description ?? "");
   const [amount, setAmount] = useState(
@@ -159,6 +184,103 @@ export default function EditExpenseModal({
   const [error, setError] = useState<string | null>(null);
   const [isCustomCategory, setIsCustomCategory] = useState(false);
   const [customCategoryInput, setCustomCategoryInput] = useState("");
+  const [receiptUrl, setReceiptUrl] = useState<string | null>(
+    expense?.receiptUrl ?? null
+  );
+  const [receiptPreviewUrl, setReceiptPreviewUrl] = useState<string | null>(
+    expense?.receiptUrl ?? null
+  );
+  const [receiptFileName, setReceiptFileName] = useState<string>("");
+  const [isScanningReceipt, setIsScanningReceipt] = useState(false);
+  const [isUploadingReceipt, setIsUploadingReceipt] = useState(false);
+  const [receiptStatusMessage, setReceiptStatusMessage] = useState<
+    string | null
+  >(null);
+
+  const handleReceiptFileChange = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+
+    setError(null);
+    setReceiptFileName(file.name);
+    setIsScanningReceipt(true);
+    setIsUploadingReceipt(true);
+    setReceiptStatusMessage("Scanning receipt...");
+
+    try {
+      const compressed = await compressReceiptFile(file);
+      setReceiptPreviewUrl(compressed.previewUrl);
+
+      const targetGroupId =
+        groupId || expense?.groupId || members[0]?.groupId || "general";
+
+      const [uploadOutcome, parseOutcome] = await Promise.allSettled([
+        uploadReceiptToStorage(
+          supabase,
+          targetGroupId,
+          compressed.blob,
+          compressed.extension,
+          compressed.mimeType
+        ),
+        parseReceiptWithAi(compressed.base64, compressed.mimeType),
+      ]);
+
+      if (uploadOutcome.status === "fulfilled") {
+        setReceiptUrl(uploadOutcome.value);
+      } else {
+        const reason =
+          uploadOutcome.reason instanceof Error
+            ? uploadOutcome.reason.message
+            : "Receipt upload failed.";
+        setError(reason);
+      }
+
+      if (parseOutcome.status === "fulfilled") {
+        const parsed = parseOutcome.value;
+        if (parsed.description) {
+          setDescription(parsed.description);
+        }
+        if (parsed.currency) {
+          setCurrency(parsed.currency === "EUR" ? "€" : "$");
+        }
+        if (parsed.date) {
+          setDate(parsed.date);
+        }
+        if (parsed.category) {
+          setIsCustomCategory(false);
+          setCategory(parsed.category);
+        }
+        if (
+          typeof parsed.amount === "number" &&
+          parsed.amount > 0 &&
+          splitMode !== "exact"
+        ) {
+          setAmount(parsed.amount.toFixed(2));
+        }
+        setReceiptStatusMessage("Receipt scanned & fields updated!");
+      } else {
+        setReceiptStatusMessage("Receipt attached (AI auto-fill unavailable).");
+      }
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error ? err.message : "Failed to process receipt file."
+      );
+      setReceiptStatusMessage(null);
+    } finally {
+      setIsScanningReceipt(false);
+      setIsUploadingReceipt(false);
+    }
+  };
+
+  const handleRemoveReceipt = () => {
+    setReceiptUrl(null);
+    setReceiptPreviewUrl(null);
+    setReceiptFileName("");
+    setReceiptStatusMessage(null);
+  };
 
   // Combine default preset categories with group-wide categories and current category
   const categoryOptions = useMemo(
@@ -352,6 +474,7 @@ export default function EditExpenseModal({
         currency,
         type,
         category: resolvedCategory,
+        receipt_url: type === "payment" ? null : receiptUrl,
         paid_by_member_id: payerId,
         date: date || getTodayLocalDate(),
       };
@@ -544,6 +667,137 @@ export default function EditExpenseModal({
             </button>
           </div>
         </div>
+
+        {/* Scan / Attach Receipt Section (Strictly for Group Expenses) */}
+        {type === "expense" && (
+          <div className="p-3.5 rounded-xl border border-blue-200/80 bg-blue-50/40 space-y-2.5">
+            <input
+              ref={receiptFileInputRef}
+              type="file"
+              accept="image/*,application/pdf"
+              onChange={handleReceiptFileChange}
+              className="hidden"
+            />
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Camera className="w-4 h-4 text-blue-600 shrink-0" />
+                <div>
+                  <span className="text-xs font-bold text-slate-800 block">
+                    Receipt Attachment & AI Auto-Fill
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    Attach or replace a receipt photo/PDF to auto-extract details
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isScanningReceipt || isUploadingReceipt}
+                onClick={() => receiptFileInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
+              >
+                {isScanningReceipt || isUploadingReceipt ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Scanning receipt...</span>
+                  </>
+                ) : (
+                  <>
+                    <Camera className="w-3.5 h-3.5" />
+                    <span>
+                      {receiptPreviewUrl || receiptUrl
+                        ? "Replace Receipt"
+                        : "Scan / Attach Receipt"}
+                    </span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {(receiptPreviewUrl || receiptUrl || isScanningReceipt) && (
+              <div className="flex items-center justify-between gap-3 pt-2 border-t border-blue-100">
+                <div className="flex items-center gap-3 min-w-0">
+                  {receiptPreviewUrl &&
+                  !isPdfReceiptUrl(receiptUrl || receiptPreviewUrl) &&
+                  !receiptFileName.toLowerCase().endsWith(".pdf") ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetUrl = receiptUrl || receiptPreviewUrl;
+                        if (targetUrl && onViewReceipt) {
+                          onViewReceipt(targetUrl, description || "Receipt");
+                        } else if (targetUrl) {
+                          window.open(targetUrl, "_blank", "noopener,noreferrer");
+                        }
+                      }}
+                      title="View full receipt"
+                      className="relative w-12 h-12 rounded-lg overflow-hidden border border-slate-200 bg-white shrink-0 group cursor-pointer"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={receiptPreviewUrl}
+                        alt="Receipt preview"
+                        className="w-full h-full object-cover group-hover:opacity-90 transition"
+                      />
+                    </button>
+                  ) : (
+                    <div className="w-12 h-12 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-blue-600 shrink-0">
+                      <FileText className="w-5 h-5" />
+                    </div>
+                  )}
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-slate-800 truncate">
+                      {receiptFileName || "Attached Receipt"}
+                    </div>
+                    {isScanningReceipt || isUploadingReceipt ? (
+                      <div className="text-[11px] text-blue-600 font-medium flex items-center gap-1 mt-0.5">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span>Scanning receipt...</span>
+                      </div>
+                    ) : receiptStatusMessage ? (
+                      <div className="text-[11px] text-emerald-700 font-medium mt-0.5">
+                        {receiptStatusMessage}
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        Saved with this expense
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {(receiptUrl || receiptPreviewUrl) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetUrl = receiptUrl || receiptPreviewUrl;
+                        if (targetUrl && onViewReceipt) {
+                          onViewReceipt(targetUrl, description || "Receipt");
+                        } else if (targetUrl) {
+                          window.open(targetUrl, "_blank", "noopener,noreferrer");
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-blue-700 bg-white hover:bg-blue-50 border border-blue-200 transition cursor-pointer"
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                      <span>View</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleRemoveReceipt}
+                    title="Remove receipt"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold text-red-600 bg-white hover:bg-red-50 border border-red-200 transition cursor-pointer"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>Remove</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Paid By & Amount */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

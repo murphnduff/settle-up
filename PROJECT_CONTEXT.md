@@ -29,7 +29,7 @@
 ### 2.2 Database Tables & Schema
 - **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `created_at` (TIMESTAMPTZ).
 - **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ). Unique constraint on `(group_id, lower(display_name))`.
-- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
+- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (`'USD'` | `'EUR'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
 - **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
 
 ---
@@ -97,6 +97,16 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Spend by Category Breakdown:** Aggregates `amount_cents` grouped by `category` per currency strictly for `type === 'expense'` (excluding payments), sorted descending by spend with formatted totals, percentage of group spend, and progress bars.
 - **Lossless CSV Mapping:** Maps `expenses.category` directly to/from the 3rd CSV column (`Category`).
 
+### 4.6 Receipt Attachments & AI Receipt Extraction (`src/lib/receipts.ts` & `/api/parse-receipt`)
+- **Client-Side Compression & Storage (`src/lib/receipts.ts`):**
+  - Resizes receipt images (`image/jpeg`, `image/png`, `image/webp`) larger than `1600px` down to `1600px` max dimension at JPEG quality `0.82` via HTML5 `<canvas>` (passing PDFs through as-is).
+  - Uploads receipts to the Supabase Storage `'receipts'` bucket at `${groupId}/${crypto.randomUUID()}.${ext}` and persists the public URL in `expenses.receipt_url`.
+- **AI Receipt Extraction Route (`src/app/api/parse-receipt/route.ts`):**
+  - `POST /api/parse-receipt` calls the Gemini REST API (`gemini-3.8-flash` with `GEMINI_API_KEY` and `responseMimeType: "application/json"`) to extract `{ description, amount, currency, date, category }`.
+  - Pre-fills the Add/Edit Transaction form in parallel with the storage upload (preserving auto-summed `Amount` if the user is in `'$ Exact'` split mode).
+- **Ledger Receipt Badge & Lightbox Modal:**
+  - Transactions with a non-null `receipt_url` display a clickable `Receipt` badge in the ledger that opens a `<dialog closedby="any">` Lightbox Modal for full-size images or embedded/linked PDFs.
+
 ---
 
 ## 5. Active Backlog & Future Development Roadmap
@@ -120,7 +130,7 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 6. **Automated Daily Snapshots:**
    - Scheduled GitHub Action or cron task pulling daily table dumps into timestamped private archives.
 
-### Phase 1.4: Receipts & AI Vision
-7. **Receipt Attachments & Extraction:**
-   - Supabase Storage upload for receipts + Gemini Multimodal API route to auto-extract merchant, date, amount, currency, and category.
-   
+### Phase 1.4: Receipts & AI Vision (Completed ✅)
+7. ✅ **Receipt Attachments & AI Receipt Extraction (OCR):**
+   - Client-side HTML5 `<canvas>` compression (`1600px`, `0.82` JPEG quality) + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
+   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`gemini-3.8-flash`) with parallel upload + auto-fill in Add/Edit Transaction forms, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
