@@ -16,7 +16,8 @@ import {
   buildGroupCurrencies,
 } from "@/lib/currencies";
 import {
-  compressReceiptFile,
+  prepareFastAiReceiptPayload,
+  compressReceiptForStorage,
   uploadReceiptToStorage,
   parseReceiptWithAi,
   isPdfReceiptUrl,
@@ -239,6 +240,7 @@ export default function EditExpenseModal({
     e.target.value = "";
     if (!file) return;
 
+    const scanStartedAt = performance.now();
     setError(null);
     setReceiptScanError(null);
     setReceiptFileName(file.name);
@@ -247,18 +249,19 @@ export default function EditExpenseModal({
     setReceiptStatusMessage("Scanning receipt...");
 
     try {
-      const compressed = await compressReceiptFile(file);
-      setReceiptPreviewUrl(compressed.previewUrl);
+      // 1. Immediately generate tiny 800px @ 0.65 JPEG thumbnail and fire /api/parse-receipt right away
+      const fastAi = await prepareFastAiReceiptPayload(file, 800, 0.65);
+      setReceiptPreviewUrl(fastAi.previewUrl);
 
       const targetGroupId =
         groupId || expense?.groupId || members[0]?.groupId || "general";
 
-      // 1. Trigger AI OCR immediately using the compact 1024px @ 0.70 payload and populate fields the instant it resolves
-      const parseTask = parseReceiptWithAi(
-        compressed.aiBase64,
-        compressed.mimeType
-      )
+      const parseTask = parseReceiptWithAi(fastAi.aiBase64, fastAi.mimeType)
         .then((parsed) => {
+          const elapsedSec = (
+            (parsed.durationMs ?? performance.now() - scanStartedAt) / 1000
+          ).toFixed(1);
+
           if (parsed.description) {
             setDescription(parsed.description);
           }
@@ -294,7 +297,9 @@ export default function EditExpenseModal({
           ) {
             setAmount(parsed.amount.toFixed(2));
           }
-          setReceiptStatusMessage("Receipt scanned & fields updated!");
+          setReceiptStatusMessage(
+            `Receipt attached & scanned (${elapsedSec}s)`
+          );
         })
         .catch((err: unknown) => {
           const reason =
@@ -306,25 +311,30 @@ export default function EditExpenseModal({
           setIsScanningReceipt(false);
         });
 
-      // 2. Upload crisp 1600px @ 0.82 receipt to Supabase Storage in parallel
-      const uploadTask = uploadReceiptToStorage(
-        supabase,
-        targetGroupId,
-        compressed.blob,
-        compressed.extension,
-        compressed.mimeType
-      )
-        .then((uploadedUrl) => {
+      // 2. Run 1600px @ 0.82 compression + Supabase Storage upload concurrently in the background
+      const uploadTask = (async () => {
+        try {
+          const storagePayload = await compressReceiptForStorage(
+            file,
+            1600,
+            0.82
+          );
+          const uploadedUrl = await uploadReceiptToStorage(
+            supabase,
+            targetGroupId,
+            storagePayload.blob,
+            storagePayload.extension,
+            storagePayload.mimeType
+          );
           setReceiptUrl(uploadedUrl);
-        })
-        .catch((err: unknown) => {
+        } catch (err: unknown) {
           const reason =
             err instanceof Error ? err.message : "Receipt upload failed.";
           setError(reason);
-        })
-        .finally(() => {
+        } finally {
           setIsUploadingReceipt(false);
-        });
+        }
+      })();
 
       await Promise.all([parseTask, uploadTask]);
     } catch (err: unknown) {
@@ -768,11 +778,11 @@ export default function EditExpenseModal({
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
-                  disabled={isScanningReceipt || isUploadingReceipt}
+                  disabled={isScanningReceipt}
                   onClick={() => receiptCameraInputRef.current?.click()}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
                 >
-                  {isScanningReceipt || isUploadingReceipt ? (
+                  {isScanningReceipt ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       <span>Scanning...</span>
@@ -786,7 +796,7 @@ export default function EditExpenseModal({
                 </button>
                 <button
                   type="button"
-                  disabled={isScanningReceipt || isUploadingReceipt}
+                  disabled={isScanningReceipt}
                   onClick={() => receiptFileInputRef.current?.click()}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
                 >
@@ -795,7 +805,7 @@ export default function EditExpenseModal({
                 </button>
                 <button
                   type="button"
-                  disabled={isScanningReceipt || isUploadingReceipt}
+                  disabled={isScanningReceipt}
                   onClick={() => receiptPdfInputRef.current?.click()}
                   title="Attach a PDF receipt"
                   className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-slate-700 border border-slate-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
@@ -849,14 +859,20 @@ export default function EditExpenseModal({
                       <div className="text-xs font-semibold text-slate-800 truncate">
                         {receiptFileName || "Attached Receipt"}
                       </div>
-                      {isScanningReceipt || isUploadingReceipt ? (
+                      {isScanningReceipt ? (
                         <div className="text-[11px] text-blue-600 font-medium flex items-center gap-1 mt-0.5">
                           <Loader2 className="w-3 h-3 animate-spin" />
                           <span>Scanning receipt...</span>
                         </div>
                       ) : receiptStatusMessage ? (
-                        <div className="text-[11px] text-emerald-700 font-medium mt-0.5">
-                          {receiptStatusMessage}
+                        <div className="text-[11px] text-emerald-700 font-medium flex items-center gap-1.5 mt-0.5">
+                          <span>{receiptStatusMessage}</span>
+                          {isUploadingReceipt && (
+                            <span className="text-[10px] text-slate-400 inline-flex items-center gap-1">
+                              <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                              uploading...
+                            </span>
+                          )}
                         </div>
                       ) : (
                         <div className="text-[11px] text-slate-500 mt-0.5">

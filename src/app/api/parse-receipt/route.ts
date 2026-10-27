@@ -3,28 +3,23 @@ import { EXPENSE_CATEGORIES } from "@/lib/reconciliation";
 import { normalizeParsedReceipt } from "@/lib/receipts";
 
 const CANDIDATE_MODELS = [
-  "gemini-flash-lite-latest",
   "gemini-2.5-flash-lite",
-  "gemini-flash-latest",
+  "gemini-flash-lite-latest",
   "gemini-2.5-flash",
+  "gemini-flash-latest",
 ];
 
-const RECEIPT_EXTRACTION_PROMPT = `You are an expert financial receipt parser for a group expense-splitting app.
-Analyze the attached receipt image or PDF and extract the transaction details into strict JSON with the following exact keys:
-{
-  "description": "Merchant name + brief summary (e.g. 'Dunnes Stores - Groceries' or 'Delta Air Lines - Flights')",
-  "amount": 42.50,
-  "currency": "USD" | "EUR" | "AUD" | "THB" | "GBP" | "CAD" | "JPY" | "NZD" | "CHF" | "MXN",
-  "date": "YYYY-MM-DD",
-  "category": "Category name"
-}
-
+const RECEIPT_EXTRACTION_PROMPT = `Extract receipt details into strict JSON:
+{"description":"Merchant + brief item","amount":0.00,"currency":"USD","date":"YYYY-MM-DD","category":"Category"}
 Rules:
-1. "amount": Use the final total charged (including tax and tip if shown), as a positive number with up to 2 decimal places.
-2. "currency": Return the 3-letter ISO currency code detected on the receipt (e.g. "THB" if ฿ / Baht / Thailand, "AUD" if A$ / GST in Australia, "EUR" if € / Euro, "GBP" if £, "CAD" if C$, "JPY" if ¥, "NZD" if NZ$, "CHF", "MXN", or "USD" if $ / default).
-3. "date": Return the transaction date in strict YYYY-MM-DD format. If no year is printed, infer the current year. If no date is visible, omit or return an empty string.
-4. "category": Prefer one of our standard categories [${EXPENSE_CATEGORIES.join(", ")}], OR if the receipt clearly belongs to another specific category (e.g. "Parking", "Tolls", "Golf", "Pharmacy"), return that concise 1-2 word category name.
-5. Return ONLY valid JSON.`;
+- amount: final total charged (positive number).
+- currency: 3-letter ISO code (USD, EUR, AUD, THB, GBP, CAD, JPY, NZD, CHF, MXN).
+- date: YYYY-MM-DD (infer current year if omitted; "" if none).
+- category: one of [${EXPENSE_CATEGORIES.join(", ")}] or a 1-2 word custom category.`;
+
+function supportsThinkingConfig(modelName: string): boolean {
+  return /gemini-(2\.5|3)/i.test(modelName);
+}
 
 function isRetryableOrCascadeError(status: number, errMsg: string): boolean {
   if (
@@ -93,6 +88,7 @@ async function discoverLatestFlashModels(
 }
 
 export async function POST(request: NextRequest) {
+  const startedAt = Date.now();
   try {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
     if (!apiKey) {
@@ -145,8 +141,8 @@ export async function POST(request: NextRequest) {
       contents: baseContents,
       generationConfig: {
         responseMimeType: "application/json",
-        temperature: 0.1,
-        maxOutputTokens: 300,
+        temperature: 0,
+        maxOutputTokens: 200,
         ...(includeThinkingZero
           ? { thinkingConfig: { thinkingBudget: 0 } }
           : {}),
@@ -155,72 +151,124 @@ export async function POST(request: NextRequest) {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let geminiJson: any = null;
+    let modelUsed = "";
     let primaryErrorMsg = "";
     const triedModels = new Set<string>();
 
-    const tryModelList = async (candidates: string[]): Promise<boolean> => {
-      for (const modelName of candidates) {
-        triedModels.add(modelName);
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-          modelName
-        )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callSingleModel = async (modelName: string): Promise<{ modelName: string; json: any }> => {
+      triedModels.add(modelName);
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        modelName
+      )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-        let geminiRes = await fetch(endpoint, {
+      const useThinkingZero = supportsThinkingConfig(modelName);
+      let geminiRes = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildRequestBody(useThinkingZero)),
+      });
+
+      if (geminiRes.ok) {
+        return { modelName, json: await geminiRes.json() };
+      }
+
+      let errData = await geminiRes.json().catch(() => ({}));
+      let currentErrorMsg: string =
+        errData?.error?.message ||
+        `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+
+      // If a model unexpectedly rejected thinkingConfig, retry once without it
+      if (useThinkingZero && geminiRes.status === 400 && /thinking/i.test(currentErrorMsg)) {
+        geminiRes = await fetch(endpoint, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(buildRequestBody(true)),
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildRequestBody(false)),
         });
 
         if (geminiRes.ok) {
-          geminiJson = await geminiRes.json();
+          return { modelName, json: await geminiRes.json() };
+        }
+
+        errData = await geminiRes.json().catch(() => ({}));
+        currentErrorMsg =
+          errData?.error?.message ||
+          `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+      }
+
+      if (!primaryErrorMsg) {
+        primaryErrorMsg = currentErrorMsg;
+      }
+
+      const err = new Error(currentErrorMsg) as Error & { retryable?: boolean };
+      err.retryable = isRetryableOrCascadeError(geminiRes.status, currentErrorMsg);
+      throw err;
+    };
+
+    // Hedged parallel race: start primary model immediately; if it hasn't responded within 3500ms
+    // (or fails with 404/429/500/503), immediately launch the next fallback model in parallel.
+    const tryModelListWithHedge = async (candidates: string[]): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const activePromises: Array<Promise<{ modelName: string; json: any }>> = [];
+      let resolvedWinner: { modelName: string; json: unknown } | null = null;
+
+      for (const candidate of candidates) {
+        const p = callSingleModel(candidate).then((res) => {
+          if (!resolvedWinner) {
+            resolvedWinner = res;
+          }
+          return res;
+        });
+        activePromises.push(p);
+
+        const raceOutcome = await Promise.race([
+          Promise.any(activePromises).then((win) => ({
+            type: "win" as const,
+            win,
+          })),
+          p.then(
+            (win) => ({ type: "win" as const, win }),
+            (err: Error & { retryable?: boolean }) => ({
+              type: "err" as const,
+              err,
+            })
+          ),
+          new Promise<{ type: "timeout" }>((resolve) =>
+            setTimeout(() => resolve({ type: "timeout" }), 3500)
+          ),
+        ]);
+
+        if (raceOutcome.type === "win") {
+          geminiJson = raceOutcome.win.json;
+          modelUsed = raceOutcome.win.modelName;
           return true;
         }
 
-        let errData = await geminiRes.json().catch(() => ({}));
-        let currentErrorMsg: string =
-          errData?.error?.message ||
-          `Gemini API (${modelName}) returned status ${geminiRes.status}`;
-
-        // Fallback cleanly if a model rejects thinkingConfig
         if (
-          geminiRes.status === 400 &&
-          /thinking/i.test(currentErrorMsg)
+          raceOutcome.type === "err" &&
+          raceOutcome.err.retryable === false &&
+          activePromises.length === 1
         ) {
-          geminiRes = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(buildRequestBody(false)),
-          });
-
-          if (geminiRes.ok) {
-            geminiJson = await geminiRes.json();
-            return true;
-          }
-
-          errData = await geminiRes.json().catch(() => ({}));
-          currentErrorMsg =
-            errData?.error?.message ||
-            `Gemini API (${modelName}) returned status ${geminiRes.status}`;
+          return false;
         }
+        // Otherwise (timeout > 3500ms or retryable 404/429/503 error), immediately launch next candidate!
+      }
 
-        if (!primaryErrorMsg) {
-          primaryErrorMsg = currentErrorMsg;
-        }
-
-        if (!isRetryableOrCascadeError(geminiRes.status, currentErrorMsg)) {
-          primaryErrorMsg = currentErrorMsg;
+      if (activePromises.length > 0) {
+        try {
+          const win = await Promise.any(activePromises);
+          geminiJson = win.json;
+          modelUsed = win.modelName;
+          return true;
+        } catch {
           return false;
         }
       }
       return false;
     };
 
-    // 1. Try configured/rolling candidate models
-    await tryModelList(modelsToTry);
+    // 1. Try configured/rolling candidate models with 3500ms hedged timeout race
+    await tryModelListWithHedge(modelsToTry);
 
     // 2. Dynamic auto-discovery fallback if all static candidates failed
     if (!geminiJson) {
@@ -229,7 +277,7 @@ export async function POST(request: NextRequest) {
         triedModels
       );
       if (discoveredModels.length > 0) {
-        await tryModelList(discoveredModels);
+        await tryModelListWithHedge(discoveredModels);
       }
     }
 
@@ -291,7 +339,16 @@ export async function POST(request: NextRequest) {
     }
 
     const normalized = normalizeParsedReceipt(parsedObj);
-    return NextResponse.json({ ok: true, ...normalized }, { status: 200 });
+    const durationMs = Date.now() - startedAt;
+    return NextResponse.json(
+      {
+        ok: true,
+        ...normalized,
+        modelUsed,
+        durationMs,
+      },
+      { status: 200 }
+    );
   } catch (err: unknown) {
     const message =
       err instanceof Error ? err.message : "Unexpected error parsing receipt.";

@@ -8,14 +8,29 @@ export interface ParsedReceiptData {
   currency?: string;
   date?: string;
   category?: string;
+  modelUsed?: string;
+  durationMs?: number;
+}
+
+export interface FastAiReceiptPayload {
+  aiBase64: string;
+  mimeType: string;
+  previewUrl: string;
+  isPdf: boolean;
+}
+
+export interface StorageReceiptPayload {
+  blob: Blob;
+  extension: string;
+  mimeType: string;
 }
 
 export interface CompressedReceiptResult {
   /** Crisp 1600px (0.82 quality) JPEG Blob for Supabase Storage upload */
   blob: Blob;
-  /** Compact 1024px (0.70 quality) JPEG base64 string for fast AI OCR */
+  /** Compact 800px (0.65 quality) JPEG base64 string for fast AI OCR */
   base64: string;
-  /** Explicit alias for the compact 1024px (0.70 quality) AI payload */
+  /** Explicit alias for the compact 800px (0.65 quality) AI payload */
   aiBase64: string;
   mimeType: string;
   extension: string;
@@ -79,6 +94,17 @@ export function normalizeParsedReceipt(raw: unknown): ParsedReceiptData {
     }
   }
 
+  if (typeof record.modelUsed === "string" && record.modelUsed.trim()) {
+    result.modelUsed = record.modelUsed.trim();
+  }
+
+  if (
+    typeof record.durationMs === "number" &&
+    Number.isFinite(record.durationMs)
+  ) {
+    result.durationMs = Math.round(record.durationMs);
+  }
+
   return result;
 }
 
@@ -118,11 +144,10 @@ function loadImageElement(file: File): Promise<HTMLImageElement> {
   });
 }
 
-function renderImageToJpegDataUrl(
+function renderImageToCanvas(
   img: HTMLImageElement,
-  maxDimension: number,
-  quality: number
-): string {
+  maxDimension: number
+): HTMLCanvasElement {
   const origWidth = img.naturalWidth || img.width || 1;
   const origHeight = img.naturalHeight || img.height || 1;
 
@@ -150,38 +175,39 @@ function renderImageToJpegDataUrl(
   ctx.fillRect(0, 0, targetWidth, targetHeight);
   ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
 
-  return canvas.toDataURL("image/jpeg", quality);
+  return canvas;
+}
+
+function renderImageToJpegDataUrl(
+  img: HTMLImageElement,
+  maxDimension: number,
+  quality: number
+): string {
+  return renderImageToCanvas(img, maxDimension).toDataURL(
+    "image/jpeg",
+    quality
+  );
 }
 
 /**
- * Dual-resolution client compression:
- * 1. Generates a compact 1024px max-dimension JPEG at 0.70 quality (`aiBase64` / `base64`)
- *    specifically for `POST /api/parse-receipt` (reduces payload size & vision token latency by ~65%).
- * 2. Generates a crisp 1600px max-dimension JPEG at 0.82 quality (`blob` / `previewUrl`)
- *    for the Supabase Storage `'receipts'` bucket upload.
- * Falls back to raw file base64 if canvas decoding fails. Passes PDFs through as-is.
+ * Step 1 (Ultra-Fast, <50ms): Immediately generates a tiny 800px max-dimension JPEG (0.65 quality, ~40KB-60KB)
+ * specifically for `POST /api/parse-receipt` so the AI request fires before any 1600px storage compression begins.
  */
-export async function compressReceiptFile(
+export async function prepareFastAiReceiptPayload(
   file: File,
-  storageMaxDimension = 1600,
-  storageQuality = 0.82,
-  aiMaxDimension = 1024,
-  aiQuality = 0.7
-): Promise<CompressedReceiptResult> {
+  aiMaxDimension = 800,
+  aiQuality = 0.65
+): Promise<FastAiReceiptPayload> {
   const fileName = file.name || "";
   const isPdf =
     file.type === "application/pdf" || /\.pdf$/i.test(fileName);
 
   if (isPdf) {
     const base64 = await readBlobAsBase64(file);
-    const previewUrl = URL.createObjectURL(file);
     return {
-      blob: file,
-      base64,
-      aiBase64: base64,
+      aiBase64: base64.replace(/^data:[^;]+;base64,/i, ""),
       mimeType: "application/pdf",
-      extension: "pdf",
-      previewUrl,
+      previewUrl: URL.createObjectURL(file),
       isPdf: true,
     };
   }
@@ -194,79 +220,134 @@ export async function compressReceiptFile(
   if (isLikelyImage) {
     try {
       const img = await loadImageElement(file);
-
-      // 1. Compact 1024px @ 0.70 quality JPEG for fast AI OCR
       const aiDataUrl = renderImageToJpegDataUrl(
         img,
         aiMaxDimension,
         aiQuality
       );
-      const aiCleanBase64 = aiDataUrl.replace(/^data:[^;]+;base64,/i, "");
-
-      // 2. Crisp 1600px @ 0.82 quality JPEG for Supabase Storage
-      const storageDataUrl = renderImageToJpegDataUrl(
-        img,
-        storageMaxDimension,
-        storageQuality
-      );
-      const storageCleanBase64 = storageDataUrl.replace(
-        /^data:[^;]+;base64,/i,
-        ""
-      );
-
-      const byteString = atob(storageCleanBase64);
-      const byteNumbers = new Uint8Array(byteString.length);
-      for (let i = 0; i < byteString.length; i++) {
-        byteNumbers[i] = byteString.charCodeAt(i);
-      }
-      const blob = new Blob([byteNumbers], { type: "image/jpeg" });
-
       return {
-        blob,
-        base64: aiCleanBase64,
-        aiBase64: aiCleanBase64,
+        aiBase64: aiDataUrl.replace(/^data:[^;]+;base64,/i, ""),
         mimeType: "image/jpeg",
-        extension: "jpg",
-        previewUrl: storageDataUrl,
+        previewUrl: aiDataUrl,
         isPdf: false,
       };
     } catch {
-      // Fallback: if <canvas> decoding fails (e.g. raw HEIC or unusual container), read raw file base64
       const rawBase64 = await readBlobAsBase64(file);
-      const cleanBase64 = rawBase64.replace(/^data:[^;]+;base64,/i, "");
-      const fallbackMime =
-        file.type && file.type.startsWith("image/") ? file.type : "image/jpeg";
-      const extMatch = fileName.match(/\.([a-z0-9]+)$/i);
-      const fallbackExt = extMatch ? extMatch[1].toLowerCase() : "jpg";
       return {
-        blob: file,
-        base64: cleanBase64,
-        aiBase64: cleanBase64,
-        mimeType: fallbackMime,
-        extension: fallbackExt,
+        aiBase64: rawBase64.replace(/^data:[^;]+;base64,/i, ""),
+        mimeType:
+          file.type && file.type.startsWith("image/")
+            ? file.type
+            : "image/jpeg",
         previewUrl: URL.createObjectURL(file),
         isPdf: false,
       };
     }
   }
 
-  // Generic fallback for any other file
   const rawBase64 = await readBlobAsBase64(file);
-  const cleanBase64 = rawBase64.replace(/^data:[^;]+;base64,/i, "");
   return {
-    blob: file,
-    base64: cleanBase64,
-    aiBase64: cleanBase64,
+    aiBase64: rawBase64.replace(/^data:[^;]+;base64,/i, ""),
     mimeType: file.type || "image/jpeg",
-    extension: "jpg",
     previewUrl: URL.createObjectURL(file),
     isPdf: false,
   };
 }
 
 /**
+ * Step 2 (Background Storage Compression): Compresses the image to a crisp 1600px JPEG (0.82 quality)
+ * using asynchronous `canvas.toBlob` so it never blocks the main thread or AI form auto-fill.
+ */
+export async function compressReceiptForStorage(
+  file: File,
+  storageMaxDimension = 1600,
+  storageQuality = 0.82
+): Promise<StorageReceiptPayload> {
+  const fileName = file.name || "";
+  const isPdf =
+    file.type === "application/pdf" || /\.pdf$/i.test(fileName);
+
+  if (isPdf) {
+    return {
+      blob: file,
+      extension: "pdf",
+      mimeType: "application/pdf",
+    };
+  }
+
+  const isLikelyImage =
+    file.type.startsWith("image/") ||
+    /\.(jpe?g|png|webp|heic|heif)$/i.test(fileName) ||
+    !file.type;
+
+  if (isLikelyImage) {
+    try {
+      const img = await loadImageElement(file);
+      const canvas = renderImageToCanvas(img, storageMaxDimension);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => {
+            if (b) resolve(b);
+            else reject(new Error("Canvas toBlob failed"));
+          },
+          "image/jpeg",
+          storageQuality
+        );
+      });
+      return {
+        blob,
+        extension: "jpg",
+        mimeType: "image/jpeg",
+      };
+    } catch {
+      const fallbackMime =
+        file.type && file.type.startsWith("image/") ? file.type : "image/jpeg";
+      const extMatch = fileName.match(/\.([a-z0-9]+)$/i);
+      const fallbackExt = extMatch ? extMatch[1].toLowerCase() : "jpg";
+      return {
+        blob: file,
+        extension: fallbackExt,
+        mimeType: fallbackMime,
+      };
+    }
+  }
+
+  return {
+    blob: file,
+    extension: "jpg",
+    mimeType: file.type || "image/jpeg",
+  };
+}
+
+/**
+ * Dual-resolution client compression helper (combines 800px @ 0.65 AI payload and 1600px @ 0.82 storage payload).
+ */
+export async function compressReceiptFile(
+  file: File,
+  storageMaxDimension = 1600,
+  storageQuality = 0.82,
+  aiMaxDimension = 800,
+  aiQuality = 0.65
+): Promise<CompressedReceiptResult> {
+  const [fastAi, storagePayload] = await Promise.all([
+    prepareFastAiReceiptPayload(file, aiMaxDimension, aiQuality),
+    compressReceiptForStorage(file, storageMaxDimension, storageQuality),
+  ]);
+
+  return {
+    blob: storagePayload.blob,
+    base64: fastAi.aiBase64,
+    aiBase64: fastAi.aiBase64,
+    mimeType: fastAi.mimeType,
+    extension: storagePayload.extension,
+    previewUrl: fastAi.previewUrl,
+    isPdf: fastAi.isPdf,
+  };
+}
+
+/**
  * Fetches a shared receipt URL (e.g. from `?shared_receipt=<url>`) and compresses it to a
- * compact 1024px @ 0.70 JPEG base64 payload for fast AI OCR extraction.
+ * tiny 800px @ 0.65 JPEG base64 payload for fast AI OCR extraction.
  */
 export async function compressRemoteReceiptForAi(
   receiptUrl: string
@@ -284,10 +365,10 @@ export async function compressRemoteReceiptForAi(
   const file = new File([blob], fileName, {
     type: blob.type || (isPdf ? "application/pdf" : "image/jpeg"),
   });
-  const compressed = await compressReceiptFile(file);
+  const fastAi = await prepareFastAiReceiptPayload(file, 800, 0.65);
   return {
-    base64: compressed.aiBase64,
-    mimeType: compressed.mimeType,
+    base64: fastAi.aiBase64,
+    mimeType: fastAi.mimeType,
   };
 }
 
