@@ -21,6 +21,8 @@ export const EXPENSE_CATEGORIES = [
   'Car Rental',
   'Gas',
   'Activities',
+  'Miscellaneous',
+  'Other',
 ] as const;
 
 /**

@@ -728,6 +728,8 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
       'Car Rental',
       'Gas',
       'Activities',
+      'Miscellaneous',
+      'Other',
     ]);
     const mergedCategories = buildGroupCategories([
       ...ledger,

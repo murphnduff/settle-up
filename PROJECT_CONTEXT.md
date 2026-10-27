@@ -138,7 +138,7 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 
 ### Phase 1.2: Expense Categorization & Custom Categories (Completed ✅)
 5. ✅ **Categories, Custom Categories & Spend Breakdown:**
-   - Added `category` column support on `expenses` with tailored presets (`General`, `Dining out`, `Groceries`, `Drinks`, `Lodging`, `Flights`, `Car Rental`, `Gas`, `Activities`), dynamic per-group category merging (`buildGroupCategories`), inline `+ Custom...` category input in Add/Edit forms, ledger badges, **Spend by Category** summary card (`calculateCategorySpend` tested in Edge Case 13), and lossless CSV `Category` column import/export.
+   - Added `category` column support on `expenses` with tailored presets (`General`, `Dining out`, `Groceries`, `Drinks`, `Lodging`, `Flights`, `Car Rental`, `Gas`, `Activities`, `Miscellaneous`, `Other`), dynamic per-group category merging (`buildGroupCategories`), inline `+ Custom...` category input in Add/Edit forms, ledger badges, **Spend by Category** summary card (`calculateCategorySpend` tested in Edge Case 13), and lossless CSV `Category` column import/export.
 
 ### Phase 1.3: Disaster Recovery & Snapshots (Next Up)
 6. **Automated Daily Snapshots:**
