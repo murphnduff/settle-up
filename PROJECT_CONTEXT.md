@@ -92,22 +92,21 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Read-Only Lock:** When `activeGroup.is_archived === true`, displays an `"Archived — Read-Only"` badge and banner, hides the "Add Transaction" form, and disables editing/deleting transactions or members while keeping `Export CSV` and `Copy Group Link` active.
 
 ### 4.5 Expense Categorization & Spend Breakdown (`calculateCategorySpend` & `buildGroupCategories`)
-- **Preset Categories (`EXPENSE_CATEGORIES`):** `['General', 'Dining out', 'Groceries', 'Drinks', 'Lodging', 'Flights', 'Car Rental', 'Gas', 'Activities']`.
-- **Dynamic Per-Group Categories (`buildGroupCategories`):** Combines the 9 preset categories with any unique custom `expense.category` values already present in the active group's `expenses` (excluding `'Payment'`). Any custom category added to a transaction or imported via CSV automatically becomes a 1-click pill option for all future transactions in that group.
+- **Preset Categories (`EXPENSE_CATEGORIES`):** `['General', 'Dining out', 'Groceries', 'Drinks', 'Lodging', 'Flights', 'Car Rental', 'Gas', 'Activities', 'Miscellaneous', 'Other']`.
+- **Dynamic Per-Group Categories (`buildGroupCategories`):** Combines the 11 preset categories with any unique custom `expense.category` values already present in the active group's `expenses` (excluding `'Payment'`). Any custom category added to a transaction or imported via CSV automatically becomes a 1-click pill option for all future transactions in that group.
 - **Inline `+ Custom...` Input:** Both the main **Add Transaction** form and `EditExpenseModal` include a `+ Custom...` pill button that reveals an inline text input for on-the-fly custom categories (e.g. `'Golf'`, `'Ski Passes'`, `'Tolls'`). Direct Payments hide the category selector and automatically store `'Payment'`.
 - **Spend by Category Breakdown:** Aggregates `amount_cents` grouped by `category` per currency strictly for `type === 'expense'` (excluding payments), sorted descending by spend with formatted totals, percentage of group spend, and progress bars.
 - **Lossless CSV Mapping:** Maps `expenses.category` directly to/from the 3rd CSV column (`Category`).
 
-### 4.6 Receipt Attachments & AI Receipt Extraction (`src/lib/receipts.ts` & `/api/parse-receipt`)
-- **Explicit Mobile & Desktop Capture Inputs:**
-  - Provides three side-by-side buttons in Add/Edit Transaction forms: **📷 Take Photo** (`accept="image/*" capture="environment"`), **🖼️ Photo Library** (`accept="image/*"` without `capture` so Android/iOS open the native photo gallery), and **📄 PDF** (`accept="application/pdf"`).
-- **Client-Side Compression & Storage (`src/lib/receipts.ts`):**
-  - Resizes receipt images (`image/jpeg`, `image/png`, `image/webp`, HEIC/Ultra-HDR JPEG) larger than `1600px` down to `1600px` max dimension at JPEG quality `0.80` via HTML5 `<canvas>` (with raw base64 fallback if canvas decoding fails, and passing PDFs through as-is).
-  - Uploads receipts to the Supabase Storage `'receipts'` bucket at `${groupId}/${crypto.randomUUID()}.${ext}` and persists the public URL in `expenses.receipt_url`.
+### 4.6 Receipt Attachments & Ultra-Fast AI Receipt Extraction (`src/lib/receipts.ts` & `/api/parse-receipt`)
+- **Compact 1-Line Receipt Auto-Scan Bar:**
+  - Provides three side-by-side non-wrapping buttons (`grid-cols-3` on mobile) in Add/Edit Transaction forms: **📷 Camera** (`accept="image/*" capture="environment"`), **🖼️ Photos** (`accept="image/*"` without `capture` so Android/iOS open the native photo gallery), and **📄 PDF** (`accept="application/pdf"`).
+- **Decoupled Ultra-Light Client Thumbnail + Background Storage Upload (`src/lib/receipts.ts`):**
+  - Immediately upon file selection, `prepareFastAiReceiptPayload` generates an `800px` max-dimension JPEG at `0.65` quality (~40–60KB) and fires `fetch('/api/parse-receipt')` within ~50ms without waiting for full-resolution compression or Supabase Storage upload.
+  - Concurrently in the background, `compressReceiptForStorage` resizes receipt images down to `1600px` max dimension at `0.82` JPEG quality and uploads to the Supabase Storage `'receipts'` bucket at `${groupId}/${crypto.randomUUID()}.${ext}`, persisting the public URL in `expenses.receipt_url`.
 - **AI Receipt Extraction Route (`src/app/api/parse-receipt/route.ts`):**
-  - `POST /api/parse-receipt` calls the Gemini REST API (`gemini-2.5-flash` with automatic fallback to `gemini-2.0-flash`, `GEMINI_API_KEY`, and `responseMimeType: "application/json"`) to extract `{ description, amount, currency, date, category }`.
-  - Prefers preset categories (`General`, `Dining out`, `Groceries`, `Drinks`, `Lodging`, `Flights`, `Car Rental`, `Gas`, `Activities`) or returns a concise 1–2 word custom category (e.g. `Parking`, `Tolls`, `Golf`, `Pharmacy`), which is automatically added to the group's category pills and selected.
-  - Pre-fills the Add/Edit Transaction form in parallel with the storage upload (preserving auto-summed `Amount` if the user is in `'$ Exact'` split mode) and surfaces diagnostic error banners if OCR fails.
+  - `POST /api/parse-receipt` tries `['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-flash-latest']` with conditional `thinkingConfig: { thinkingBudget: 0 }` on `2.5` models, `maxOutputTokens: 250`, `temperature: 0`, and a `3500ms` hedged parallel fallback race so slow requests never hang.
+  - Extracts `{ description, amount, currency, date, category }` (preferring the 11 preset categories or returning a concise 1–2 word custom category) and returns timing diagnostics (`durationMs`, `modelUsed`) displayed in the UI (`"Receipt scanned (1.2s)"`).
 - **Ledger Receipt Badge & Lightbox Modal:**
   - Transactions with a non-null `receipt_url` display a clickable `Receipt` badge in the ledger that opens a `<dialog closedby="any">` Lightbox Modal for full-size images or embedded/linked PDFs.
 
@@ -115,11 +114,25 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Supported Currency Catalog (`SUPPORTED_CURRENCIES`):**
   - First-class support for `USD` (`$`), `EUR` (`€`), `AUD` (`A$`), `THB` (`฿`), `GBP` (`£`), `CAD` (`C$`), `JPY` (`¥`), `NZD` (`NZ$`), `CHF` (`CHF`), `MXN` (`Mex$`), plus any custom 3-letter ISO currency code via `formatCurrency(cents, currencyCode)`.
 - **Per-Group Currency Management:**
-  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency selection in Create Group and a **Manage Group Currencies** modal (`Currencies (...)` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
+  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency selection in Create Group and a **Manage Group Currencies** modal (`Currencies` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
   - **Clean Single-Currency UX:** Groups with only 1 currency enabled hide currency switcher tabs and dropdowns so the UI stays minimal.
   - **Auto-Enable on AI Receipt Scan & CSV Import:** Scanning a receipt or importing a CSV with a new currency automatically appends that currency to `group.currencies`.
 - **Cross-Currency Conversion & "🌐 Unified Settlement (Convert All)" Mode:**
   - Available whenever a group has 2+ currencies. Includes a target currency selector, **Fetch Live Rates** (`https://open.er-api.com/v6/latest/${targetCurrency}`), editable exchange rate overrides persisted in `groups.exchange_rates`, and unified Member Summary + Settlement Plan with secondary currency equivalents (tested in Edge Case 15).
+
+### 4.8 Streamlined Dashboard Hierarchy, Mobile-First Layout & Custom PWA App Icons
+- **Single-Line Top Navbar & Collapsible Mobile Group Switcher (`< lg`):**
+  - Hides the header subtitle on mobile (`hidden sm:block`) and collapses the Groups/Create Group sidebar into a compact top bar button (`📂 Groups (<Active Group>) ▾ Switch`) when viewing a group on mobile so the active group header, balances, and transaction form appear immediately above the fold. On desktop (`lg+`), the left sidebar remains visible and sticky (`lg:sticky lg:top-6`).
+- **Compact 2-Row Group Header Card:**
+  - **Row 1:** Group Name, member count pill, inline spent summary pills (`$X Spent` per currency + `N txns`), primary `Copy Link` and `Currencies` buttons, and a compact `⚙️ Manage` dropdown menu (`Manage Members`, `Export CSV`, and `Archive / Unarchive Group`).
+  - **Row 2:** Single horizontal identity bar (`Viewing as: [Murph] [Fitz (You)] [Kev] • Reset`).
+- **Unified Tabbed "Balances & Analytics" Card (`💸 Settle Up` | `👥 Members` | `🏷️ Categories`):**
+  - Consolidates **Settlement Plan** (`💸 Settle Up` with 1-click `Settle` buttons and Unified Settlement converter), **Member Summary** (`👥 Members`), and **Spend by Category** (`🏷️ Categories`) into a single 3-tab card placed in the sticky right column on desktop (`lg:sticky lg:top-6`) and directly above `Add Transaction` on mobile (`lg:hidden`).
+- **Fits-One-Screen "Add Transaction" Form & Ledger Filtering:**
+  - Compact 1-line receipt bar (`grid-cols-3` buttons on mobile), 2-column `Paid By` + `Amount` grid on both mobile and desktop, 3-column `Description` + `Date` row, and tight category/participant pills.
+  - **Transaction History** flows naturally on desktop (`lg:max-h-none`) and includes quick type filter pills (`All` | `Expenses` | `Payments`) plus a live search input filtering by description, category, payer, or recipient.
+- **Custom PWA App Icons (`public/icon-192.png`, `public/icon-512.png`, `public/apple-touch-icon.png`, `src/app/icon.tsx`, `src/app/apple-icon.tsx`):**
+  - Royal-blue to emerald gradient app icon (`#1e3a8a` → `#059669`) with ~20% maskable safe-zone padding, wired into `public/manifest.json` (`any` + `maskable`) and `src/app/layout.tsx` metadata for Android PWA, iOS Home Screen, and desktop browser tabs.
 
 ---
 
@@ -146,8 +159,8 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 
 ### Phase 1.4: Receipts & AI Vision (Completed ✅)
 7. ✅ **Receipt Attachments & AI Receipt Extraction (OCR):**
-   - Client-side HTML5 `<canvas>` compression (`1600px`, `0.80` JPEG quality) + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
-   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction (`['gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash']` with `thinkingConfig: { thinkingBudget: 0 }`, `maxOutputTokens: 300`, and dynamic model auto-discovery), dual-resolution client compression (`1024px @ 0.70` for fast AI OCR + `1600px @ 0.82` for crisp Supabase Storage), decoupled instant form auto-fill in Add/Edit Transaction forms, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
+   - Client-side HTML5 `<canvas>` compression + Supabase Storage `'receipts'` bucket upload (`expenses.receipt_url`).
+   - `POST /api/parse-receipt` Gemini Multimodal JSON extraction, dynamic category creation, ledger `Receipt` badge, and Lightbox Modal viewer (tested in Edge Case 14).
 
 ### Phase 1.5: Per-Group Custom Currencies & Cross-Currency Unified Reconciliation (Completed ✅)
 8. ✅ **Per-Group Custom Currencies & Unified Settlement:**
@@ -155,9 +168,15 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
    - Per-group `currencies`, `default_currency`, and `exchange_rates` management, clean single-currency UX, auto-enable on AI scan/CSV import, and **🌐 Unified Settlement (Convert All)** with live exchange rates (`open.er-api.com`), editable rate overrides, and zero-sum unified reconciliation (`calculateUnifiedReconciliation` tested in Edge Case 15).
 
 ### Phase 2: Fast AI OCR, 1-Click Settlement & Mobile PWA Web Share Target (Completed ✅)
-9. ✅ **4x–5x Faster Receipt Scanning:**
-   - Prioritizes `gemini-flash-lite-latest` & `gemini-2.5-flash-lite` with `thinkingBudget: 0` (`maxOutputTokens: 300`, `temperature: 0.1`), dual-resolution client compression (`1024px` @ `0.70` JPEG for AI vs. `1600px` @ `0.82` JPEG for storage), and decoupled form auto-fill that populates fields the instant `/api/parse-receipt` resolves without waiting for storage upload.
-10. ✅ **1-Click "Settle" Button in Settlement Plan:**
-    - Each settlement instruction (in both Per-Currency Ledgers and Unified Settlement mode) includes a **"Settle"** button (hidden when archived) that switches the Add Transaction form to `Direct Payment` mode, pre-fills debtor, creditor, exact transfer amount, currency, and `'Settlement Payment'`, and smoothly scrolls the highlighted form into view.
-11. ✅ **Mobile "Share Receipt to Settle Up" (`public/manifest.json` + `/share-receipt`):**
+9. ✅ **1-Click "Settle" Button in Settlement Plan:**
+   - Each settlement instruction (in both Per-Currency Ledgers and Unified Settlement mode) includes a **"Settle"** button (hidden when archived) that switches the Add Transaction form to `Direct Payment` mode, pre-fills debtor, creditor, exact transfer amount, currency, and `'Settlement Payment'`, and smoothly scrolls the highlighted form into view.
+10. ✅ **Mobile "Share Receipt to Settle Up" (`public/manifest.json` + `/share-receipt`):**
     - Configured PWA `share_target` in `public/manifest.json` and `POST /share-receipt` route handler (`src/app/share-receipt/route.ts`) that uploads shared images/PDFs to `receipts/shared/...` and redirects (`303 See Other`) to `/?shared_receipt=<url>` (or `/[slug]?shared_receipt=<url>`), where Settle Up automatically attaches the receipt, triggers AI OCR auto-fill, and cleans up the query string via `window.history.replaceState`.
+
+### Phase 3: UI & Usability Polish, Custom PWA Icons, and Fast Receipt OCR Optimization (Completed ✅)
+11. ✅ **Ultra-Fast Hedged Receipt OCR (`800px` Thumbnail + `gemini-2.5-flash-lite` 3.5s Hedged Race):**
+    - Client immediately generates an `800px` @ `0.65` JPEG (`prepareFastAiReceiptPayload`) and fires `/api/parse-receipt` before the `1600px` Supabase Storage upload starts, while the server runs `gemini-2.5-flash-lite` (`thinkingBudget: 0`, `maxOutputTokens: 250`) with a `3500ms` hedged parallel fallback to `gemini-2.5-flash` and returns scan timing diagnostics.
+12. ✅ **Custom PWA App Icons (`icon-192.png`, `icon-512.png`, `apple-touch-icon.png`, `icon.tsx`, `apple-icon.tsx`):**
+    - Generated royal-blue to emerald gradient icons with adaptive maskable safe-zone padding and wired `public/manifest.json` and `src/app/layout.tsx` metadata across Android, iOS, and desktop.
+13. ✅ **Streamlined Mobile & Desktop Dashboard Hierarchy:**
+    - Single-line mobile top navbar, collapsible mobile group switcher (`📂 Groups (<Name>) ▾ Switch`), sticky desktop sidebars (`lg:sticky lg:top-6`), compact 2-row Group Header with inline spent pills and `⚙️ Manage` menu, unified 3-tab **Balances & Analytics** card (`💸 Settle Up` | `👥 Members` | `🏷️ Categories`), compact fits-one-screen **Add Transaction** form, and **Transaction History** type filter pills (`All | Expenses | Payments`) + live search input.
