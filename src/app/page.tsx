@@ -65,7 +65,6 @@ import {
   Plus,
   Receipt,
   ArrowRightLeft,
-  Wallet,
   Sparkles,
   Edit3,
   Share2,
@@ -81,14 +80,13 @@ import {
   ChevronDown,
   ChevronRight,
   Lock,
-  Tag,
-  Camera,
   FileText,
   ExternalLink,
   Loader2,
   Globe,
   RefreshCw,
   Settings2,
+  Search,
 } from "lucide-react";
 import type { User, SupabaseClient } from "@supabase/supabase-js";
 
@@ -336,8 +334,17 @@ export function SettleUpDashboard({
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
   const [copiedGroupLink, setCopiedGroupLink] = useState(false);
   const [showArchivedGroups, setShowArchivedGroups] = useState(false);
+  const [isMobileGroupsOpen, setIsMobileGroupsOpen] = useState(false);
+  const [isManageMenuOpen, setIsManageMenuOpen] = useState(false);
+  const [analyticsTab, setAnalyticsTab] = useState<
+    "settle" | "members" | "categories"
+  >("settle");
   const [historyCurrencyFilter, setHistoryCurrencyFilter] =
     useState<string>("all");
+  const [historyTypeFilter, setHistoryTypeFilter] = useState<
+    "all" | "expense" | "payment"
+  >("all");
+  const [historySearchQuery, setHistorySearchQuery] = useState<string>("");
   const [notification, setNotification] = useState<{
     type: "success" | "error";
     message: string;
@@ -735,6 +742,8 @@ export function SettleUpDashboard({
   // Switch active group and sync browser URL to /<slug>
   const handleSelectGroup = (group: Group) => {
     setActiveGroupId(group.id);
+    setIsMobileGroupsOpen(false);
+    setIsManageMenuOpen(false);
     addRecentGroupId(group.id);
     if (typeof window !== "undefined") {
       const slugOrId = group.slug || generateGroupSlug(group.name) || group.id;
@@ -802,7 +811,11 @@ export function SettleUpDashboard({
     setCurrency(defCur);
     setUnifiedTargetCurrency(defCur);
     setHistoryCurrencyFilter("all");
+    setHistoryTypeFilter("all");
+    setHistorySearchQuery("");
     setIsUnifiedMode(false);
+    setIsManageMenuOpen(false);
+    setIsMobileGroupsOpen(false);
 
     const savedRates = activeGroup.exchange_rates || {};
     const initialInputs: Record<string, string> = { [defCur]: "1" };
@@ -876,14 +889,46 @@ export function SettleUpDashboard({
     [activeGroupCurrencies, displayCurrencies]
   );
 
-  // Filtered transactions for the ledger
+  // Filtered transactions for the ledger (Currency + Type + Search Query)
   const filteredExpenses = useMemo(() => {
-    if (historyCurrencyFilter === "all") return expenses;
-    const filterCode = normalizeCurrencyCode(historyCurrencyFilter);
-    return expenses.filter(
-      (e) => normalizeCurrencyCode(e.currency) === filterCode
-    );
-  }, [expenses, historyCurrencyFilter]);
+    const query = historySearchQuery.trim().toLowerCase();
+    return expenses.filter((e) => {
+      if (historyCurrencyFilter !== "all") {
+        const filterCode = normalizeCurrencyCode(historyCurrencyFilter);
+        if (normalizeCurrencyCode(e.currency) !== filterCode) return false;
+      }
+      if (historyTypeFilter !== "all" && e.type !== historyTypeFilter) {
+        return false;
+      }
+      if (query) {
+        const payerMember = members.find(
+          (m) => m.id === e.paidByMemberId || m.id === e.payerId
+        );
+        const payerName = (payerMember?.name || "").toLowerCase();
+        const recipientNames = e.splits
+          .map((s) => members.find((m) => m.id === s.memberId)?.name || "")
+          .join(" ")
+          .toLowerCase();
+        const desc = (e.description || "").toLowerCase();
+        const cat = (e.category || "General").toLowerCase();
+        if (
+          !desc.includes(query) &&
+          !cat.includes(query) &&
+          !payerName.includes(query) &&
+          !recipientNames.includes(query)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [
+    expenses,
+    historyCurrencyFilter,
+    historyTypeFilter,
+    historySearchQuery,
+    members,
+  ]);
 
   // Memoized settlement calculations
   const settlements: SettlementInstruction[] = useMemo(() => {
@@ -2312,24 +2357,617 @@ export function SettleUpDashboard({
 
   const activeMemberObj = members.find((m) => m.id === activeMemberId);
 
+  const renderBalancesAndAnalyticsCard = () => (
+    <div className="bg-white border border-slate-200 p-4 sm:p-5 rounded-2xl shadow-xs space-y-3.5">
+      {/* 3 Segmented Tabs: Settle Up | Members | Categories */}
+      <div className="grid grid-cols-3 bg-slate-100 p-1 rounded-xl border border-slate-200/80 text-xs font-semibold gap-1">
+        <button
+          type="button"
+          onClick={() => setAnalyticsTab("settle")}
+          className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 truncate ${
+            analyticsTab === "settle"
+              ? "bg-white text-blue-700 shadow-2xs font-bold"
+              : "text-slate-600 hover:text-slate-900"
+          }`}
+        >
+          <span>💸</span>
+          <span className="truncate">Settle Up</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setAnalyticsTab("members")}
+          className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 truncate ${
+            analyticsTab === "members"
+              ? "bg-white text-blue-700 shadow-2xs font-bold"
+              : "text-slate-600 hover:text-slate-900"
+          }`}
+        >
+          <span>👥</span>
+          <span className="truncate">Members</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setAnalyticsTab("categories")}
+          className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 truncate ${
+            analyticsTab === "categories"
+              ? "bg-white text-blue-700 shadow-2xs font-bold"
+              : "text-slate-600 hover:text-slate-900"
+          }`}
+        >
+          <span>🏷️</span>
+          <span className="truncate">Categories</span>
+        </button>
+      </div>
+
+      {/* Shared Multi-Currency Unified Toggle (Visible on Settle Up & Members tabs when 2+ currencies exist) */}
+      {hasMultipleCurrencies && analyticsTab !== "categories" && (
+        <div className="space-y-2.5">
+          <button
+            type="button"
+            onClick={() => setIsUnifiedMode((prev) => !prev)}
+            className={`w-full py-2 px-3 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 cursor-pointer ${
+              isUnifiedMode
+                ? "bg-emerald-600 text-white border-emerald-600 shadow-2xs"
+                : "bg-emerald-50/70 hover:bg-emerald-100/80 text-emerald-900 border-emerald-200"
+            }`}
+          >
+            <Globe className="w-3.5 h-3.5 shrink-0" />
+            <span>
+              {isUnifiedMode
+                ? `🌐 Unified Settlement Active (${unifiedTargetCurrency})`
+                : "🌐 Unified Settlement (Convert All)"}
+            </span>
+          </button>
+
+          {isUnifiedMode && analyticsTab === "settle" && (
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <label className="font-semibold text-slate-700">
+                  Settle All In:
+                </label>
+                <select
+                  value={normalizeCurrencyCode(unifiedTargetCurrency)}
+                  onChange={(e) =>
+                    handleSelectUnifiedTargetCurrency(e.target.value)
+                  }
+                  className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+                >
+                  {activeGroupCurrencies.map((code) => (
+                    <option key={code} value={code}>
+                      {code} ({getCurrencySymbol(code)})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="space-y-2 pt-2 border-t border-slate-200/80">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-slate-600">
+                    Exchange Rates
+                  </span>
+                  <button
+                    type="button"
+                    disabled={isFetchingRates}
+                    onClick={handleFetchLiveRates}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 transition cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`w-3 h-3 ${
+                        isFetchingRates ? "animate-spin" : ""
+                      }`}
+                    />
+                    <span>
+                      {isFetchingRates ? "Fetching..." : "Fetch Live Rates"}
+                    </span>
+                  </button>
+                </div>
+
+                <div className="space-y-1.5">
+                  {activeGroupCurrencies
+                    .filter(
+                      (code) =>
+                        code !== normalizeCurrencyCode(unifiedTargetCurrency)
+                    )
+                    .map((otherCode) => (
+                      <div
+                        key={otherCode}
+                        className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
+                      >
+                        <span className="text-[11px] font-medium text-slate-600 shrink-0">
+                          1 {unifiedTargetCurrency} =
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="number"
+                            step="any"
+                            min="0.000001"
+                            value={
+                              exchangeRatesInput[otherCode] ??
+                              String(numericExchangeRates[otherCode] ?? 1)
+                            }
+                            onChange={(e) =>
+                              setExchangeRatesInput((prev) => ({
+                                ...prev,
+                                [otherCode]: e.target.value,
+                              }))
+                            }
+                            className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                          />
+                          <span className="text-[11px] font-bold text-slate-700 w-8">
+                            {otherCode}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+
+                {!activeGroup?.is_archived && (
+                  <button
+                    type="button"
+                    disabled={isSavingRates}
+                    onClick={handleSaveExchangeRates}
+                    className="w-full py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white transition cursor-pointer disabled:opacity-50"
+                  >
+                    {isSavingRates
+                      ? "Saving Rates..."
+                      : "Save Exchange Rates"}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 1: Settle Up (Settlement Plan) */}
+      {analyticsTab === "settle" && (
+        <div className="space-y-2.5">
+          <p className="text-[11px] text-slate-500 leading-snug">
+            {hasMultipleCurrencies && isUnifiedMode
+              ? `Unified cross-currency cash-flow minimization converted into ${unifiedTargetCurrency}.`
+              : "Greedy cash-flow minimization pairing largest debtors with largest creditors."}
+          </p>
+
+          {hasMultipleCurrencies && isUnifiedMode ? (
+            <div className="space-y-2 pt-2 border-t border-slate-100">
+              <div className="flex items-center justify-between text-xs font-bold text-emerald-900">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                  Unified ({unifiedTargetCurrency}) Plan
+                </span>
+                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                  {unifiedResult.settlements.length === 0
+                    ? "Settled"
+                    : `${unifiedResult.settlements.length} transfer(s)`}
+                </span>
+              </div>
+
+              {unifiedResult.settlements.length === 0 ? (
+                <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                  All combined cross-currency debts are settled up.
+                </div>
+              ) : (
+                unifiedResult.settlements.map((s, idx) => {
+                  const otherCodes = activeGroupCurrencies.filter(
+                    (c) => c !== normalizeCurrencyCode(unifiedTargetCurrency)
+                  );
+                  const secondaryEquivalents = otherCodes
+                    .map((otherCode) => {
+                      const rate = numericExchangeRates[otherCode];
+                      if (!rate || rate <= 0) return null;
+                      const eqCents = Math.round(s.amountCents * rate);
+                      return formatCurrency(eqCents, otherCode);
+                    })
+                    .filter(Boolean);
+
+                  return (
+                    <div
+                      key={idx}
+                      className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl text-xs space-y-1.5"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="space-y-1 min-w-0">
+                          <div className="text-slate-700">
+                            <span className="font-bold text-slate-900">
+                              {s.fromUser}
+                            </span>{" "}
+                            pays{" "}
+                            <span className="font-bold text-slate-900">
+                              {s.toUser}
+                            </span>
+                          </div>
+                          <div className="text-sm font-bold text-emerald-800 flex items-baseline gap-1.5 flex-wrap">
+                            <span>
+                              {formatCurrency(
+                                s.amountCents,
+                                unifiedTargetCurrency
+                              )}
+                            </span>
+                            {secondaryEquivalents.length > 0 && (
+                              <span className="text-[11px] font-medium text-emerald-700/80">
+                                (≈ {secondaryEquivalents.join(" • ")})
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {!activeGroup?.is_archived && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleQuickSettle(s, unifiedTargetCurrency)
+                            }
+                            title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
+                          >
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>Settle</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          ) : (
+            displayCurrencies.map((code, idx) => {
+              const list = settlementsByCurrency[code] || [];
+              const sym = getCurrencySymbol(code);
+              const isSecondary = idx % 2 === 1;
+              return (
+                <div
+                  key={code}
+                  className="space-y-2 pt-2 border-t border-slate-100"
+                >
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                        }`}
+                      ></span>
+                      {code} ({sym}) Ledger
+                    </span>
+                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                      {list.length === 0
+                        ? "Settled"
+                        : `${list.length} transfer(s)`}
+                    </span>
+                  </div>
+
+                  {list.length === 0 ? (
+                    <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                      All {code} debts are settled up.
+                    </div>
+                  ) : (
+                    list.map((s, sIdx) => (
+                      <div
+                        key={sIdx}
+                        className={`p-3 rounded-xl text-xs space-y-1 border ${
+                          isSecondary
+                            ? "bg-indigo-50/50 border-indigo-100"
+                            : "bg-blue-50/50 border-blue-100"
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="space-y-1 min-w-0">
+                            <div className="text-slate-700">
+                              <span className="font-bold text-slate-900">
+                                {s.fromUser}
+                              </span>{" "}
+                              pays{" "}
+                              <span className="font-bold text-slate-900">
+                                {s.toUser}
+                              </span>
+                            </div>
+                            <div
+                              className={`text-sm font-bold ${
+                                isSecondary
+                                  ? "text-indigo-700"
+                                  : "text-blue-700"
+                              }`}
+                            >
+                              {formatCurrency(s.amountCents, code)}
+                            </div>
+                          </div>
+
+                          {!activeGroup?.is_archived && (
+                            <button
+                              type="button"
+                              onClick={() => handleQuickSettle(s, code)}
+                              title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold text-white shadow-2xs transition cursor-pointer shrink-0 ${
+                                isSecondary
+                                  ? "bg-indigo-600 hover:bg-indigo-700"
+                                  : "bg-blue-600 hover:bg-blue-700"
+                              }`}
+                            >
+                              <CheckCircle2 className="w-3 h-3" />
+                              <span>Settle</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: Members (Member Summary Table) */}
+      {analyticsTab === "members" && (
+        <div className="space-y-2.5">
+          <p className="text-[11px] text-slate-500 leading-snug">
+            {hasMultipleCurrencies && isUnifiedMode
+              ? `All expenses and payments converted into ${unifiedTargetCurrency} using your active exchange rates.`
+              : "Cumulative out-of-pocket expenses paid vs. accrued share vs. net balance."}
+          </p>
+
+          {members.length === 0 ? (
+            <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+              No members in this group yet.
+            </div>
+          ) : hasMultipleCurrencies && isUnifiedMode ? (
+            <div className="space-y-2">
+              <div className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                Unified {unifiedTargetCurrency} (
+                {getCurrencySymbol(unifiedTargetCurrency)}) Breakdown
+              </div>
+              <div className="overflow-x-auto border border-emerald-100 rounded-xl">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-emerald-50/60 border-b border-emerald-100 text-slate-600 font-semibold">
+                      <th className="py-2 px-2.5">Member</th>
+                      <th className="py-2 px-2 text-right">Paid</th>
+                      <th className="py-2 px-2 text-right">Share</th>
+                      <th className="py-2 px-2.5 text-right">Net</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {unifiedResult.memberBreakdown.map((row) => {
+                      const paidStr = formatCurrency(
+                        row.paidCents,
+                        unifiedTargetCurrency
+                      );
+                      const shareStr = formatCurrency(
+                        row.shareCents,
+                        unifiedTargetCurrency
+                      );
+                      const absFormatted = formatCurrency(
+                        Math.abs(row.netBalanceCents),
+                        unifiedTargetCurrency
+                      );
+                      const netStr =
+                        row.netBalanceCents > 0
+                          ? `+${absFormatted}`
+                          : row.netBalanceCents < 0
+                            ? `-${absFormatted}`
+                            : formatCurrency(0, unifiedTargetCurrency);
+                      const netColorClass =
+                        row.netBalanceCents > 0
+                          ? "text-emerald-600 font-bold"
+                          : row.netBalanceCents < 0
+                            ? "text-rose-600 font-bold"
+                            : "text-slate-400 font-medium";
+
+                      return (
+                        <tr
+                          key={row.memberId}
+                          className="hover:bg-slate-50/60 transition"
+                        >
+                          <td className="py-2 px-2.5 font-semibold text-slate-900">
+                            {row.memberName}
+                            {row.memberId === activeMemberId && (
+                              <span className="ml-1 text-[10px] font-semibold text-blue-600">
+                                (You)
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-2 text-right text-slate-700 font-medium">
+                            {paidStr}
+                          </td>
+                          <td className="py-2 px-2 text-right text-slate-700 font-medium">
+                            {shareStr}
+                          </td>
+                          <td
+                            className={`py-2 px-2.5 text-right ${netColorClass}`}
+                          >
+                            {netStr}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : (
+            displayCurrencies.map((code, idx) => {
+              const rows = memberBreakdownByCurrency[code] || [];
+              const sym = getCurrencySymbol(code);
+              return (
+                <div
+                  key={code}
+                  className={`space-y-2 ${
+                    idx > 0 ? "pt-2.5 border-t border-slate-100" : ""
+                  }`}
+                >
+                  {displayCurrencies.length > 1 && (
+                    <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          idx % 2 === 0 ? "bg-blue-600" : "bg-indigo-600"
+                        }`}
+                      ></span>
+                      {code} ({sym}) Breakdown
+                    </div>
+                  )}
+                  <div className="overflow-x-auto border border-slate-100 rounded-xl">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
+                          <th className="py-2 px-2.5">Member</th>
+                          <th className="py-2 px-2 text-right">Paid</th>
+                          <th className="py-2 px-2 text-right">Share</th>
+                          <th className="py-2 px-2.5 text-right">Net</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {rows.map((row) => {
+                          const paidStr = formatCurrency(row.paidCents, code);
+                          const shareStr = formatCurrency(row.shareCents, code);
+                          const absFormatted = formatCurrency(
+                            Math.abs(row.netBalanceCents),
+                            code
+                          );
+                          const netStr =
+                            row.netBalanceCents > 0
+                              ? `+${absFormatted}`
+                              : row.netBalanceCents < 0
+                                ? `-${absFormatted}`
+                                : formatCurrency(0, code);
+                          const netColorClass =
+                            row.netBalanceCents > 0
+                              ? "text-emerald-600 font-bold"
+                              : row.netBalanceCents < 0
+                                ? "text-rose-600 font-bold"
+                                : "text-slate-400 font-medium";
+
+                          return (
+                            <tr
+                              key={row.memberId}
+                              className="hover:bg-slate-50/60 transition"
+                            >
+                              <td className="py-2 px-2.5 font-semibold text-slate-900">
+                                {row.memberName}
+                                {row.memberId === activeMemberId && (
+                                  <span className="ml-1 text-[10px] font-semibold text-blue-600">
+                                    (You)
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-2 px-2 text-right text-slate-700 font-medium">
+                                {paidStr}
+                              </td>
+                              <td className="py-2 px-2 text-right text-slate-700 font-medium">
+                                {shareStr}
+                              </td>
+                              <td
+                                className={`py-2 px-2.5 text-right ${netColorClass}`}
+                              >
+                                {netStr}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
+
+      {/* TAB 3: Categories (Spend by Category Progress Bars) */}
+      {analyticsTab === "categories" && (
+        <div className="space-y-3">
+          <p className="text-[11px] text-slate-500 leading-snug">
+            Group expenses aggregated by category (excludes settlement
+            payments).
+          </p>
+
+          {displayCurrencies.map((code, idx) => {
+            const catList = categorySpendByCurrency[code] || [];
+            const sym = getCurrencySymbol(code);
+            const isSecondary = idx % 2 === 1;
+            if (idx > 0 && catList.length === 0) return null;
+
+            return (
+              <div
+                key={code}
+                className={`space-y-2.5 ${
+                  idx > 0 ? "pt-3 border-t border-slate-100" : ""
+                }`}
+              >
+                {displayCurrencies.length > 1 && (
+                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                      }`}
+                    ></span>
+                    {code} ({sym}) Categories
+                  </div>
+                )}
+
+                {catList.length === 0 ? (
+                  <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                    No {code} expenses recorded yet.
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {catList.map((c) => (
+                      <div key={c.category} className="space-y-1 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-800 truncate">
+                            {c.category}
+                          </span>
+                          <span className="text-slate-600 font-medium shrink-0">
+                            <strong className="text-slate-900">
+                              {formatCurrency(c.amountCents, code)}
+                            </strong>{" "}
+                            <span className="text-[11px] text-slate-400">
+                              ({c.percentage.toFixed(1)}%)
+                            </span>
+                          </span>
+                        </div>
+                        <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all ${
+                              isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                            }`}
+                            style={{
+                              width: `${Math.min(100, Math.max(2, c.percentage))}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-slate-50">
-      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-blue-600 text-white font-black flex items-center justify-center text-base shadow-2xs">
+      <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 sm:py-3.5 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-blue-600 text-white font-black flex items-center justify-center text-base shadow-2xs shrink-0">
             $
           </div>
-          <div>
-            <h1 className="text-lg font-bold text-slate-900 tracking-tight leading-none">
+          <div className="min-w-0">
+            <h1 className="text-lg font-bold text-slate-900 tracking-tight leading-none truncate">
               Settle Up
             </h1>
-            <p className="text-[11px] text-slate-400 mt-0.5">
+            <p className="hidden sm:block text-[11px] text-slate-400 mt-0.5 truncate">
               Instant group expense & settlement tracker
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5 shrink-0">
           {user ? (
             <>
               <div className="flex items-center gap-2">
@@ -2339,7 +2977,7 @@ export function SettleUpDashboard({
                     Super-Admin
                   </span>
                 )}
-                <span className="text-xs sm:text-sm text-slate-600 font-medium">
+                <span className="hidden md:inline text-xs sm:text-sm text-slate-600 font-medium">
                   {user.email}
                 </span>
               </div>
@@ -2349,7 +2987,7 @@ export function SettleUpDashboard({
                 className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-red-600 font-medium transition cursor-pointer"
               >
                 <LogOut className="w-3.5 h-3.5" />
-                Sign out
+                <span>Sign out</span>
               </button>
             </>
           ) : (
@@ -2468,9 +3106,37 @@ export function SettleUpDashboard({
           </div>
         </div>
       ) : (
-      <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 md:grid-cols-4 gap-6">
-        {/* Groups Sidebar */}
-        <aside className="bg-white border border-slate-200 p-4 rounded-2xl h-fit flex flex-col gap-4">
+      <div className="max-w-7xl mx-auto p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-4 gap-4 sm:gap-6">
+        {/* Mobile Collapsible Group Switcher Bar (< lg when viewing an active group) */}
+        {activeGroup && (
+          <div className="lg:hidden">
+            <button
+              type="button"
+              onClick={() => setIsMobileGroupsOpen((prev) => !prev)}
+              className="w-full bg-white border border-slate-200 px-3.5 py-2.5 rounded-xl shadow-2xs flex items-center justify-between text-xs font-semibold text-slate-700 hover:bg-slate-50 transition cursor-pointer"
+            >
+              <span className="flex items-center gap-2 truncate">
+                <span>📂</span>
+                <span className="truncate">
+                  Groups ({activeGroup.name})
+                </span>
+                <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-slate-100 text-slate-500 font-normal shrink-0">
+                  {activeGroups.length}
+                </span>
+              </span>
+              <span className="text-slate-400 ml-2 shrink-0">
+                {isMobileGroupsOpen ? "▴ Hide" : "▾ Switch"}
+              </span>
+            </button>
+          </div>
+        )}
+
+        {/* Groups Sidebar (Collapsed on mobile when viewing a group unless expanded; sticky on desktop lg+) */}
+        <aside
+          className={`${
+            activeGroup && !isMobileGroupsOpen ? "hidden lg:flex" : "flex"
+          } bg-white border border-slate-200 p-4 rounded-2xl h-fit flex-col gap-4 lg:sticky lg:top-6 lg:self-start`}
+        >
           <div className="space-y-3">
             <div>
               <h2 className="font-semibold text-slate-800 mb-2.5 text-sm flex items-center justify-between">
@@ -2750,33 +3416,52 @@ export function SettleUpDashboard({
           )}
         </aside>
 
-        {/* Expense Entry & Settlement Panel */}
-        <section className="md:col-span-2 min-w-0 space-y-6">
+        {/* Center Column: Compact Group Header, Add Transaction, and Transaction History */}
+        <section className="lg:col-span-2 min-w-0 space-y-4 sm:space-y-5">
           {activeGroup ? (
-            <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4 overflow-hidden">
+            <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs space-y-2.5">
+              {/* Row 1: Group Name + Inline Summary Pills (Left) & Primary Action Buttons (Right) */}
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2.5 flex-wrap min-w-0">
-                  <h2 className="text-xl font-bold text-slate-900 tracking-tight truncate">
+                <div className="flex items-center gap-2 flex-wrap min-w-0">
+                  <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight truncate">
                     {activeGroup.name}
                   </h2>
-                  <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700 shrink-0">
+                  <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-slate-100 text-slate-700 shrink-0">
                     {members.length}{" "}
                     {members.length === 1 ? "member" : "members"}
                   </span>
+                  {displayCurrencies.map((code) => (
+                    <span
+                      key={code}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200/80 shrink-0"
+                    >
+                      <span>
+                        {formatCurrency(currencyTotalsCents[code] || 0, code)}
+                      </span>
+                      <span className="font-medium text-emerald-700/80">
+                        {displayCurrencies.length > 1
+                          ? `${code} Spent`
+                          : "Spent"}
+                      </span>
+                    </span>
+                  ))}
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 shrink-0">
+                    {expenses.length} {expenses.length === 1 ? "txn" : "txns"}
+                  </span>
                   {activeGroup.is_archived && (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200 shrink-0">
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-200 shrink-0">
                       <Lock className="w-3 h-3" />
-                      Archived — Read-Only
+                      Archived
                     </span>
                   )}
                 </div>
 
-                {/* Action Buttons: Copy Group Link, Export CSV (All Users), Currencies, Archive Toggle & Manage Members (Super-Admin) */}
-                <div className="flex flex-wrap items-center gap-2">
+                {/* Primary Actions: 🔗 Copy Link, 💱 Currencies, ⚙️ Manage Menu (or Export CSV for non-admins) */}
+                <div className="flex items-center gap-1.5 flex-wrap shrink-0">
                   <button
                     type="button"
                     onClick={handleCopyGroupLink}
-                    className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer ${
+                    className={`inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer ${
                       copiedGroupLink
                         ? "bg-emerald-600 text-white"
                         : "bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
@@ -2785,23 +3470,14 @@ export function SettleUpDashboard({
                     {copiedGroupLink ? (
                       <>
                         <Check className="w-3.5 h-3.5 shrink-0" />
-                        <span>Copied Link!</span>
+                        <span>Copied!</span>
                       </>
                     ) : (
                       <>
                         <Share2 className="w-3.5 h-3.5 shrink-0" />
-                        <span>Copy Group Link</span>
+                        <span>Copy Link</span>
                       </>
                     )}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleExportCsv}
-                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5 shrink-0" />
-                    <span>Export CSV</span>
                   </button>
 
                   {isSuperAdmin && !activeGroup.is_archived && (
@@ -2814,108 +3490,124 @@ export function SettleUpDashboard({
                         setIsCurrencyModalOpen(true);
                       }}
                       title="Configure enabled currencies for this group"
-                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
+                      className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
                     >
-                      <Settings2 className="w-3.5 h-3.5 shrink-0" />
+                      <Globe className="w-3.5 h-3.5 shrink-0 text-blue-600" />
                       <span>
-                        Currencies ({activeGroupCurrencies.join(", ")})
+                        {activeGroupCurrencies.length > 1
+                          ? `Currencies (${activeGroupCurrencies.join(", ")})`
+                          : "Currencies"}
                       </span>
                     </button>
                   )}
 
-                  {isSuperAdmin && (
-                    <button
-                      type="button"
-                      onClick={() => handleToggleArchiveGroup(activeGroup)}
-                      className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer border ${
-                        activeGroup.is_archived
-                          ? "bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200"
-                          : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
-                      }`}
-                    >
-                      {activeGroup.is_archived ? (
-                        <>
-                          <ArchiveRestore className="w-3.5 h-3.5 shrink-0" />
-                          <span>Unarchive Group</span>
-                        </>
-                      ) : (
-                        <>
-                          <Archive className="w-3.5 h-3.5 shrink-0" />
-                          <span>Archive Group</span>
-                        </>
-                      )}
-                    </button>
-                  )}
+                  {isSuperAdmin ? (
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setIsManageMenuOpen((prev) => !prev)}
+                        className={`inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer border ${
+                          isManageMenuOpen
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
+                        }`}
+                      >
+                        <Settings2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>Manage</span>
+                        <ChevronDown className="w-3 h-3 shrink-0 opacity-75" />
+                      </button>
 
-                  {isSuperAdmin && !activeGroup.is_archived && (
+                      {isManageMenuOpen && (
+                        <div className="absolute right-0 mt-1.5 w-48 bg-white border border-slate-200 rounded-xl shadow-lg p-1.5 z-30 space-y-1 text-xs">
+                          {!activeGroup.is_archived && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsManageMenuOpen(false);
+                                setIsInviteModalOpen(true);
+                              }}
+                              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 transition cursor-pointer text-left"
+                            >
+                              <UserPlus className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                              <span>Manage Members</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsManageMenuOpen(false);
+                              handleExportCsv();
+                            }}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-slate-100 transition cursor-pointer text-left"
+                          >
+                            <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                            <span>Export CSV</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsManageMenuOpen(false);
+                              handleToggleArchiveGroup(activeGroup);
+                            }}
+                            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-amber-800 hover:bg-amber-50 transition cursor-pointer text-left"
+                          >
+                            {activeGroup.is_archived ? (
+                              <>
+                                <ArchiveRestore className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                                <span>Unarchive Group</span>
+                              </>
+                            ) : (
+                              <>
+                                <Archive className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                                <span>Archive Group</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
                     <button
                       type="button"
-                      onClick={() => setIsInviteModalOpen(true)}
-                      className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl transition shadow-xs bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
+                      onClick={handleExportCsv}
+                      title="Export CSV"
+                      className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
                     >
-                      <UserPlus className="w-3.5 h-3.5 shrink-0" />
-                      <span>Manage Members</span>
+                      <Download className="w-3.5 h-3.5 shrink-0" />
+                      <span>CSV</span>
                     </button>
                   )}
                 </div>
               </div>
 
               {activeGroup.is_archived && (
-                <div className="p-3 bg-amber-50/90 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-center justify-between gap-2 flex-wrap">
-                  <span className="flex items-center gap-2 font-medium">
-                    <Lock className="w-4 h-4 text-amber-700 shrink-0" />
-                    <span>
-                      <strong>Archived — Read-Only:</strong> This group is
-                      retired and locked. Adding, editing, or deleting
-                      transactions and members is disabled.
-                    </span>
+                <div className="px-3 py-2 bg-amber-50/90 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-center gap-2">
+                  <Lock className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                  <span>
+                    <strong>Archived — Read-Only:</strong> Adding, editing, or
+                    deleting transactions and members is disabled.
                   </span>
                 </div>
               )}
 
-              {/* Zero-Login Identity Pill Selector (Non-nagging for non-participant Super-Admin) */}
+              {/* Row 2: Compact Horizontal Identity Bar */}
               {members.length > 0 ? (
-                <div className="p-3 bg-slate-50 border border-slate-200/80 rounded-xl space-y-2">
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
-                      {isSuperAdmin && !activeMemberObj ? (
-                        <Shield className="w-3.5 h-3.5 text-indigo-600" />
-                      ) : (
-                        <UserCheck className="w-3.5 h-3.5 text-blue-600" />
-                      )}
-                      {activeMemberObj
-                        ? `Viewing as ${activeMemberObj.name} (tap another name to switch):`
-                        : isSuperAdmin
-                          ? "Admin View (non-participant) — optionally tap a member to act as them:"
-                          : "Who are you in this group? Tap your name:"}
-                    </span>
-                    {isSuperAdmin && activeMemberObj && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveMemberId("");
-                          if (activeGroupId && typeof window !== "undefined") {
-                            localStorage.removeItem(
-                              memberStorageKey(activeGroupId)
-                            );
-                            const slugOrId =
-                              activeGroup.slug ||
-                              generateGroupSlug(activeGroup.name) ||
-                              activeGroup.id;
-                            window.history.replaceState(
-                              null,
-                              "",
-                              `/${slugOrId}`
-                            );
-                          }
-                        }}
-                        className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 cursor-pointer"
-                      >
-                        Reset to Admin View
-                      </button>
-                    )}
-                  </div>
+                <div className="px-3 py-1.5 bg-slate-50 border border-slate-200/80 rounded-xl flex items-center justify-between gap-2 flex-wrap">
                   <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[11px] font-semibold text-slate-600 flex items-center gap-1 shrink-0 mr-0.5">
+                      {isSuperAdmin && !activeMemberObj ? (
+                        <Shield className="w-3 h-3 text-indigo-600" />
+                      ) : (
+                        <UserCheck className="w-3 h-3 text-blue-600" />
+                      )}
+                      <span>
+                        {activeMemberObj
+                          ? "Viewing as:"
+                          : isSuperAdmin
+                            ? "Admin View (tap to act as):"
+                            : "Who are you:"}
+                      </span>
+                    </span>
                     {members.map((m) => {
                       const isMe = m.id === activeMemberId;
                       return (
@@ -2923,7 +3615,7 @@ export function SettleUpDashboard({
                           key={m.id}
                           type="button"
                           onClick={() => handleSelectIdentity(m)}
-                          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold transition cursor-pointer border ${
+                          className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold transition cursor-pointer border ${
                             isMe
                               ? "bg-blue-600 text-white border-blue-600 shadow-2xs"
                               : "bg-white text-slate-700 border-slate-200 hover:bg-blue-50 hover:border-blue-200"
@@ -2938,10 +3630,41 @@ export function SettleUpDashboard({
                         </button>
                       );
                     })}
+                    {isSuperAdmin && activeMemberObj && (
+                      <>
+                        <span className="text-slate-300 text-xs">•</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveMemberId("");
+                            if (
+                              activeGroupId &&
+                              typeof window !== "undefined"
+                            ) {
+                              localStorage.removeItem(
+                                memberStorageKey(activeGroupId)
+                              );
+                              const slugOrId =
+                                activeGroup.slug ||
+                                generateGroupSlug(activeGroup.name) ||
+                                activeGroup.id;
+                              window.history.replaceState(
+                                null,
+                                "",
+                                `/${slugOrId}`
+                              );
+                            }
+                          }}
+                          className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+                        >
+                          Reset
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               ) : (
-                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between">
+                <div className="px-3 py-2 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between">
                   <span>No members have been added to this group yet.</span>
                   {isSuperAdmin && (
                     <button
@@ -2954,37 +3677,6 @@ export function SettleUpDashboard({
                   )}
                 </div>
               )}
-
-              {/* Per-Group Currency Ledger Summary Metrics (Clean single-currency UX when only 1 currency is enabled) */}
-              <div
-                className={`grid grid-cols-2 ${
-                  displayCurrencies.length >= 2
-                    ? "sm:grid-cols-3"
-                    : "sm:grid-cols-2"
-                } gap-3 pt-2 border-t border-slate-100 text-xs`}
-              >
-                {displayCurrencies.map((code) => (
-                  <div
-                    key={code}
-                    className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100"
-                  >
-                    <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
-                      {code} Spent
-                    </span>
-                    <span className="text-base font-bold text-slate-900">
-                      {formatCurrency(currencyTotalsCents[code] || 0, code)}
-                    </span>
-                  </div>
-                ))}
-                <div className="p-2.5 bg-slate-50/80 rounded-xl border border-slate-100">
-                  <span className="text-slate-400 font-medium block text-[11px] mb-0.5">
-                    Total Transactions
-                  </span>
-                  <span className="text-base font-bold text-slate-900">
-                    {expenses.length}
-                  </span>
-                </div>
-              </div>
             </div>
           ) : (
             <div className="bg-white border border-slate-200 p-8 rounded-2xl text-center space-y-3">
@@ -3008,246 +3700,22 @@ export function SettleUpDashboard({
 
           {activeGroup && (
             <>
-              {/* Cumulative Member Summary Card (Supports Isolated Per-Currency or Unified Converted View) */}
-              {members.length > 0 && (
-                <div className="bg-white border border-slate-200 p-5 rounded-2xl shadow-xs space-y-4">
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <div>
-                      <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
-                        <Users className="w-4 h-4 text-blue-600" />
-                        Member Summary
-                        {hasMultipleCurrencies && isUnifiedMode && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                            <Globe className="w-3 h-3" />
-                            Unified in {unifiedTargetCurrency} (
-                            {getCurrencySymbol(unifiedTargetCurrency)})
-                          </span>
-                        )}
-                      </h3>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        {hasMultipleCurrencies && isUnifiedMode
-                          ? `All expenses and payments converted into ${unifiedTargetCurrency} using your active exchange rates`
-                          : "Cumulative out-of-pocket expenses paid vs. accrued share consumed vs. net balance (including settlement payments)"}
-                      </p>
-                    </div>
+              {/* Mobile Unified Balances & Analytics Card (< lg, placed right above Add Transaction) */}
+              <div className="lg:hidden">{renderBalancesAndAnalyticsCard()}</div>
 
-                    {hasMultipleCurrencies && (
-                      <button
-                        type="button"
-                        onClick={() => setIsUnifiedMode((prev) => !prev)}
-                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                          isUnifiedMode
-                            ? "bg-emerald-600 text-white border-emerald-600 shadow-2xs"
-                            : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
-                        }`}
-                      >
-                        <Globe className="w-3.5 h-3.5" />
-                        <span>
-                          {isUnifiedMode
-                            ? `Showing Unified (${unifiedTargetCurrency})`
-                            : "🌐 Unified Settlement (Convert All)"}
-                        </span>
-                      </button>
-                    )}
-                  </div>
-
-                  {hasMultipleCurrencies && isUnifiedMode ? (
-                    <div className="space-y-2">
-                      <div className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
-                        Unified {unifiedTargetCurrency} (
-                        {getCurrencySymbol(unifiedTargetCurrency)}) Breakdown
-                      </div>
-                      <div className="overflow-x-auto border border-emerald-100 rounded-xl">
-                        <table className="w-full text-left border-collapse text-xs">
-                          <thead>
-                            <tr className="bg-emerald-50/60 border-b border-emerald-100 text-slate-600 font-semibold">
-                              <th className="py-2.5 px-3">Member</th>
-                              <th className="py-2.5 px-3 text-right">
-                                Paid (Converted)
-                              </th>
-                              <th className="py-2.5 px-3 text-right">
-                                Share (Converted)
-                              </th>
-                              <th className="py-2.5 px-3 text-right">
-                                Unified Net Balance
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100">
-                            {unifiedResult.memberBreakdown.map((row) => {
-                              const paidStr = formatCurrency(
-                                row.paidCents,
-                                unifiedTargetCurrency
-                              );
-                              const shareStr = formatCurrency(
-                                row.shareCents,
-                                unifiedTargetCurrency
-                              );
-                              const absFormatted = formatCurrency(
-                                Math.abs(row.netBalanceCents),
-                                unifiedTargetCurrency
-                              );
-                              const netStr =
-                                row.netBalanceCents > 0
-                                  ? `+${absFormatted}`
-                                  : row.netBalanceCents < 0
-                                    ? `-${absFormatted}`
-                                    : formatCurrency(0, unifiedTargetCurrency);
-                              const netColorClass =
-                                row.netBalanceCents > 0
-                                  ? "text-emerald-600 font-bold"
-                                  : row.netBalanceCents < 0
-                                    ? "text-rose-600 font-bold"
-                                    : "text-slate-400 font-medium";
-
-                              return (
-                                <tr
-                                  key={row.memberId}
-                                  className="hover:bg-slate-50/60 transition"
-                                >
-                                  <td className="py-2.5 px-3 font-semibold text-slate-900">
-                                    {row.memberName}
-                                    {row.memberId === activeMemberId && (
-                                      <span className="ml-1.5 text-[10px] font-semibold text-blue-600">
-                                        (You)
-                                      </span>
-                                    )}
-                                  </td>
-                                  <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
-                                    {paidStr}
-                                  </td>
-                                  <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
-                                    {shareStr}
-                                  </td>
-                                  <td
-                                    className={`py-2.5 px-3 text-right ${netColorClass}`}
-                                  >
-                                    {netStr}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  ) : (
-                    displayCurrencies.map((code, idx) => {
-                      const rows = memberBreakdownByCurrency[code] || [];
-                      const sym = getCurrencySymbol(code);
-                      return (
-                        <div
-                          key={code}
-                          className={`space-y-2 ${
-                            idx > 0 ? "pt-3 border-t border-slate-100" : ""
-                          }`}
-                        >
-                          {displayCurrencies.length > 1 && (
-                            <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                              <span
-                                className={`w-2 h-2 rounded-full ${
-                                  idx % 2 === 0
-                                    ? "bg-blue-600"
-                                    : "bg-indigo-600"
-                                }`}
-                              ></span>
-                              {code} ({sym}) Breakdown
-                            </div>
-                          )}
-                          <div className="overflow-x-auto border border-slate-100 rounded-xl">
-                            <table className="w-full text-left border-collapse text-xs">
-                              <thead>
-                                <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
-                                  <th className="py-2.5 px-3">Member</th>
-                                  <th className="py-2.5 px-3 text-right">
-                                    Paid (Out-of-Pocket)
-                                  </th>
-                                  <th className="py-2.5 px-3 text-right">
-                                    Share (Accrued Cost)
-                                  </th>
-                                  <th className="py-2.5 px-3 text-right">
-                                    Net Balance
-                                  </th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-slate-100">
-                                {rows.map((row) => {
-                                  const paidStr = formatCurrency(
-                                    row.paidCents,
-                                    code
-                                  );
-                                  const shareStr = formatCurrency(
-                                    row.shareCents,
-                                    code
-                                  );
-                                  const absFormatted = formatCurrency(
-                                    Math.abs(row.netBalanceCents),
-                                    code
-                                  );
-                                  const netStr =
-                                    row.netBalanceCents > 0
-                                      ? `+${absFormatted}`
-                                      : row.netBalanceCents < 0
-                                        ? `-${absFormatted}`
-                                        : formatCurrency(0, code);
-                                  const netColorClass =
-                                    row.netBalanceCents > 0
-                                      ? "text-emerald-600 font-bold"
-                                      : row.netBalanceCents < 0
-                                        ? "text-rose-600 font-bold"
-                                        : "text-slate-400 font-medium";
-
-                                  return (
-                                    <tr
-                                      key={row.memberId}
-                                      className="hover:bg-slate-50/60 transition"
-                                    >
-                                      <td className="py-2.5 px-3 font-semibold text-slate-900">
-                                        {row.memberName}
-                                        {row.memberId === activeMemberId && (
-                                          <span className="ml-1.5 text-[10px] font-semibold text-blue-600">
-                                            (You)
-                                          </span>
-                                        )}
-                                      </td>
-                                      <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
-                                        {paidStr}
-                                      </td>
-                                      <td className="py-2.5 px-3 text-right text-slate-700 font-medium">
-                                        {shareStr}
-                                      </td>
-                                      <td
-                                        className={`py-2.5 px-3 text-right ${netColorClass}`}
-                                      >
-                                        {netStr}
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              )}
-
-              {/* Add Transaction Form (Hidden when group is archived) */}
+              {/* Compact Add Transaction Form (Hidden when group is archived) */}
               {!activeGroup.is_archived && (
               <form
                 ref={addTransactionFormRef}
                 onSubmit={handleAddExpense}
-                className={`bg-white border p-6 rounded-2xl shadow-xs space-y-4 transition-all duration-300 ${
+                className={`bg-white border p-4 sm:p-5 rounded-2xl shadow-xs space-y-3 transition-all duration-300 ${
                   isFormHighlighted
                     ? "border-emerald-400 ring-2 ring-emerald-500/30 bg-emerald-50/10"
                     : "border-slate-200"
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <h2 className="font-bold text-slate-900 text-base">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="font-bold text-slate-900 text-sm sm:text-base">
                     Add Transaction
                   </h2>
                   <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
@@ -3262,7 +3730,7 @@ export function SettleUpDashboard({
                           setSelectedMembers(members.map((m) => m.id));
                         }
                       }}
-                      className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
+                      className={`px-2.5 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
                         type === "expense"
                           ? "bg-white text-slate-900 shadow-2xs"
                           : "text-slate-500 hover:text-slate-800"
@@ -3285,7 +3753,7 @@ export function SettleUpDashboard({
                           setSelectedMembers([defaultRecipient.id]);
                         }
                       }}
-                      className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
+                      className={`px-2.5 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
                         type === "payment"
                           ? "bg-white text-slate-900 shadow-2xs"
                           : "text-slate-500 hover:text-slate-800"
@@ -3296,9 +3764,9 @@ export function SettleUpDashboard({
                   </div>
                 </div>
 
-                {/* Prominent Scan / Attach Receipt Section (Strictly for Group Expenses) */}
+                {/* Compact 1-Line Receipt Auto-Scan Bar (Strictly for Group Expenses) */}
                 {type === "expense" && (
-                  <div className="p-3.5 rounded-xl border border-blue-200/80 bg-blue-50/40 space-y-2.5">
+                  <div className="p-2.5 rounded-xl border border-blue-200/80 bg-blue-50/40 space-y-2">
                     <input
                       ref={addReceiptCameraInputRef}
                       type="file"
@@ -3321,39 +3789,29 @@ export function SettleUpDashboard({
                       onChange={handleAddReceiptFileChange}
                       className="hidden"
                     />
-                    <div className="flex items-center justify-between gap-2 flex-wrap">
-                      <div className="flex items-center gap-2">
-                        <div className="p-1.5 rounded-lg bg-blue-100 text-blue-700 shrink-0">
-                          <Camera className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <span className="text-xs font-bold text-slate-900 block">
-                            Scan / Attach Receipt
-                          </span>
-                          <span className="text-[11px] text-slate-500">
-                            Take a photo, pick from your gallery, or attach a
-                            PDF to auto-fill details
-                          </span>
-                        </div>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800 shrink-0">
+                        <span>📎</span>
+                        <span>Receipt (Auto-Scan):</span>
                       </div>
-                      <div className="flex items-center gap-1.5 flex-wrap">
+                      <div className="grid grid-cols-3 gap-1.5 sm:flex sm:items-center">
                         <button
                           type="button"
                           disabled={isScanningReceipt}
                           onClick={() =>
                             addReceiptCameraInputRef.current?.click()
                           }
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60"
+                          className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-2xs transition cursor-pointer disabled:opacity-60 truncate"
                         >
                           {isScanningReceipt ? (
                             <>
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                              <span>Scanning...</span>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                              <span className="truncate">Scanning...</span>
                             </>
                           ) : (
                             <>
                               <span>📷</span>
-                              <span>Take Photo</span>
+                              <span className="truncate">Camera</span>
                             </>
                           )}
                         </button>
@@ -3361,20 +3819,20 @@ export function SettleUpDashboard({
                           type="button"
                           disabled={isScanningReceipt}
                           onClick={() => addReceiptInputRef.current?.click()}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
+                          className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs transition cursor-pointer disabled:opacity-60 truncate"
                         >
                           <span>🖼️</span>
-                          <span>Photo Library</span>
+                          <span className="truncate">Photos</span>
                         </button>
                         <button
                           type="button"
                           disabled={isScanningReceipt}
                           onClick={() => addReceiptPdfInputRef.current?.click()}
                           title="Attach a PDF receipt"
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-slate-700 border border-slate-200 shadow-2xs transition cursor-pointer disabled:opacity-60"
+                          className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-blue-50 text-slate-700 border border-slate-200 shadow-2xs transition cursor-pointer disabled:opacity-60 truncate"
                         >
                           <span>📄</span>
-                          <span>PDF</span>
+                          <span className="truncate">PDF</span>
                         </button>
                       </div>
                     </div>
@@ -3385,7 +3843,7 @@ export function SettleUpDashboard({
                       receiptScanError) && (
                       <div className="space-y-2 pt-2 border-t border-blue-100">
                         <div className="flex items-center justify-between gap-3">
-                          <div className="flex items-center gap-3 min-w-0">
+                          <div className="flex items-center gap-2.5 min-w-0">
                             {receiptPreviewUrl &&
                             !isPdfReceiptUrl(receiptUrl || receiptPreviewUrl) &&
                             !receiptFileName.toLowerCase().endsWith(".pdf") ? (
@@ -3405,7 +3863,7 @@ export function SettleUpDashboard({
                                   }
                                 }}
                                 title="Click to view full receipt"
-                                className="relative w-12 h-12 rounded-lg overflow-hidden border border-slate-200 bg-white shrink-0 group cursor-pointer"
+                                className="relative w-10 h-10 rounded-lg overflow-hidden border border-slate-200 bg-white shrink-0 group cursor-pointer"
                               >
                                 {/* eslint-disable-next-line @next/next/no-img-element */}
                                 <img
@@ -3415,8 +3873,8 @@ export function SettleUpDashboard({
                                 />
                               </button>
                             ) : (
-                              <div className="w-12 h-12 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-blue-600 shrink-0">
-                                <FileText className="w-5 h-5" />
+                              <div className="w-10 h-10 rounded-lg border border-slate-200 bg-white flex items-center justify-center text-blue-600 shrink-0">
+                                <FileText className="w-4 h-4" />
                               </div>
                             )}
                             <div className="min-w-0">
@@ -3448,14 +3906,14 @@ export function SettleUpDashboard({
                             type="button"
                             onClick={handleRemoveAddReceipt}
                             title="Remove receipt"
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition cursor-pointer shrink-0"
+                            className="p-1 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition cursor-pointer shrink-0"
                           >
                             <X className="w-4 h-4" />
                           </button>
                         </div>
 
                         {receiptScanError && (
-                          <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 flex items-start gap-2">
+                          <div className="p-2 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 flex items-start gap-2">
                             <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
                             <span>{receiptScanError}</span>
                           </div>
@@ -3465,9 +3923,10 @@ export function SettleUpDashboard({
                   </div>
                 )}
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="text-xs font-semibold text-slate-600 block mb-1">
+                {/* 2-Column Field Grid on Mobile & Desktop: Paid By + Amount */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="min-w-0">
+                    <label className="text-xs font-semibold text-slate-600 block mb-1 truncate">
                       Paid By
                     </label>
                     <select
@@ -3487,7 +3946,7 @@ export function SettleUpDashboard({
                           );
                         }
                       }}
-                      className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                      className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                       required
                     >
                       <option value="">Select Member</option>
@@ -3499,22 +3958,22 @@ export function SettleUpDashboard({
                     </select>
                   </div>
 
-                  <div>
-                    <label className="text-xs font-semibold text-slate-600 block mb-1">
+                  <div className="min-w-0">
+                    <label className="text-xs font-semibold text-slate-600 block mb-1 truncate">
                       {activeGroupCurrencies.length > 1
                         ? "Amount & Currency"
                         : `Amount (${currency})`}
-                      {isExactMode ? " (Auto-Summed)" : ""}
+                      {isExactMode ? " (Auto)" : ""}
                     </label>
-                    <div className="flex gap-2">
-                      <div className="relative flex-1">
-                        <span className="absolute left-3 top-2 text-sm font-semibold text-slate-400">
+                    <div className="flex gap-1.5">
+                      <div className="relative flex-1 min-w-0">
+                        <span className="absolute left-2.5 top-1.5 text-sm font-semibold text-slate-400">
                           {getCurrencySymbol(currency)}
                         </span>
                         <input
                           type="number"
                           step="0.01"
-                          placeholder={isExactMode ? "Auto-summed" : "0.00"}
+                          placeholder={isExactMode ? "Auto" : "0.00"}
                           value={
                             isExactMode
                               ? exactSummary.totalSplitCents > 0
@@ -3535,9 +3994,9 @@ export function SettleUpDashboard({
                           }
                           className={`w-full ${
                             getCurrencySymbol(currency).length > 1
-                              ? "pl-9"
-                              : "pl-7"
-                          } pr-3 py-2 border border-slate-300 rounded-lg text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition ${
+                              ? "pl-8"
+                              : "pl-6"
+                          } pr-2 py-1.5 border border-slate-300 rounded-lg text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition ${
                             isExactMode
                               ? "bg-slate-50 text-slate-700 font-semibold cursor-default"
                               : "bg-white text-slate-900"
@@ -3550,7 +4009,7 @@ export function SettleUpDashboard({
                           value={normalizeCurrencyCode(currency)}
                           onChange={(e) => setCurrency(e.target.value)}
                           aria-label="Transaction currency"
-                          className="border border-slate-300 rounded-lg px-2.5 py-2 text-xs font-bold text-slate-800 bg-slate-50 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition cursor-pointer shrink-0"
+                          className="border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-bold text-slate-800 bg-slate-50 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition cursor-pointer shrink-0"
                         >
                           {activeGroupCurrencies.map((code) => {
                             const info = getCurrencyInfo(code);
@@ -3566,7 +4025,8 @@ export function SettleUpDashboard({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                {/* Description (2 cols) + Date (1 col) */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="sm:col-span-2">
                     <label className="text-xs font-semibold text-slate-600 block mb-1">
                       Description
@@ -3580,7 +4040,7 @@ export function SettleUpDashboard({
                       }
                       value={description}
                       onChange={(e) => setDescription(e.target.value)}
-                      className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                      className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                       required={type === "expense"}
                     />
                   </div>
@@ -3592,7 +4052,7 @@ export function SettleUpDashboard({
                       type="date"
                       value={transactionDate}
                       onChange={(e) => setTransactionDate(e.target.value)}
-                      className="w-full border border-slate-300 rounded-lg p-2 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                      className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                       required
                     />
                   </div>
@@ -3600,7 +4060,7 @@ export function SettleUpDashboard({
 
                 {/* Category Selector (Strictly for Group Expenses; payments automatically use 'Payment') */}
                 {type === "expense" && (
-                  <div className="space-y-2">
+                  <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-slate-600 block">
                       Category
                     </label>
@@ -3666,24 +4126,49 @@ export function SettleUpDashboard({
                 )}
 
                 {/* Split Mode (Equal | % Percentage | $ Exact) & Participants */}
-                <div className="space-y-3">
+                <div className="space-y-2">
                   <div className="flex items-center justify-between flex-wrap gap-2">
-                    <label className="text-xs font-semibold text-slate-600">
-                      {type === "expense"
-                        ? splitMode === "equal"
-                          ? `Split Among (${selectedMembers.length} selected)`
-                          : splitMode === "percentage"
-                            ? "Split by Percentage (%)"
-                            : `Split by Exact Amount (${getCurrencySymbol(currency)})`
-                        : "Paid To (Recipient)"}
-                    </label>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs font-semibold text-slate-600">
+                        {type === "expense"
+                          ? splitMode === "equal"
+                            ? `Split Among (${selectedMembers.length} selected)`
+                            : splitMode === "percentage"
+                              ? "Split by Percentage (%)"
+                              : `Split by Exact Amount (${getCurrencySymbol(currency)})`
+                          : "Paid To (Recipient)"}
+                      </label>
+                      {type === "expense" &&
+                        splitMode === "equal" &&
+                        members.length > 0 && (
+                          <span className="inline-flex items-center gap-1.5 text-[11px]">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSelectedMembers(members.map((m) => m.id))
+                              }
+                              className="text-blue-600 hover:text-blue-700 font-semibold cursor-pointer"
+                            >
+                              All
+                            </button>
+                            <span className="text-slate-300">•</span>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedMembers([])}
+                              className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                            >
+                              Clear
+                            </button>
+                          </span>
+                        )}
+                    </div>
 
                     {type === "expense" && (
                       <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
                         <button
                           type="button"
                           onClick={() => setSplitMode("equal")}
-                          className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          className={`px-2 py-0.5 rounded-md font-semibold transition cursor-pointer ${
                             splitMode === "equal"
                               ? "bg-white text-blue-700 shadow-2xs"
                               : "text-slate-500 hover:text-slate-800"
@@ -3694,13 +4179,13 @@ export function SettleUpDashboard({
                         <button
                           type="button"
                           onClick={() => setSplitMode("percentage")}
-                          className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          className={`px-2 py-0.5 rounded-md font-semibold transition cursor-pointer ${
                             splitMode === "percentage"
                               ? "bg-white text-blue-700 shadow-2xs"
                               : "text-slate-500 hover:text-slate-800"
                           }`}
                         >
-                          % Percentage
+                          % Pct
                         </button>
                         <button
                           type="button"
@@ -3712,7 +4197,7 @@ export function SettleUpDashboard({
                               );
                             }
                           }}
-                          className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          className={`px-2 py-0.5 rounded-md font-semibold transition cursor-pointer ${
                             splitMode === "exact"
                               ? "bg-white text-blue-700 shadow-2xs"
                               : "text-slate-500 hover:text-slate-800"
@@ -3726,29 +4211,7 @@ export function SettleUpDashboard({
 
                   {type === "payment" || splitMode === "equal" ? (
                     <>
-                      {type === "expense" && members.length > 0 && (
-                        <div className="flex items-center justify-end gap-2 text-xs">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setSelectedMembers(members.map((m) => m.id))
-                            }
-                            className="text-blue-600 hover:text-blue-700 font-semibold cursor-pointer"
-                          >
-                            Select All
-                          </button>
-                          <span className="text-slate-300">•</span>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedMembers([])}
-                            className="text-slate-400 hover:text-slate-600 cursor-pointer"
-                          >
-                            Clear
-                          </button>
-                        </div>
-                      )}
-
-                      <div className="flex flex-wrap gap-2">
+                      <div className="flex flex-wrap gap-1.5">
                         {members.map((m) => {
                           const isSelected = selectedMembers.includes(m.id);
                           const isSelfPayment =
@@ -3771,7 +4234,7 @@ export function SettleUpDashboard({
                                   );
                                 }
                               }}
-                              className={`px-3 py-1.5 rounded-full text-xs font-medium border transition flex items-center gap-1.5 ${
+                              className={`px-2.5 py-1 rounded-full text-xs font-medium border transition flex items-center gap-1 ${
                                 isSelfPayment
                                   ? "bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed opacity-60"
                                   : isSelected
@@ -3790,7 +4253,7 @@ export function SettleUpDashboard({
 
                       {/* Live split calculation preview */}
                       {perPersonAmount && type === "expense" && (
-                        <div className="p-2.5 bg-blue-50/70 border border-blue-100 rounded-xl text-xs text-blue-800 flex items-center justify-between animate-in fade-in-50">
+                        <div className="px-3 py-1.5 bg-blue-50/70 border border-blue-100 rounded-xl text-xs text-blue-800 flex items-center justify-between">
                           <span className="flex items-center gap-1.5">
                             <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
                             <span>
@@ -3801,7 +4264,7 @@ export function SettleUpDashboard({
                               :
                             </span>
                           </span>
-                          <span className="font-bold text-blue-900 text-sm">
+                          <span className="font-bold text-blue-900 text-xs sm:text-sm">
                             {getCurrencySymbol(currency)}
                             {perPersonAmount} each
                           </span>
@@ -3817,7 +4280,7 @@ export function SettleUpDashboard({
                           return (
                             <div
                               key={m.id}
-                              className="flex items-center justify-between gap-2 p-2.5 rounded-xl border border-slate-200 bg-slate-50/60"
+                              className="flex items-center justify-between gap-2 p-2 rounded-xl border border-slate-200 bg-slate-50/60"
                             >
                               <div className="min-w-0 flex-1">
                                 <span className="text-xs font-semibold text-slate-800 block truncate">
@@ -3855,7 +4318,7 @@ export function SettleUpDashboard({
                       </div>
 
                       <div
-                        className={`p-2.5 rounded-xl text-xs flex items-center justify-between border ${
+                        className={`p-2 rounded-xl text-xs flex items-center justify-between border ${
                           percentageSummary.isValid
                             ? "bg-emerald-50 border-emerald-200 text-emerald-800"
                             : "bg-amber-50 border-amber-200 text-amber-800"
@@ -3885,7 +4348,7 @@ export function SettleUpDashboard({
                         {members.map((m) => (
                           <div
                             key={m.id}
-                            className="flex items-center justify-between gap-2 p-2.5 rounded-xl border border-slate-200 bg-slate-50/60"
+                            className="flex items-center justify-between gap-2 p-2 rounded-xl border border-slate-200 bg-slate-50/60"
                           >
                             <span className="text-xs font-semibold text-slate-800 truncate flex-1">
                               {m.name}
@@ -3934,7 +4397,7 @@ export function SettleUpDashboard({
                       </div>
 
                       <div
-                        className={`p-2.5 rounded-xl text-xs flex items-center justify-between border ${
+                        className={`p-2 rounded-xl text-xs flex items-center justify-between border ${
                           exactSummary.valid
                             ? "bg-emerald-50 border-emerald-200 text-emerald-800"
                             : "bg-amber-50 border-amber-200 text-amber-800"
@@ -3967,71 +4430,133 @@ export function SettleUpDashboard({
                 <button
                   type="submit"
                   disabled={members.length === 0}
-                  className="w-full bg-slate-900 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-slate-800 transition cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full bg-slate-900 text-white py-2 rounded-xl text-sm font-semibold hover:bg-slate-800 transition cursor-pointer shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Save Transaction
                 </button>
               </form>
               )}
 
-              {/* Ledger Table with Currency Isolation Filter and Group-Wide Editing */}
+              {/* Ledger Table with Quick Type Filter, Search Input, Currency Filter, and Group-Wide Editing */}
               <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <h3 className="font-bold text-sm text-slate-900">
-                      Transaction History
-                    </h3>
-                    <p className="text-xs text-slate-400">
-                      Showing {filteredExpenses.length} of {expenses.length}{" "}
-                      records •{" "}
-                      {activeGroup.is_archived
-                        ? "Archived (Read-Only)"
-                        : "Anyone with the group link can edit or delete"}
-                    </p>
+                <div className="px-4 sm:px-5 py-3.5 border-b border-slate-200 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="font-bold text-sm text-slate-900">
+                        Transaction History
+                      </h3>
+                      <p className="text-[11px] text-slate-400">
+                        Showing {filteredExpenses.length} of {expenses.length}{" "}
+                        records •{" "}
+                        {activeGroup.is_archived
+                          ? "Archived (Read-Only)"
+                          : "Anyone with the group link can edit or delete"}
+                      </p>
+                    </div>
+
+                    {/* Currency Segmented Tabs (Only shown when group has 2+ currencies) */}
+                    {activeGroupCurrencies.length > 1 && (
+                      <div className="flex flex-wrap bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setHistoryCurrencyFilter("all")}
+                          className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                            historyCurrencyFilter === "all"
+                              ? "bg-white text-slate-900 shadow-2xs"
+                              : "text-slate-500 hover:text-slate-800"
+                          }`}
+                        >
+                          All
+                        </button>
+                        {activeGroupCurrencies.map((code) => {
+                          const count = expenses.filter(
+                            (e) => normalizeCurrencyCode(e.currency) === code
+                          ).length;
+                          const sym = getCurrencySymbol(code);
+                          return (
+                            <button
+                              key={code}
+                              type="button"
+                              onClick={() => setHistoryCurrencyFilter(code)}
+                              className={`px-2 py-1 rounded-md font-semibold transition cursor-pointer ${
+                                historyCurrencyFilter === code
+                                  ? "bg-white text-blue-700 shadow-2xs"
+                                  : "text-slate-500 hover:text-slate-800"
+                              }`}
+                            >
+                              {sym} {code} ({count})
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
 
-                  {/* Currency Segmented Tabs (Only shown when group has 2+ currencies) */}
-                  {activeGroupCurrencies.length > 1 && (
-                    <div className="flex flex-wrap bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs">
+                  {/* Quick Filter Pill Bar (All | Expenses | Payments) + Compact Search Input */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200 text-xs self-start">
                       <button
                         type="button"
-                        onClick={() => setHistoryCurrencyFilter("all")}
-                        className={`px-3 py-1 rounded-md font-semibold transition cursor-pointer ${
-                          historyCurrencyFilter === "all"
+                        onClick={() => setHistoryTypeFilter("all")}
+                        className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          historyTypeFilter === "all"
                             ? "bg-white text-slate-900 shadow-2xs"
                             : "text-slate-500 hover:text-slate-800"
                         }`}
                       >
                         All
                       </button>
-                      {activeGroupCurrencies.map((code) => {
-                        const count = expenses.filter(
-                          (e) => normalizeCurrencyCode(e.currency) === code
-                        ).length;
-                        const sym = getCurrencySymbol(code);
-                        return (
-                          <button
-                            key={code}
-                            type="button"
-                            onClick={() => setHistoryCurrencyFilter(code)}
-                            className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
-                              historyCurrencyFilter === code
-                                ? "bg-white text-blue-700 shadow-2xs"
-                                : "text-slate-500 hover:text-slate-800"
-                            }`}
-                          >
-                            {sym} {code} ({count})
-                          </button>
-                        );
-                      })}
+                      <button
+                        type="button"
+                        onClick={() => setHistoryTypeFilter("expense")}
+                        className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          historyTypeFilter === "expense"
+                            ? "bg-white text-rose-700 shadow-2xs"
+                            : "text-slate-500 hover:text-slate-800"
+                        }`}
+                      >
+                        Expenses
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setHistoryTypeFilter("payment")}
+                        className={`px-2.5 py-1 rounded-md font-semibold transition cursor-pointer ${
+                          historyTypeFilter === "payment"
+                            ? "bg-white text-blue-700 shadow-2xs"
+                            : "text-slate-500 hover:text-slate-800"
+                        }`}
+                      >
+                        Payments
+                      </button>
                     </div>
-                  )}
+
+                    <div className="relative flex-1 sm:max-w-xs">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={historySearchQuery}
+                        onChange={(e) => setHistorySearchQuery(e.target.value)}
+                        placeholder="Filter by description, category, payer..."
+                        className="w-full pl-8 pr-7 py-1 border border-slate-200 rounded-lg text-xs text-slate-800 placeholder:text-slate-400 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition"
+                      />
+                      {historySearchQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setHistorySearchQuery("")}
+                          aria-label="Clear search"
+                          className="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600 text-xs cursor-pointer"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
 
-                <div className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
+                <div className="divide-y divide-slate-100 max-h-[36rem] lg:max-h-none overflow-y-auto">
                   {filteredExpenses.length === 0 ? (
                     <div className="p-8 text-center text-xs text-slate-400 italic">
-                      No transactions recorded for this currency filter.
+                      No matching transactions found.
                     </div>
                   ) : (
                     filteredExpenses.map((exp) => {
@@ -4048,7 +4573,7 @@ export function SettleUpDashboard({
                       return (
                         <div
                           key={exp.id}
-                          className={`p-4 flex items-center justify-between text-sm hover:bg-slate-50/60 transition gap-3 border-l-4 ${
+                          className={`p-3.5 sm:p-4 flex items-center justify-between text-sm hover:bg-slate-50/60 transition gap-3 border-l-4 ${
                             isPayment
                               ? "border-l-[#BDE0FF] bg-[#F8FBFF]"
                               : "border-l-[#FFC4C4] bg-[#FFFBFB]"
@@ -4163,393 +4688,9 @@ export function SettleUpDashboard({
           )}
         </section>
 
-        {/* Multi-Currency & Unified Settlement Minimization Plan */}
-        <aside className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs h-fit space-y-4">
-          <div className="space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="font-bold text-slate-900 text-base flex items-center gap-2">
-                <Wallet className="w-4 h-4 text-blue-600" />
-                Settlement Plan
-              </h2>
-            </div>
-            <p className="text-xs text-slate-500">
-              {hasMultipleCurrencies && isUnifiedMode
-                ? `Unified cross-currency cash-flow minimization converted into ${unifiedTargetCurrency}.`
-                : "Greedy cash-flow minimization pairing largest debtors with largest creditors."}
-            </p>
-
-            {/* 🌐 Unified Settlement (Convert All) Toggle & Exchange Rate Controls */}
-            {hasMultipleCurrencies && (
-              <div className="pt-1 space-y-2.5">
-                <button
-                  type="button"
-                  onClick={() => setIsUnifiedMode((prev) => !prev)}
-                  className={`w-full py-2 px-3 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                    isUnifiedMode
-                      ? "bg-emerald-600 text-white border-emerald-600 shadow-2xs"
-                      : "bg-emerald-50/70 hover:bg-emerald-100/80 text-emerald-900 border-emerald-200"
-                  }`}
-                >
-                  <Globe className="w-3.5 h-3.5 shrink-0" />
-                  <span>
-                    {isUnifiedMode
-                      ? "🌐 Unified Settlement Active"
-                      : "🌐 Unified Settlement (Convert All)"}
-                  </span>
-                </button>
-
-                {isUnifiedMode && (
-                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-3 text-xs">
-                    <div className="flex items-center justify-between gap-2">
-                      <label className="font-semibold text-slate-700">
-                        Settle All In:
-                      </label>
-                      <select
-                        value={normalizeCurrencyCode(unifiedTargetCurrency)}
-                        onChange={(e) =>
-                          handleSelectUnifiedTargetCurrency(e.target.value)
-                        }
-                        className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
-                      >
-                        {activeGroupCurrencies.map((code) => (
-                          <option key={code} value={code}>
-                            {code} ({getCurrencySymbol(code)})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div className="space-y-2 pt-2 border-t border-slate-200/80">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[11px] font-semibold text-slate-600">
-                          Exchange Rates
-                        </span>
-                        <button
-                          type="button"
-                          disabled={isFetchingRates}
-                          onClick={handleFetchLiveRates}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 transition cursor-pointer disabled:opacity-50"
-                        >
-                          <RefreshCw
-                            className={`w-3 h-3 ${
-                              isFetchingRates ? "animate-spin" : ""
-                            }`}
-                          />
-                          <span>
-                            {isFetchingRates
-                              ? "Fetching..."
-                              : "Fetch Live Rates"}
-                          </span>
-                        </button>
-                      </div>
-
-                      <div className="space-y-1.5">
-                        {activeGroupCurrencies
-                          .filter(
-                            (code) =>
-                              code !==
-                              normalizeCurrencyCode(unifiedTargetCurrency)
-                          )
-                          .map((otherCode) => (
-                            <div
-                              key={otherCode}
-                              className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
-                            >
-                              <span className="text-[11px] font-medium text-slate-600 shrink-0">
-                                1 {unifiedTargetCurrency} =
-                              </span>
-                              <div className="flex items-center gap-1.5">
-                                <input
-                                  type="number"
-                                  step="any"
-                                  min="0.000001"
-                                  value={
-                                    exchangeRatesInput[otherCode] ??
-                                    String(
-                                      numericExchangeRates[otherCode] ?? 1
-                                    )
-                                  }
-                                  onChange={(e) =>
-                                    setExchangeRatesInput((prev) => ({
-                                      ...prev,
-                                      [otherCode]: e.target.value,
-                                    }))
-                                  }
-                                  className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                                />
-                                <span className="text-[11px] font-bold text-slate-700 w-8">
-                                  {otherCode}
-                                </span>
-                              </div>
-                            </div>
-                          ))}
-                      </div>
-
-                      {!activeGroup?.is_archived && (
-                        <button
-                          type="button"
-                          disabled={isSavingRates}
-                          onClick={handleSaveExchangeRates}
-                          className="w-full py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white transition cursor-pointer disabled:opacity-50"
-                        >
-                          {isSavingRates
-                            ? "Saving Rates..."
-                            : "Save Exchange Rates"}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {hasMultipleCurrencies && isUnifiedMode ? (
-            <div className="space-y-2 pt-3 border-t border-slate-100">
-              <div className="flex items-center justify-between text-xs font-bold text-emerald-900">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
-                  Unified ({unifiedTargetCurrency}) Plan
-                </span>
-                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
-                  {unifiedResult.settlements.length === 0
-                    ? "Settled"
-                    : `${unifiedResult.settlements.length} transfer(s)`}
-                </span>
-              </div>
-
-              {unifiedResult.settlements.length === 0 ? (
-                <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                  All combined cross-currency debts are settled up.
-                </div>
-              ) : (
-                unifiedResult.settlements.map((s, idx) => {
-                  const otherCodes = activeGroupCurrencies.filter(
-                    (c) => c !== normalizeCurrencyCode(unifiedTargetCurrency)
-                  );
-                  const secondaryEquivalents = otherCodes
-                    .map((otherCode) => {
-                      const rate = numericExchangeRates[otherCode];
-                      if (!rate || rate <= 0) return null;
-                      const eqCents = Math.round(s.amountCents * rate);
-                      return formatCurrency(eqCents, otherCode);
-                    })
-                    .filter(Boolean);
-
-                  return (
-                    <div
-                      key={idx}
-                      className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl text-xs space-y-1.5"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="space-y-1 min-w-0">
-                          <div className="text-slate-700">
-                            <span className="font-bold text-slate-900">
-                              {s.fromUser}
-                            </span>{" "}
-                            pays{" "}
-                            <span className="font-bold text-slate-900">
-                              {s.toUser}
-                            </span>
-                          </div>
-                          <div className="text-sm font-bold text-emerald-800 flex items-baseline gap-1.5 flex-wrap">
-                            <span>
-                              {formatCurrency(
-                                s.amountCents,
-                                unifiedTargetCurrency
-                              )}
-                            </span>
-                            {secondaryEquivalents.length > 0 && (
-                              <span className="text-[11px] font-medium text-emerald-700/80">
-                                (≈ {secondaryEquivalents.join(" • ")})
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        {!activeGroup?.is_archived && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleQuickSettle(s, unifiedTargetCurrency)
-                            }
-                            title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
-                          >
-                            <CheckCircle2 className="w-3 h-3" />
-                            <span>Settle</span>
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          ) : (
-            displayCurrencies.map((code, idx) => {
-              const list = settlementsByCurrency[code] || [];
-              const sym = getCurrencySymbol(code);
-              const isSecondary = idx % 2 === 1;
-              return (
-                <div
-                  key={code}
-                  className="space-y-2 pt-3 border-t border-slate-100"
-                >
-                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
-                    <span className="flex items-center gap-1.5">
-                      <span
-                        className={`w-2 h-2 rounded-full ${
-                          isSecondary ? "bg-indigo-600" : "bg-blue-600"
-                        }`}
-                      ></span>
-                      {code} ({sym}) Ledger
-                    </span>
-                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
-                      {list.length === 0
-                        ? "Settled"
-                        : `${list.length} transfer(s)`}
-                    </span>
-                  </div>
-
-                  {list.length === 0 ? (
-                    <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                      All {code} debts are settled up.
-                    </div>
-                  ) : (
-                    list.map((s, sIdx) => (
-                      <div
-                        key={sIdx}
-                        className={`p-3 rounded-xl text-xs space-y-1 border ${
-                          isSecondary
-                            ? "bg-indigo-50/50 border-indigo-100"
-                            : "bg-blue-50/50 border-blue-100"
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="space-y-1 min-w-0">
-                            <div className="text-slate-700">
-                              <span className="font-bold text-slate-900">
-                                {s.fromUser}
-                              </span>{" "}
-                              pays{" "}
-                              <span className="font-bold text-slate-900">
-                                {s.toUser}
-                              </span>
-                            </div>
-                            <div
-                              className={`text-sm font-bold ${
-                                isSecondary
-                                  ? "text-indigo-700"
-                                  : "text-blue-700"
-                              }`}
-                            >
-                              {formatCurrency(s.amountCents, code)}
-                            </div>
-                          </div>
-
-                          {!activeGroup?.is_archived && (
-                            <button
-                              type="button"
-                              onClick={() => handleQuickSettle(s, code)}
-                              title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
-                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold text-white shadow-2xs transition cursor-pointer shrink-0 ${
-                                isSecondary
-                                  ? "bg-indigo-600 hover:bg-indigo-700"
-                                  : "bg-blue-600 hover:bg-blue-700"
-                              }`}
-                            >
-                              <CheckCircle2 className="w-3 h-3" />
-                              <span>Settle</span>
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              );
-            })
-          )}
-
-          {/* Spend by Category Breakdown (Per Currency, Strictly Expenses) */}
-          {activeGroup && (
-            <div className="space-y-4 pt-4 border-t border-slate-200">
-              <div>
-                <h2 className="font-bold text-slate-900 text-base flex items-center gap-2">
-                  <Tag className="w-4 h-4 text-blue-600" />
-                  Spend by Category
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Group expenses aggregated by category (excludes settlement
-                  payments).
-                </p>
-              </div>
-
-              {displayCurrencies.map((code, idx) => {
-                const catList = categorySpendByCurrency[code] || [];
-                const sym = getCurrencySymbol(code);
-                const isSecondary = idx % 2 === 1;
-                if (idx > 0 && catList.length === 0) return null;
-
-                return (
-                  <div
-                    key={code}
-                    className={`space-y-2.5 ${
-                      idx > 0 ? "pt-3 border-t border-slate-100" : ""
-                    }`}
-                  >
-                    {displayCurrencies.length > 1 && (
-                      <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                        <span
-                          className={`w-2 h-2 rounded-full ${
-                            isSecondary ? "bg-indigo-600" : "bg-blue-600"
-                          }`}
-                        ></span>
-                        {code} ({sym}) Categories
-                      </div>
-                    )}
-
-                    {catList.length === 0 ? (
-                      <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                        No {code} expenses recorded yet.
-                      </div>
-                    ) : (
-                      <div className="space-y-2.5">
-                        {catList.map((c) => (
-                          <div key={c.category} className="space-y-1 text-xs">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="font-semibold text-slate-800 truncate">
-                                {c.category}
-                              </span>
-                              <span className="text-slate-600 font-medium shrink-0">
-                                <strong className="text-slate-900">
-                                  {formatCurrency(c.amountCents, code)}
-                                </strong>{" "}
-                                <span className="text-[11px] text-slate-400">
-                                  ({c.percentage.toFixed(1)}%)
-                                </span>
-                              </span>
-                            </div>
-                            <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                              <div
-                                className={`h-full rounded-full transition-all ${
-                                  isSecondary ? "bg-indigo-600" : "bg-blue-600"
-                                }`}
-                                style={{
-                                  width: `${Math.min(100, Math.max(2, c.percentage))}%`,
-                                }}
-                              />
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
+        {/* Desktop Right Column: Unified Tabbed Balances & Analytics Card (lg:sticky lg:top-6) */}
+        <aside className="hidden lg:block lg:sticky lg:top-6 lg:self-start">
+          {renderBalancesAndAnalyticsCard()}
         </aside>
       </div>
       )}
