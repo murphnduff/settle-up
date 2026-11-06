@@ -1,12 +1,16 @@
-import { NextResponse, connection } from "next/server";
+import { NextRequest, NextResponse, connection } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
 // Note: `nextConfig.cacheComponents` is enabled in `next.config.ts`, which disallows
-// legacy `export const dynamic` / `export const revalidate` segment configs at build time.
-// Calling `await connection()` below forces dynamic request-time execution on every invocation.
+// legacy `export const dynamic = 'force-dynamic'` / `export const revalidate = 0` exports.
+// Calling `await connection()` and reading `request.headers` guarantees dynamic request-time execution.
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   await connection();
+
+  const timestamp = new Date().toISOString();
+  const userAgent = request.headers.get("user-agent") || "manual";
+  const triggeredBy = userAgent.slice(0, 120);
 
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -17,11 +21,11 @@ export async function GET() {
         ok: false,
         status: "error",
         message: "Missing Supabase environment variables",
-        timestamp: new Date().toISOString(),
+        timestamp,
       },
       {
         status: 500,
-        headers: { "Cache-Control": "no-store" },
+        headers: { "Cache-Control": "no-store, max-age=0" },
       }
     );
   }
@@ -53,43 +57,81 @@ export async function GET() {
     supabase.storage.from("receipts").list("", { limit: 1 }),
   ]);
 
-  const firstError =
+  const queryError =
     groupsRes.error || membersRes.error || expensesRes.error || storageRes.error;
 
-  if (firstError) {
+  if (queryError) {
     return NextResponse.json(
       {
         ok: false,
         status: "error",
-        message: firstError.message,
-        timestamp: new Date().toISOString(),
+        message: queryError.message,
+        timestamp,
       },
       {
         status: 500,
-        headers: { "Cache-Control": "no-store" },
+        headers: { "Cache-Control": "no-store, max-age=0" },
       }
     );
   }
 
   const groupsCount = groupsRes.count ?? groupsRes.data?.length ?? 0;
 
+  const { error: insertError } = await supabase.from("heartbeat_logs").insert({
+    triggered_by: triggeredBy,
+    groups_count: groupsCount,
+  });
+
+  if (insertError) {
+    return NextResponse.json(
+      {
+        ok: false,
+        status: "error",
+        message: insertError.message,
+        timestamp,
+      },
+      {
+        status: 500,
+        headers: { "Cache-Control": "no-store, max-age=0" },
+      }
+    );
+  }
+
+  const thirtyDaysAgoIso = new Date(
+    Date.now() - 30 * 24 * 60 * 60 * 1000
+  ).toISOString();
+
+  const { error: cleanupError } = await supabase
+    .from("heartbeat_logs")
+    .delete()
+    .lt("created_at", thirtyDaysAgoIso);
+
+  if (cleanupError) {
+    console.warn("[Heartbeat] Failed to prune old heartbeat_logs:", cleanupError.message);
+  }
+
+  console.log("[Heartbeat]", {
+    triggered_by: triggeredBy,
+    groupsCount,
+    timestamp,
+  });
+
   return NextResponse.json(
     {
       ok: true,
       status: "ok",
-      timestamp: new Date().toISOString(),
+      triggeredBy,
       groupsCount,
-      membersCount: membersRes.count ?? membersRes.data?.length ?? 0,
-      expensesCount: expensesRes.count ?? expensesRes.data?.length ?? 0,
-      receiptsChecked: storageRes.data?.length ?? 0,
+      timestamp,
     },
     {
       headers: {
-        "Cache-Control": "no-store",
+        "Cache-Control": "no-store, max-age=0",
       },
     }
   );
 }
+
 
 
 

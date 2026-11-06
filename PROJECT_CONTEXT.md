@@ -3,7 +3,7 @@
 ## 1. Tech Stack & Infrastructure
 - **Frontend / Fullstack:** Next.js 16 (App Router, React 19, TypeScript, Tailwind CSS, Lucide Icons) — fully responsive across Desktop, Tablet, and Mobile.
 - **Backend / Database:** Supabase (PostgreSQL 15+, Google OAuth for Super-Admin only, Row-Level Security).
-- **Keep-Alive Heartbeat:** Next.js API route (`/api/heartbeat`) + daily `vercel.json` cron job (`0 9 * * *`) executing uncached REST + Storage API activity (`groups`, `group_members`, `expenses`, and `storage.from('receipts').list()`) to prevent Supabase Free Tier 7-day inactivity pausing.
+- **Keep-Alive Heartbeat:** Next.js API route (`/api/heartbeat`) + daily `vercel.json` cron job (`0 9 * * *`) executing uncached REST + Storage API reads (`groups`, `group_members`, `expenses`, `storage.from('receipts').list()`) and persistent write/prune activity in `public.heartbeat_logs` (30-day rolling retention) to prevent Supabase Free Tier 7-day inactivity pausing.
 - **Testing & Tooling:** Node 24 built-in test runner (`node --experimental-strip-types --test`), ESLint 9.
 - **Hosting & Production:** Vercel (`https://split.murphnduff.org`).
 - **Deployment Workflow:** Local commits pushed via PowerShell `sync "commit message"` macro.
