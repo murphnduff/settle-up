@@ -19,8 +19,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(
       {
         ok: false,
-        status: "error",
-        message: "Missing Supabase environment variables",
+        error: "Missing Supabase environment variables",
         timestamp,
       },
       {
@@ -30,107 +29,147 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const supabase = createClient(supabaseUrl, supabaseKey, {
-    auth: { persistSession: false },
-    global: {
-      fetch: (url, options = {}) =>
-        fetch(url, { ...options, cache: "no-store" }),
-    },
-  });
-
-  const [groupsRes, membersRes, expensesRes, storageRes] = await Promise.all([
-    supabase
-      .from("groups")
-      .select("id", { count: "exact" })
-      .order("created_at", { ascending: false })
-      .limit(1),
-    supabase
-      .from("group_members")
-      .select("id", { count: "exact" })
-      .order("created_at", { ascending: false })
-      .limit(1),
-    supabase
-      .from("expenses")
-      .select("id", { count: "exact" })
-      .order("created_at", { ascending: false })
-      .limit(1),
-    supabase.storage.from("receipts").list("", { limit: 1 }),
-  ]);
-
-  const queryError =
-    groupsRes.error || membersRes.error || expensesRes.error || storageRes.error;
-
-  if (queryError) {
-    return NextResponse.json(
-      {
-        ok: false,
-        status: "error",
-        message: queryError.message,
-        timestamp,
+  try {
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false },
+      global: {
+        fetch: (url, options = {}) =>
+          fetch(url, { ...options, cache: "no-store" }),
       },
-      {
-        status: 500,
-        headers: { "Cache-Control": "no-store, max-age=0" },
-      }
-    );
-  }
+    });
 
-  const groupsCount = groupsRes.count ?? groupsRes.data?.length ?? 0;
+    const warnings: string[] = [];
+    let reachedSupabase = false;
+    let groupsCount = 0;
 
-  const { error: insertError } = await supabase.from("heartbeat_logs").insert({
-    triggered_by: triggeredBy,
-    groups_count: groupsCount,
-  });
+    // 1. Query groups, group_members, expenses, and storage independently
+    const [groupsRes, membersRes, expensesRes, storageRes] = await Promise.all([
+      supabase
+        .from("groups")
+        .select("id", { count: "exact" })
+        .order("created_at", { ascending: false })
+        .limit(1),
+      supabase
+        .from("group_members")
+        .select("id", { count: "exact" })
+        .limit(1),
+      supabase
+        .from("expenses")
+        .select("id", { count: "exact" })
+        .order("created_at", { ascending: false })
+        .limit(1),
+      supabase.storage.from("receipts").list("", { limit: 1 }),
+    ]);
 
-  if (insertError) {
-    return NextResponse.json(
-      {
-        ok: false,
-        status: "error",
-        message: insertError.message,
-        timestamp,
-      },
-      {
-        status: 500,
-        headers: { "Cache-Control": "no-store, max-age=0" },
-      }
-    );
-  }
-
-  const thirtyDaysAgoIso = new Date(
-    Date.now() - 30 * 24 * 60 * 60 * 1000
-  ).toISOString();
-
-  const { error: cleanupError } = await supabase
-    .from("heartbeat_logs")
-    .delete()
-    .lt("created_at", thirtyDaysAgoIso);
-
-  if (cleanupError) {
-    console.warn("[Heartbeat] Failed to prune old heartbeat_logs:", cleanupError.message);
-  }
-
-  console.log("[Heartbeat]", {
-    triggered_by: triggeredBy,
-    groupsCount,
-    timestamp,
-  });
-
-  return NextResponse.json(
-    {
-      ok: true,
-      status: "ok",
-      triggeredBy,
-      groupsCount,
-      timestamp,
-    },
-    {
-      headers: {
-        "Cache-Control": "no-store, max-age=0",
-      },
+    if (groupsRes.error) {
+      warnings.push(`groups: ${groupsRes.error.message}`);
+    } else {
+      reachedSupabase = true;
+      groupsCount = groupsRes.count ?? groupsRes.data?.length ?? 0;
     }
-  );
+
+    if (membersRes.error) {
+      warnings.push(`group_members: ${membersRes.error.message}`);
+    } else {
+      reachedSupabase = true;
+    }
+
+    if (expensesRes.error) {
+      warnings.push(`expenses: ${expensesRes.error.message}`);
+    } else {
+      reachedSupabase = true;
+    }
+
+    if (storageRes.error) {
+      warnings.push(`storage.receipts: ${storageRes.error.message}`);
+    } else {
+      reachedSupabase = true;
+    }
+
+    // 2. Insert persistent heartbeat log row
+    const { error: insertError } = await supabase.from("heartbeat_logs").insert({
+      triggered_by: triggeredBy,
+      groups_count: groupsCount,
+    });
+
+    if (insertError) {
+      warnings.push(`heartbeat_logs.insert: ${insertError.message}`);
+    } else {
+      reachedSupabase = true;
+    }
+
+    // 3. Prune heartbeat_logs older than 30 days using a valid JS ISO string
+    const thirtyDaysAgoIso = new Date(
+      Date.now() - 30 * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    const { error: cleanupError } = await supabase
+      .from("heartbeat_logs")
+      .delete()
+      .lt("created_at", thirtyDaysAgoIso);
+
+    if (cleanupError) {
+      warnings.push(`heartbeat_logs.cleanup: ${cleanupError.message}`);
+    } else {
+      reachedSupabase = true;
+    }
+
+    if (!reachedSupabase) {
+      const fatalMsg =
+        warnings.join("; ") || "Supabase is completely unreachable";
+      return NextResponse.json(
+        {
+          ok: false,
+          error: fatalMsg,
+          warnings,
+          timestamp,
+        },
+        {
+          status: 500,
+          headers: { "Cache-Control": "no-store, max-age=0" },
+        }
+      );
+    }
+
+    console.log("[Heartbeat]", {
+      triggered_by: triggeredBy,
+      groupsCount,
+      warnings: warnings.length > 0 ? warnings : undefined,
+      timestamp,
+    });
+
+    return NextResponse.json(
+      {
+        ok: true,
+        status: "ok",
+        triggeredBy,
+        groupsCount,
+        timestamp,
+        ...(warnings.length > 0 ? { warnings } : {}),
+      },
+      {
+        headers: {
+          "Cache-Control": "no-store, max-age=0",
+        },
+      }
+    );
+  } catch (err: unknown) {
+    const errorMessage =
+      err instanceof Error ? err.message : "Unexpected heartbeat error";
+    return NextResponse.json(
+      {
+        ok: false,
+        error: errorMessage,
+        timestamp,
+      },
+      {
+        status: 500,
+        headers: { "Cache-Control": "no-store, max-age=0" },
+      }
+    );
+  }
 }
+
 
 
 

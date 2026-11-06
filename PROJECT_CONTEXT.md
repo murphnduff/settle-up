@@ -28,7 +28,8 @@
 
 ### 2.2 Database Tables & Schema
 - **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `currencies` (TEXT[] DEFAULT `ARRAY['USD']`), `default_currency` (TEXT DEFAULT `'USD'`), `exchange_rates` (JSONB DEFAULT `'{}'`), `created_at` (TIMESTAMPTZ).
-- **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `created_at` (TIMESTAMPTZ). Unique constraint on `(group_id, lower(display_name))`.
+- **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL). Unique constraint on `(group_id, lower(display_name))`.
+- **`heartbeat_logs`**: `id` (UUID PK), `triggered_by` (TEXT), `groups_count` (INTEGER), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (TEXT — any 3-letter ISO currency code such as `'USD'`, `'EUR'`, `'AUD'`, `'THB'`, `'GBP'`, `'CAD'`, `'JPY'`, `'NZD'`, `'CHF'`, `'MXN'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
 - **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
 
