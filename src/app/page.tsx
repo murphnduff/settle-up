@@ -3526,6 +3526,8 @@ export function SettleUpDashboard({
     </div>
   );
 
+  const showGroupsSidebar = isSuperAdmin || groups.length > 1 || !activeGroup;
+
   return (
     <div className="min-h-screen bg-slate-50">
       <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 sm:py-3.5 flex items-center justify-between gap-2">
@@ -3683,8 +3685,8 @@ export function SettleUpDashboard({
         </div>
       ) : (
       <div className="max-w-7xl mx-auto p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-4 gap-4 sm:gap-6">
-        {/* Mobile Collapsible Group Switcher Bar (< lg when viewing an active group) */}
-        {activeGroup && (
+        {/* Mobile Collapsible Group Switcher Bar (< lg when viewing an active group and user has multiple groups or is Super-Admin) */}
+        {activeGroup && showGroupsSidebar && (
           <div className="lg:hidden">
             <button
               type="button"
@@ -3707,7 +3709,8 @@ export function SettleUpDashboard({
           </div>
         )}
 
-        {/* Groups Sidebar (Collapsed on mobile when viewing a group unless expanded; sticky on desktop lg+) */}
+        {/* Groups Sidebar (Collapsed on mobile when viewing a group unless expanded; hidden for single-group non-admin visitors) */}
+        {showGroupsSidebar && (
         <aside
           className={`${
             activeGroup && !isMobileGroupsOpen ? "hidden lg:flex" : "flex"
@@ -3991,9 +3994,14 @@ export function SettleUpDashboard({
             </div>
           )}
         </aside>
+        )}
 
         {/* Center Column: Compact Group Header, Add Transaction, and Transaction History */}
-        <section className="lg:col-span-2 min-w-0 space-y-4 sm:space-y-5">
+        <section
+          className={`${
+            showGroupsSidebar ? "lg:col-span-2" : "lg:col-span-3"
+          } min-w-0 space-y-4 sm:space-y-5`}
+        >
           {activeGroup ? (
             <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs space-y-2.5">
               {/* Row 1: Group Name + Inline Summary Pills (Left) & Primary Action Buttons (Right) */}
@@ -4402,10 +4410,7 @@ export function SettleUpDashboard({
 
           {activeGroup && (
             <>
-              {/* Mobile Unified Balances & Analytics Card (< lg, placed right above Add Transaction) */}
-              <div className="lg:hidden">{renderBalancesAndAnalyticsCard()}</div>
-
-              {/* Compact Add Transaction Form (Hidden when group is archived) */}
+              {/* Compact Add Transaction Form (First card below Group Header on both Desktop and Mobile; hidden when group is archived) */}
               {!activeGroup.is_archived && (
               <form
                 ref={addTransactionFormRef}
@@ -5258,6 +5263,9 @@ export function SettleUpDashboard({
                 </button>
               </form>
               )}
+
+              {/* Mobile Unified Balances & Analytics Card (< lg, placed below Add Transaction and above Transaction History) */}
+              <div className="lg:hidden">{renderBalancesAndAnalyticsCard()}</div>
 
               {/* Ledger Table with Quick Type Filter, Search Input, Currency Filter, and Group-Wide Editing */}
               <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">

@@ -132,8 +132,9 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
   - **Row 1:** Group Name, member count pill, inline spent summary pills (`$X Spent` per currency + `N txns`), primary `Copy Link` and `Currencies` buttons, and a compact `⚙️ Manage` dropdown menu (`Manage Members`, `Export CSV`, and `Archive / Unarchive Group`).
   - **Row 2:** Single horizontal identity bar (`Viewing as: [Murph] [Fitz (You)] [Kev] • Reset`).
 - **Unified Tabbed "Balances & Analytics" Card (`💸 Settle Up` | `👥 Members` | `🏷️ Categories`):**
-  - Consolidates **Settlement Plan** (`💸 Settle Up` with 1-click `Settle` buttons and Unified Settlement converter), **Member Summary** (`👥 Members`), and **Spend by Category** (`🏷️ Categories`) into a single 3-tab card placed in the sticky right column on desktop (`lg:sticky lg:top-6`) and directly above `Add Transaction` on mobile (`lg:hidden`).
-- **Fits-One-Screen "Add Transaction" Form & Ledger Filtering:**
+  - Consolidates **Settlement Plan** (`💸 Settle Up` with 1-click `Settle` buttons and Unified Settlement converter), **Member Summary** (`👥 Members`), and **Spend by Category** (`🏷️ Categories`) into a single 3-tab card placed in the sticky right column on desktop (`lg:sticky lg:top-6`) and directly below **Add Transaction** on mobile (`lg:hidden`).
+- **Top-of-View "Add Transaction" Form & Ledger Filtering:**
+  - Positioned at the very top of the default group view right beneath the compact Group Header on both Desktop (`lg+`, expanding to `lg:col-span-3` when a single-group non-admin visitor has no left sidebar) and Mobile (`< lg`, above Balances & Analytics and Transaction History).
   - Compact 1-line receipt bar (`grid-cols-3` buttons on mobile), 2-column `Paid By` + `Amount` grid on both mobile and desktop, 3-column `Description` + `Date` row, and tight category/participant pills.
   - **Transaction History** flows naturally on desktop (`lg:max-h-none`) and includes quick type filter pills (`All` | `Expenses` | `Payments`) plus a live search input filtering by description, category, payer, or recipient.
 - **Custom PWA App Icons (`public/icon-192.png`, `public/icon-512.png`, `public/apple-touch-icon.png`, `src/app/icon.tsx`, `src/app/apple-icon.tsx`):**
