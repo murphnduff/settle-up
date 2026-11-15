@@ -174,3 +174,258 @@ export function buildGroupCurrencies(
   return result;
 }
 
+export type FxRatesMap = Record<string, number>;
+
+/**
+ * Safely normalizes a raw JSONB `fx_rates` map into uppercase 3-letter ISO keys
+ * with positive finite numeric values. Returns `null` if no valid rates exist.
+ */
+export function normalizeFxRatesMap(
+  raw: unknown,
+  baseCurrency?: string | null
+): FxRatesMap | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const normalized: FxRatesMap = {};
+  let validCount = 0;
+
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const num = Number(v);
+    if (Number.isFinite(num) && num > 0) {
+      const code = normalizeCurrencyCode(k);
+      normalized[code] = Number(num.toPrecision(10));
+      validCount++;
+    }
+  }
+
+  if (validCount === 0) {
+    return null;
+  }
+
+  if (baseCurrency) {
+    const baseCode = normalizeCurrencyCode(baseCurrency);
+    if (!normalized[baseCode]) {
+      normalized[baseCode] = 1;
+    }
+  }
+
+  return normalized;
+}
+
+/**
+ * Resolves the locked conversion multiplier (`1 expenseCurrency = mult targetCurrency`)
+ * from an expense's `fx_rates` map, or returns `null` if unavailable.
+ */
+export function getLockedRateToTarget(
+  expenseCurrency: string,
+  targetCurrency: string,
+  fxRates?: FxRatesMap | null
+): number | null {
+  const expCode = normalizeCurrencyCode(expenseCurrency);
+  const targetCode = normalizeCurrencyCode(targetCurrency);
+  if (expCode === targetCode) return 1;
+  if (!fxRates || typeof fxRates !== "object") return null;
+
+  const rawTarget = Number(fxRates[targetCode]);
+  if (!Number.isFinite(rawTarget) || rawTarget <= 0) {
+    return null;
+  }
+
+  const rawSelf = Number(fxRates[expCode]);
+  const baseSelf = Number.isFinite(rawSelf) && rawSelf > 0 ? rawSelf : 1;
+  return rawTarget / baseSelf;
+}
+
+/**
+ * Formats an exchange rate number cleanly (e.g., 34.5 -> "34.50", 1.5234 -> "1.5234").
+ */
+export function formatFxQuoteNumber(rate: number): string {
+  if (!Number.isFinite(rate) || rate <= 0) return "1.00";
+  if (rate >= 100) {
+    return rate.toFixed(2);
+  }
+  if (rate >= 1) {
+    const fixed4 = rate.toFixed(4);
+    return fixed4.replace(/(\.\d{2,}?)0+$/, "$1");
+  }
+  const fixed6 = rate.toFixed(6);
+  return fixed6.replace(/(\.\d{4,}?)0+$/, "$1");
+}
+
+/**
+ * Formats a human-friendly FX quote between `expenseCurrency` and `targetCurrency`
+ * so values < 1 (such as THB -> USD) display intuitively as `1 USD = 34.50 THB`,
+ * while values >= 1 (such as EUR -> USD) display as `1 EUR = 1.08 USD`.
+ */
+export function formatFxDisplayQuote(
+  expenseCurrency: string,
+  targetCurrency: string,
+  rateExpToTarget: number
+): {
+  quoteText: string;
+  shortRateText: string;
+  isInverse: boolean;
+  displayRate: number;
+} {
+  const expCode = normalizeCurrencyCode(expenseCurrency);
+  const targetCode = normalizeCurrencyCode(targetCurrency);
+  const safeRate =
+    Number.isFinite(rateExpToTarget) && rateExpToTarget > 0
+      ? rateExpToTarget
+      : 1;
+
+  if (safeRate < 1) {
+    const inverse = 1 / safeRate;
+    const shortRateText = formatFxQuoteNumber(inverse);
+    return {
+      quoteText: `1 ${targetCode} = ${shortRateText} ${expCode}`,
+      shortRateText,
+      isInverse: true,
+      displayRate: inverse,
+    };
+  }
+
+  const shortRateText = formatFxQuoteNumber(safeRate);
+  return {
+    quoteText: `1 ${expCode} = ${shortRateText} ${targetCode}`,
+    shortRateText,
+    isInverse: false,
+    displayRate: safeRate,
+  };
+}
+
+const fxFetchCache = new Map<string, Promise<FxRatesMap>>();
+
+/**
+ * Fetches date-aware FX rates normalized as `1 unit of baseCurrency = X units of targetCurrency`
+ * (with `fx_rates[baseCurrency] = 1`).
+ *
+ * 1. Queries `https://api.frankfurter.dev/v1/${dateIso}?base=${baseCurrency}` first for free historical daily rates.
+ * 2. Merges/falls back to `https://open.er-api.com/v6/latest/${baseCurrency}` for today's live tick
+ *    or for any ISO currency code not returned by Frankfurter.
+ */
+export async function fetchTransactionFxRates(
+  baseCurrency: string,
+  dateIso: string,
+  targetCurrencies: string[] = []
+): Promise<FxRatesMap> {
+  const base = normalizeCurrencyCode(baseCurrency);
+  const todayUtc = new Date().toISOString().split("T")[0];
+  const cleanDateMatch = (dateIso || "").trim().match(/^(\d{4}-\d{2}-\d{2})/);
+  const cleanDate = cleanDateMatch ? cleanDateMatch[1] : todayUtc;
+  const queryDate = cleanDate > todayUtc ? todayUtc : cleanDate;
+  const isHistoricalDate = cleanDate < todayUtc;
+
+  const normalizedTargets = Array.from(
+    new Set(
+      targetCurrencies
+        .filter(Boolean)
+        .map((c) => normalizeCurrencyCode(c))
+        .filter((c) => c !== base)
+    )
+  ).sort();
+
+  const desiredKeepCodes = new Set<string>([
+    base,
+    ...SUPPORTED_CURRENCIES.map((c) => c.code),
+    ...normalizedTargets,
+  ]);
+
+  const cacheKey = `${base}::${cleanDate}::${normalizedTargets.join(",")}`;
+  const cached = fxFetchCache.get(cacheKey);
+  if (cached) {
+    return cached.then((r) => ({ ...r }));
+  }
+
+  const task = (async (): Promise<FxRatesMap> => {
+    const rates: FxRatesMap = { [base]: 1 };
+    let frankfurterOk = false;
+
+    try {
+      const frankfurterUrl = `https://api.frankfurter.dev/v1/${encodeURIComponent(
+        queryDate
+      )}?base=${encodeURIComponent(base)}`;
+      const res = await fetch(frankfurterUrl);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.rates && typeof data.rates === "object") {
+          frankfurterOk = true;
+          for (const [k, v] of Object.entries(
+            data.rates as Record<string, unknown>
+          )) {
+            const code = normalizeCurrencyCode(k);
+            const num = Number(v);
+            if (
+              desiredKeepCodes.has(code) &&
+              Number.isFinite(num) &&
+              num > 0
+            ) {
+              rates[code] = Number(num.toPrecision(10));
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall through to open.er-api.com fallback
+    }
+
+    const missingRequestedTarget = normalizedTargets.some(
+      (code) => !(code in rates)
+    );
+    const shouldQueryLiveApi =
+      !frankfurterOk || !isHistoricalDate || missingRequestedTarget;
+
+    if (shouldQueryLiveApi) {
+      try {
+        const liveUrl = `https://open.er-api.com/v6/latest/${encodeURIComponent(
+          base
+        )}`;
+        const res = await fetch(liveUrl);
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.rates && typeof data.rates === "object") {
+            for (const [k, v] of Object.entries(
+              data.rates as Record<string, unknown>
+            )) {
+              const code = normalizeCurrencyCode(k);
+              const num = Number(v);
+              if (
+                !desiredKeepCodes.has(code) ||
+                !Number.isFinite(num) ||
+                num <= 0
+              ) {
+                continue;
+              }
+              // On historical dates, only fill codes missing from Frankfurter so historical ECB rates stay preserved
+              if (!isHistoricalDate || !(code in rates)) {
+                rates[code] = Number(num.toPrecision(10));
+              }
+            }
+          }
+        }
+      } catch {
+        // Keep whatever rates were resolved so far
+      }
+    }
+
+    rates[base] = 1;
+    return rates;
+  })();
+
+  fxFetchCache.set(cacheKey, task);
+  try {
+    const resolved = await task;
+    // Evict from cache if no non-base rates were obtained (e.g. temporary offline failure)
+    if (normalizedTargets.length > 0 && Object.keys(resolved).length <= 1) {
+      fxFetchCache.delete(cacheKey);
+    }
+    return { ...resolved };
+  } catch (err) {
+    fxFetchCache.delete(cacheKey);
+    throw err;
+  }
+}
+
+

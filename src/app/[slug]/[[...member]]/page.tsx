@@ -3,12 +3,26 @@
 import { Suspense } from "react";
 import { useParams } from "next/navigation";
 import { SettleUpDashboard } from "@/app/page";
+import { safeDecodeUrlComponent } from "@/lib/reconciliation";
 
 function SlugGroupContent() {
-  const params = useParams<{ slug: string }>();
+  const params = useParams<{ slug?: string; member?: string | string[] }>();
   const slug = typeof params?.slug === "string" ? params.slug : "";
+  const rawMember = Array.isArray(params?.member)
+    ? params.member[0] || ""
+    : typeof params?.member === "string"
+      ? params.member
+      : "";
+  const initialMember = rawMember
+    ? safeDecodeUrlComponent(rawMember).trim()
+    : "";
 
-  return <SettleUpDashboard initialSlug={slug} />;
+  return (
+    <SettleUpDashboard
+      initialSlug={slug}
+      initialMember={initialMember || undefined}
+    />
+  );
 }
 
 export default function SlugGroupPage() {
@@ -26,4 +40,3 @@ export default function SlugGroupPage() {
     </Suspense>
   );
 }
-

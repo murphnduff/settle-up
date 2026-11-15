@@ -88,16 +88,33 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check if an explicit group slug was passed via query param or form field
+    // Check if an explicit group slug (and optional member) was passed via query param or form field
     const explicitGroup =
       request.nextUrl.searchParams.get("group")?.trim() ||
       (typeof formData.get("group") === "string"
         ? (formData.get("group") as string).trim()
         : "");
+    const explicitMember =
+      request.nextUrl.searchParams.get("member")?.trim() ||
+      (typeof formData.get("member") === "string"
+        ? (formData.get("member") as string).trim()
+        : "");
 
-    const targetPath = explicitGroup
-      ? `/${encodeURIComponent(explicitGroup)}?shared_receipt=${encodeURIComponent(publicUrl)}`
-      : `/?shared_receipt=${encodeURIComponent(publicUrl)}`;
+    const cleanSegments = explicitGroup
+      ? explicitGroup
+          .split("/")
+          .map((seg) => seg.trim())
+          .filter(Boolean)
+          .map((seg) => encodeURIComponent(seg))
+      : [];
+    if (cleanSegments.length === 1 && explicitMember) {
+      cleanSegments.push(encodeURIComponent(explicitMember));
+    }
+
+    const targetPath =
+      cleanSegments.length > 0
+        ? `/${cleanSegments.join("/")}?shared_receipt=${encodeURIComponent(publicUrl)}`
+        : `/?shared_receipt=${encodeURIComponent(publicUrl)}`;
 
     return NextResponse.redirect(new URL(targetPath, origin), 303);
   } catch (err: unknown) {

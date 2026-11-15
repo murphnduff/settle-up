@@ -13,7 +13,13 @@ import {
   normalizeCurrencyCode,
   getCurrencySymbol,
   getCurrencyInfo,
+  formatCurrency,
   buildGroupCurrencies,
+  fetchTransactionFxRates,
+  normalizeFxRatesMap,
+  getLockedRateToTarget,
+  formatFxDisplayQuote,
+  type FxRatesMap,
 } from "@/lib/currencies";
 import {
   prepareFastAiReceiptPayload,
@@ -34,6 +40,7 @@ import {
   ExternalLink,
   Loader2,
   Trash2,
+  RefreshCw,
 } from "lucide-react";
 
 export type SplitMode = "equal" | "percentage" | "exact";
@@ -78,6 +85,7 @@ export interface ExpenseItem {
   type: "expense" | "payment";
   category?: string;
   receiptUrl?: string | null;
+  fxRates?: FxRatesMap | null;
   date: string;
   createdAt?: string;
   createdBy?: string;
@@ -96,6 +104,7 @@ interface EditExpenseModalProps {
   groupId?: string;
   members: GroupMember[];
   groupCurrencies?: string[];
+  defaultCurrency?: string;
   existingCategories?: string[];
   onCurrencyAdded?: (currencyCode: string) => void;
   onViewReceipt?: (url: string, title?: string) => void;
@@ -129,6 +138,7 @@ export default function EditExpenseModal({
   groupId,
   members,
   groupCurrencies = ["USD"],
+  defaultCurrency,
   existingCategories = [],
   onCurrencyAdded,
   onViewReceipt,
@@ -140,22 +150,32 @@ export default function EditExpenseModal({
   const receiptFileInputRef = useRef<HTMLInputElement>(null);
   const receiptPdfInputRef = useRef<HTMLInputElement>(null);
 
+  const initialCurrency = normalizeCurrencyCode(expense?.currency);
+  const initialDate = expense?.date
+    ? expense.date.split("T")[0]
+    : getTodayLocalDate();
+  const initialFxKey = `${initialCurrency}::${initialDate}`;
+
   const [description, setDescription] = useState(expense?.description ?? "");
   const [amount, setAmount] = useState(
     expense ? (expense.amountCents / 100).toFixed(2) : ""
   );
-  const [currency, setCurrency] = useState<string>(() =>
-    normalizeCurrencyCode(expense?.currency)
+  const [currency, setCurrency] = useState<string>(initialCurrency);
+  const normalizedCurrency = normalizeCurrencyCode(currency);
+  const normalizedDefaultCurrency = normalizeCurrencyCode(
+    defaultCurrency || groupCurrencies[0] || "USD"
   );
-  const currencySymbol = getCurrencySymbol(currency);
+  const currencySymbol = getCurrencySymbol(normalizedCurrency);
   const availableCurrencies = useMemo(
     () =>
       buildGroupCurrencies(
         groupCurrencies,
-        currency,
-        expense ? [{ currency: expense.currency }] : []
+        normalizedDefaultCurrency,
+        expense
+          ? [{ currency: expense.currency }, normalizedCurrency]
+          : [normalizedCurrency]
       ),
-    [groupCurrencies, currency, expense]
+    [groupCurrencies, normalizedDefaultCurrency, normalizedCurrency, expense]
   );
   const [type, setType] = useState<"expense" | "payment">(
     expense?.type === "payment" ? "payment" : "expense"
@@ -221,6 +241,90 @@ export default function EditExpenseModal({
   >(null);
   const [receiptScanError, setReceiptScanError] = useState<string | null>(null);
   const [scannedCategories, setScannedCategories] = useState<string[]>([]);
+
+  // Transaction-time locked FX state:
+  // Preserves saved expense.fxRates on initial open unless date/currency changes or user clicks [Refresh] / [Edit].
+  const [savedOrManualFx, setSavedOrManualFx] = useState<{
+    key: string;
+    rates: FxRatesMap | null;
+    isManual?: boolean;
+  } | null>(() => ({
+    key: initialFxKey,
+    rates: normalizeFxRatesMap(expense?.fxRates, initialCurrency),
+    isManual: false,
+  }));
+  const [autoFetchedFx, setAutoFetchedFx] = useState<{
+    key: string;
+    rates: FxRatesMap;
+  } | null>(null);
+  const [isRefreshingFx, setIsRefreshingFx] = useState(false);
+  const [isEditingFx, setIsEditingFx] = useState(false);
+  const [fxRateInput, setFxRateInput] = useState("");
+  const [fxBilledAmountInput, setFxBilledAmountInput] = useState("");
+
+  const cleanDate = (date || getTodayLocalDate()).split("T")[0];
+  const currentFxKey = `${normalizedCurrency}::${cleanDate}`;
+  const isMultiCurrencyContext =
+    availableCurrencies.length > 1 ||
+    normalizedCurrency !== normalizedDefaultCurrency;
+
+  const resolvedFxRates: FxRatesMap | null =
+    savedOrManualFx?.key === currentFxKey
+      ? savedOrManualFx.rates
+      : autoFetchedFx?.key === currentFxKey
+        ? autoFetchedFx.rates
+        : null;
+
+  const shouldAutoFetchFx =
+    isMultiCurrencyContext &&
+    savedOrManualFx?.key !== currentFxKey &&
+    autoFetchedFx?.key !== currentFxKey;
+
+  useEffect(() => {
+    if (!shouldAutoFetchFx) return;
+    let cancelled = false;
+
+    fetchTransactionFxRates(normalizedCurrency, cleanDate, availableCurrencies)
+      .then((rates) => {
+        if (!cancelled) {
+          setAutoFetchedFx({ key: currentFxKey, rates });
+        }
+      })
+      .catch(() => {
+        // Leave resolvedFxRates null if offline
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    shouldAutoFetchFx,
+    normalizedCurrency,
+    cleanDate,
+    availableCurrencies,
+    currentFxKey,
+  ]);
+
+  const handleRefreshFxRate = async () => {
+    setIsRefreshingFx(true);
+    try {
+      const freshRates = await fetchTransactionFxRates(
+        normalizedCurrency,
+        cleanDate,
+        availableCurrencies
+      );
+      setSavedOrManualFx({
+        key: currentFxKey,
+        rates: freshRates,
+        isManual: false,
+      });
+      setIsEditingFx(false);
+    } catch {
+      setError("Could not fetch exchange rate for the selected date.");
+    } finally {
+      setIsRefreshingFx(false);
+    }
+  };
 
   // Combine default preset categories with group-wide categories and current category
   const categoryOptions = useMemo(
@@ -437,6 +541,86 @@ export default function EditExpenseModal({
       ? (totalCents / 100 / selectedMembers.length).toFixed(2)
       : null;
 
+  const lockedRateToDefault = useMemo(
+    () =>
+      getLockedRateToTarget(
+        normalizedCurrency,
+        normalizedDefaultCurrency,
+        resolvedFxRates
+      ),
+    [normalizedCurrency, normalizedDefaultCurrency, resolvedFxRates]
+  );
+
+  const fxQuoteInfo = useMemo(
+    () =>
+      lockedRateToDefault && lockedRateToDefault > 0
+        ? formatFxDisplayQuote(
+            normalizedCurrency,
+            normalizedDefaultCurrency,
+            lockedRateToDefault
+          )
+        : null,
+    [normalizedCurrency, normalizedDefaultCurrency, lockedRateToDefault]
+  );
+
+  const convertedDefaultCents =
+    lockedRateToDefault && totalCents > 0
+      ? Math.round(totalCents * lockedRateToDefault)
+      : null;
+
+  const handleOpenEditFx = () => {
+    const currentQuote = fxQuoteInfo;
+    setFxRateInput(currentQuote ? currentQuote.shortRateText : "");
+    setFxBilledAmountInput(
+      convertedDefaultCents && convertedDefaultCents > 0
+        ? (convertedDefaultCents / 100).toFixed(2)
+        : ""
+    );
+    setIsEditingFx(true);
+  };
+
+  const handleApplyFxOverride = () => {
+    const billedVal = parseFloat(fxBilledAmountInput);
+    const rateVal = parseFloat(fxRateInput);
+    let nextRateExpToDefault: number | null = null;
+
+    // If user typed an exact billed amount in defaultCurrency and totalCents > 0, prefer exact billing ratio unless rate was edited directly
+    const currentConvertedStr =
+      convertedDefaultCents && convertedDefaultCents > 0
+        ? (convertedDefaultCents / 100).toFixed(2)
+        : "";
+    if (
+      fxBilledAmountInput.trim() &&
+      fxBilledAmountInput.trim() !== currentConvertedStr &&
+      !isNaN(billedVal) &&
+      billedVal > 0 &&
+      totalCents > 0
+    ) {
+      nextRateExpToDefault = (billedVal * 100) / totalCents;
+    } else if (!isNaN(rateVal) && rateVal > 0) {
+      const useInverse = fxQuoteInfo ? fxQuoteInfo.isInverse : true;
+      nextRateExpToDefault = useInverse ? 1 / rateVal : rateVal;
+    } else if (!isNaN(billedVal) && billedVal > 0 && totalCents > 0) {
+      nextRateExpToDefault = (billedVal * 100) / totalCents;
+    }
+
+    if (nextRateExpToDefault && nextRateExpToDefault > 0) {
+      const updatedMap: FxRatesMap = {
+        ...(resolvedFxRates || {}),
+        [normalizedCurrency]: 1,
+        [normalizedDefaultCurrency]: Number(
+          nextRateExpToDefault.toPrecision(10)
+        ),
+      };
+      setSavedOrManualFx({
+        key: currentFxKey,
+        rates: updatedMap,
+        isManual: true,
+      });
+      setIsEditingFx(false);
+    }
+  };
+
   // Live percentage summary
   const percentageSummary = useMemo(() => {
     const pctRecord: Record<string, number> = {};
@@ -536,6 +720,23 @@ export default function EditExpenseModal({
 
       const normalizedCurrency = normalizeCurrencyCode(currency);
 
+      let finalFxRates = resolvedFxRates;
+      if (
+        !finalFxRates &&
+        isMultiCurrencyContext &&
+        savedOrManualFx?.key !== currentFxKey
+      ) {
+        try {
+          finalFxRates = await fetchTransactionFxRates(
+            normalizedCurrency,
+            cleanDate,
+            availableCurrencies
+          );
+        } catch {
+          finalFxRates = null;
+        }
+      }
+
       const updatePayload: Record<string, unknown> = {
         description:
           description.trim() || (type === "payment" ? "Payment" : "Expense"),
@@ -545,7 +746,8 @@ export default function EditExpenseModal({
         category: resolvedCategory,
         receipt_url: type === "payment" ? null : receiptUrl,
         paid_by_member_id: payerId,
-        date: date || getTodayLocalDate(),
+        date: cleanDate,
+        fx_rates: finalFxRates,
       };
 
       let { error: updateError } = await supabase
@@ -553,13 +755,31 @@ export default function EditExpenseModal({
         .update(updatePayload)
         .eq("id", expense.id);
 
-      if (
-        updateError &&
-        (updateError.message?.toLowerCase().includes("expenses_currency_check") ||
-          updateError.message?.toLowerCase().includes("currency"))
-      ) {
-        updatePayload.currency =
-          normalizedCurrency === "EUR" ? "€" : normalizedCurrency === "USD" ? "$" : normalizedCurrency;
+      for (let attempt = 0; attempt < 2 && updateError; attempt++) {
+        const msg = updateError.message?.toLowerCase() || "";
+        let updated = false;
+        if (
+          msg.includes("fx_rates") &&
+          "fx_rates" in updatePayload
+        ) {
+          delete updatePayload.fx_rates;
+          updated = true;
+        } else if (
+          msg.includes("expenses_currency_check") ||
+          msg.includes("currency")
+        ) {
+          const fallbackCur =
+            normalizedCurrency === "EUR"
+              ? "€"
+              : normalizedCurrency === "USD"
+                ? "$"
+                : normalizedCurrency;
+          if (updatePayload.currency !== fallbackCur) {
+            updatePayload.currency = fallbackCur;
+            updated = true;
+          }
+        }
+        if (!updated) break;
         const retryUpdate = await supabase
           .from("expenses")
           .update(updatePayload)
@@ -994,8 +1214,11 @@ export default function EditExpenseModal({
               </div>
               {availableCurrencies.length > 1 && (
                 <select
-                  value={currency}
-                  onChange={(e) => setCurrency(e.target.value)}
+                  value={normalizedCurrency}
+                  onChange={(e) => {
+                    setCurrency(e.target.value);
+                    setIsEditingFx(false);
+                  }}
                   className="border border-slate-300 rounded-lg px-2.5 py-2 text-xs font-bold text-slate-800 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
                 >
                   {availableCurrencies.map((code) => {
@@ -1009,6 +1232,165 @@ export default function EditExpenseModal({
                 </select>
               )}
             </div>
+
+            {/* Compact Inline FX Pill when transaction currency differs from group default currency */}
+            {normalizedCurrency !== normalizedDefaultCurrency && (
+              <div className="mt-1.5 space-y-1.5">
+                <div className="px-2.5 py-1 rounded-lg bg-emerald-50/70 border border-emerald-200/80 text-[11px] text-emerald-900 flex items-center justify-between gap-2 flex-wrap">
+                  {shouldAutoFetchFx || isRefreshingFx ? (
+                    <span className="inline-flex items-center gap-1.5 text-emerald-800">
+                      <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                      <span>Fetching rate for {cleanDate}...</span>
+                    </span>
+                  ) : fxQuoteInfo ? (
+                    <span className="leading-snug">
+                      Rate on <strong>{cleanDate}</strong>:{" "}
+                      <span className="font-semibold">
+                        {fxQuoteInfo.quoteText}
+                      </span>
+                      {convertedDefaultCents !== null && (
+                        <span className="text-emerald-800 font-semibold">
+                          {" "}
+                          (≈{" "}
+                          {formatCurrency(
+                            convertedDefaultCents,
+                            normalizedDefaultCurrency
+                          )}{" "}
+                          {normalizedDefaultCurrency})
+                        </span>
+                      )}
+                      {savedOrManualFx?.key === currentFxKey &&
+                        savedOrManualFx?.isManual && (
+                          <span className="ml-1 px-1.5 py-0.5 rounded bg-emerald-100 text-[10px] font-bold text-emerald-800">
+                            Custom
+                          </span>
+                        )}
+                    </span>
+                  ) : (
+                    <span className="text-slate-600">
+                      No locked rate saved for {cleanDate} (uses group fallback)
+                    </span>
+                  )}
+
+                  <span className="inline-flex items-center gap-1.5 shrink-0 font-semibold">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        isEditingFx ? setIsEditingFx(false) : handleOpenEditFx()
+                      }
+                      className="text-blue-700 hover:text-blue-900 underline cursor-pointer"
+                    >
+                      {isEditingFx ? "Cancel" : "Edit"}
+                    </button>
+                    <span className="text-emerald-300">•</span>
+                    <button
+                      type="button"
+                      disabled={isRefreshingFx}
+                      onClick={handleRefreshFxRate}
+                      title="Fetch historical rate for this transaction date"
+                      className="inline-flex items-center gap-0.5 text-emerald-800 hover:text-emerald-950 underline cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`w-2.5 h-2.5 ${
+                          isRefreshingFx ? "animate-spin" : ""
+                        }`}
+                      />
+                      <span>{fxQuoteInfo ? "Refresh" : "Lock Rate"}</span>
+                    </button>
+                  </span>
+                </div>
+
+                {isEditingFx && (
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2 text-[11px]">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold text-slate-700">
+                        {fxQuoteInfo && !fxQuoteInfo.isInverse
+                          ? `1 ${normalizedCurrency} =`
+                          : `1 ${normalizedDefaultCurrency} =`}
+                      </span>
+                      <input
+                        type="number"
+                        step="any"
+                        min="0.000001"
+                        placeholder="Rate"
+                        value={fxRateInput}
+                        onChange={(e) => {
+                          setFxRateInput(e.target.value);
+                          const v = parseFloat(e.target.value);
+                          if (!isNaN(v) && v > 0 && totalCents > 0) {
+                            const useInv = fxQuoteInfo
+                              ? fxQuoteInfo.isInverse
+                              : true;
+                            const mult = useInv ? 1 / v : v;
+                            setFxBilledAmountInput(
+                              ((totalCents * mult) / 100).toFixed(2)
+                            );
+                          }
+                        }}
+                        className="w-24 border border-slate-300 rounded-md px-2 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="font-bold text-slate-700">
+                        {fxQuoteInfo && !fxQuoteInfo.isInverse
+                          ? normalizedDefaultCurrency
+                          : normalizedCurrency}
+                      </span>
+                    </div>
+
+                    {totalCents > 0 && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-slate-600">
+                          Or exact {normalizedDefaultCurrency} billed:
+                        </span>
+                        <div className="relative w-28">
+                          <span className="absolute left-2 top-1 text-xs font-semibold text-slate-400">
+                            {getCurrencySymbol(normalizedDefaultCurrency)}
+                          </span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0.01"
+                            placeholder="0.00"
+                            value={fxBilledAmountInput}
+                            onChange={(e) => {
+                              setFxBilledAmountInput(e.target.value);
+                              const b = parseFloat(e.target.value);
+                              if (!isNaN(b) && b > 0 && totalCents > 0) {
+                                const mult = (b * 100) / totalCents;
+                                const useInv = fxQuoteInfo
+                                  ? fxQuoteInfo.isInverse
+                                  : mult < 1;
+                                const display = useInv ? 1 / mult : mult;
+                                setFxRateInput(display.toFixed(4));
+                              }
+                            }}
+                            className="w-full pl-6 pr-2 py-1 border border-slate-300 rounded-md text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleApplyFxOverride}
+                          className="ml-auto px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
+                        >
+                          Apply
+                        </button>
+                      </div>
+                    )}
+
+                    {totalCents <= 0 && (
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={handleApplyFxOverride}
+                          className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white font-semibold cursor-pointer"
+                        >
+                          Apply Rate
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 

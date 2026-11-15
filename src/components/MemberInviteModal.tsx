@@ -75,9 +75,13 @@ export default function MemberInviteModal({
     text: string;
   } | null>(null);
 
-  // Copy tracking states
+  // Copy tracking states & timers (cleared on repeat clicks per modern-web-guidance copy-button)
   const [copiedGroupLink, setCopiedGroupLink] = useState(false);
   const [copiedMemberId, setCopiedMemberId] = useState<string | null>(null);
+  const [copyLiveAnnouncement, setCopyLiveAnnouncement] = useState("");
+  const lastAnnouncementRef = useRef("");
+  const groupCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const memberCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Renaming state
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
@@ -123,22 +127,36 @@ export default function MemberInviteModal({
     }
   };
 
+  const announceCopyStatus = (baseMessage: string) => {
+    let nextMessage = baseMessage;
+    if (nextMessage === lastAnnouncementRef.current) {
+      nextMessage += "\u00A0";
+    }
+    lastAnnouncementRef.current = nextMessage;
+    setCopyLiveAnnouncement(nextMessage);
+  };
+
+  const legacyCopy = (text: string): boolean => {
+    const field = Object.assign(document.createElement("textarea"), {
+      value: text,
+    });
+    field.setAttribute("readonly", "");
+    field.style.cssText = "position:fixed;inset-block-start:0;opacity:0";
+    document.body.append(field);
+    field.select();
+    try {
+      return document.execCommand("copy");
+    } finally {
+      field.remove();
+    }
+  };
+
   const copyToClipboard = async (text: string) => {
     try {
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand("copy");
-        document.body.removeChild(textarea);
-      }
+      await navigator.clipboard.writeText(text);
       return true;
-    } catch (err) {
-      console.error("Failed to copy:", err);
-      return false;
+    } catch {
+      return legacyCopy(text);
     }
   };
 
@@ -155,21 +173,37 @@ export default function MemberInviteModal({
   const handleCopyGroupLink = async () => {
     if (!group) return;
     const url = getGroupShareUrl();
+    if (groupCopyTimerRef.current) {
+      clearTimeout(groupCopyTimerRef.current);
+    }
     const ok = await copyToClipboard(url);
+    announceCopyStatus(ok ? "Copied group link" : "Copy failed");
     if (ok) {
       setCopiedGroupLink(true);
-      setTimeout(() => setCopiedGroupLink(false), 2500);
+      groupCopyTimerRef.current = setTimeout(() => {
+        setCopiedGroupLink(false);
+        setCopyLiveAnnouncement("");
+      }, 2500);
     }
   };
 
   const handleCopyMemberLink = async (member: GroupMember) => {
     if (!group) return;
     const memberDisplayName = member.displayName || member.name;
-    const url = `${getGroupShareUrl()}?m=${encodeURIComponent(memberDisplayName)}`;
+    const url = `${getGroupShareUrl()}/${encodeURIComponent(memberDisplayName)}`;
+    if (memberCopyTimerRef.current) {
+      clearTimeout(memberCopyTimerRef.current);
+    }
     const ok = await copyToClipboard(url);
+    announceCopyStatus(
+      ok ? `Copied ${memberDisplayName}'s link` : "Copy failed"
+    );
     if (ok) {
       setCopiedMemberId(member.id);
-      setTimeout(() => setCopiedMemberId(null), 2500);
+      memberCopyTimerRef.current = setTimeout(() => {
+        setCopiedMemberId(null);
+        setCopyLiveAnnouncement("");
+      }, 2500);
     }
   };
 
@@ -487,7 +521,10 @@ export default function MemberInviteModal({
               Members ({currentMembers.length})
             </h3>
             <span className="text-[11px] text-slate-400">
-              Direct links auto-select that member (?m=Name)
+              Direct links auto-select that member (/[slug]/[member])
+            </span>
+            <span role="status" className="sr-only">
+              {copyLiveAnnouncement}
             </span>
           </div>
 

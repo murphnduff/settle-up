@@ -17,10 +17,11 @@
   - Admin rights are verified strictly by `user?.email?.toLowerCase() === 'murph@murphnduff.org'` (client) and `lower(auth.jwt() ->> 'email') = 'murph@murphnduff.org'` via the `public.is_super_admin()` database helper.
   - Only `murph@murphnduff.org` can see the master group list, create groups, delete groups, manage members, or import CSV data.
   - Admin is not required to be a participant in created groups (e.g. creating a group for others; "Add me as a member" checkbox defaults to `true`).
-- **Regular Users (Zero Sign-In & Root-Level Friendly URLs):**
-  - Access any group directly via root slug: `https://split.murphnduff.org/[slug]` (or `?m=<display_name>`).
-  - No OAuth login required for visitors.
-  - "Who Are You?" pill selection saves `active_member_id` and adds the group to `localStorage` (`recent_groups`), updating the URL to `?m=<name>` via `window.history.replaceState` for cross-device recognition.
+- **Regular Users (Zero Sign-In & Personalized Member URLs):**
+  - Access any group directly via optional catch-all route `src/app/[slug]/[[...member]]/page.tsx`: `https://split.murphnduff.org/[slug]` or personalized `https://split.murphnduff.org/[slug]/[member]`.
+  - Identity URL resolution (`resolveMemberIdentityFromUrl`) supports all formats with strict priority: (1) path segment `/[slug]/[member]` (URL-decoded, case-insensitive match against `group_members.display_name`), (2) legacy `?m=<name>`, (3) bare valueless query string `?[name]` (ignoring reserved keys like `shared_receipt`), and (4) saved `localStorage` (`settle_up_member_<groupId>`).
+  - Selecting a "Who Are You?" / "Viewing as" identity pill saves `active_member_id` to `localStorage`, adds the group to `recent_groups`, and updates the browser URL via `window.history.replaceState` to `/${slug}/${encodeURIComponent(member.display_name)}` (preserving `?shared_receipt=...` only while scanning). Clicking "Reset" returns the URL to `/${slug}`.
+  - The Group Header `Copy Link` control and `MemberInviteModal` let users copy either the general group link (`/${slug}`) or any member's personalized link (`/${slug}/${member}`).
 - **Stealth Root & Anti-Indexing Shield:**
   - Visiting root `/` unauthenticated with no local groups renders a minimal "Private Portal" sign-in card with zero descriptive copy.
   - `src/app/robots.ts` blocks all user agents and AI crawlers (`Googlebot`, `Google-Extended`, `GPTBot`, `CCBot`, etc.).
@@ -30,7 +31,7 @@
 - **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `currencies` (TEXT[] DEFAULT `ARRAY['USD']`), `default_currency` (TEXT DEFAULT `'USD'`), `exchange_rates` (JSONB DEFAULT `'{}'`), `created_at` (TIMESTAMPTZ).
 - **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL). Unique constraint on `(group_id, lower(display_name))`.
 - **`heartbeat_logs`**: `id` (UUID PK), `triggered_by` (TEXT), `groups_count` (INTEGER), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
-- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (TEXT — any 3-letter ISO currency code such as `'USD'`, `'EUR'`, `'AUD'`, `'THB'`, `'GBP'`, `'CAD'`, `'JPY'`, `'NZD'`, `'CHF'`, `'MXN'`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
+- **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (TEXT — any 3-letter ISO currency code such as `'USD'`, `'EUR'`, `'AUD'`, `'THB'`, `'GBP'`, `'CAD'`, `'JPY'`, `'NZD'`, `'CHF'`, `'MXN'`), `fx_rates` (JSONB DEFAULT NULL — transaction-time locked conversion rates normalized as `1 expense.currency = X targetCurrency`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
 - **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
 
 ---
@@ -40,7 +41,7 @@
 ### 3.1 Strict Integer-Cent Arithmetic, Isolated Ledgers & Unified Cross-Currency Reconciliation
 - All financial math is computed in integer cents to prevent floating-point drift.
 - **Per-Currency Isolated Mode (Default):** Each currency enabled on a group (`USD`, `AUD`, `THB`, `EUR`, etc.) calculates and settles independently.
-- **Cross-Currency Unified Reconciliation (`calculateUnifiedReconciliation`):** When a group has 2+ currencies, users can toggle **🌐 Unified Settlement (Convert All)** to convert each member's Paid, Accrued Share, and Net Balance into any selected target currency using live exchange rates (`https://open.er-api.com/v6/latest/${targetCurrency}`) or custom overrides stored in `groups.exchange_rates`. Any 1-cent rounding remainder is resolved deterministically on the member with the largest absolute balance so $\sum \text{netBalanceCents} = 0$, outputting a single unified Settlement Plan (with secondary currency equivalents).
+- **Cross-Currency Unified Reconciliation (`calculateUnifiedReconciliation` & `calculateUnifiedCategorySpend`):** When a group has 2+ currencies, users can toggle **🌐 Unified Settlement (Convert All)** to convert each transaction and its `expense_splits` into any selected target currency using **that transaction's own locked `expense.fx_rates[targetCurrency]`** captured at the date of the transaction (falling back to `groups.exchange_rates` only for legacy rows where `fx_rates` is `null`). Per-transaction Largest Remainder cent allocation guarantees $\sum \text{convertedSplits} = \text{convertedAmountCents}$ and $\sum \text{netBalanceCents} = 0$, outputting a single unified Settlement Plan (with secondary currency equivalents), Member Summary, and Category Breakdown.
 
 ### 3.2 Net Balance Calculation
 For each user $u$ and currency $c$:
@@ -73,10 +74,11 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **`% Percentage`**: Numeric inputs per member validating to $100\%$ with integer-cent rounding.
 - **`$ Exact`**: Inline dollar/euro input per member. The top-level `Amount` field automatically updates in real time to match the exact sum of member inputs, preventing double-entry.
 
-### 4.2 Unified CSV Import & Export (Splitwise-Compatible)
-- **Format:** `Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,...`
+### 4.2 Unified CSV Import & Export (Splitwise-Compatible + Optional `FX_Rates`)
+- **Format:** `Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,...[,FX_Rates]`
 - **Payer identification:** Member column with positive value (`val > 0`).
 - **Split allocations:** Member columns with negative values (`val < 0`) indicate owed split amounts. Payer's own share $= \text{Cost} - \text{val}$.
+- **Transaction-Time FX Preservation:** Exports append an optional trailing `FX_Rates` JSON column whenever any exported transaction has locked `fx_rates` (omitted on standard single-currency ledgers for byte-for-byte Splitwise compatibility). On CSV import, `FX_Rates` is parsed directly, and multi-currency CSVs lacking `FX_Rates` automatically fetch historical rates by row `Date` via `fetchTransactionFxRates`.
 - **Summary footer:** Ignores and generates trailing blank line + `<Date>,Total balance, , ,<Currency>,<Net 1>,...`.
 - **High-Speed Bulk Insert:** Import pre-generates client UUIDs and commits all members, expenses, and splits in three batched Supabase calls (< 0.5s).
 
@@ -118,8 +120,10 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
   - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency selection in Create Group and a **Manage Group Currencies** modal (`Currencies` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
   - **Clean Single-Currency UX:** Groups with only 1 currency enabled hide currency switcher tabs and dropdowns so the UI stays minimal.
   - **Auto-Enable on AI Receipt Scan & CSV Import:** Scanning a receipt or importing a CSV with a new currency automatically appends that currency to `group.currencies`.
-- **Cross-Currency Conversion & "🌐 Unified Settlement (Convert All)" Mode:**
-  - Available whenever a group has 2+ currencies. Includes a target currency selector, **Fetch Live Rates** (`https://open.er-api.com/v6/latest/${targetCurrency}`), editable exchange rate overrides persisted in `groups.exchange_rates`, and unified Member Summary + Settlement Plan with secondary currency equivalents (tested in Edge Case 15).
+- **Transaction-Time Locked FX Rates (`fetchTransactionFxRates` & `expenses.fx_rates`):**
+  - Queries `https://api.frankfurter.dev/v1/${dateIso}?base=${baseCurrency}` for historical daily ECB rates and merges/falls back to `https://open.er-api.com/v6/latest/${baseCurrency}` for today's live tick or currencies not covered by Frankfurter, normalized as `1 expense.currency = X targetCurrency`.
+  - Add & Edit Transaction forms auto-fetch date-aware FX rates whenever `currency` or `date` changes (including after AI Receipt OCR auto-fill) and display an inline FX pill under `Amount` when `currency !== group.default_currency` (`Rate on YYYY-MM-DD: 1 USD = 34.50 THB (≈ $28.99 USD) • Edit`), supporting custom rate overrides or typing the exact billed card charge in `default_currency`.
+  - Ledger rows with locked foreign-currency rates display a subtle converted subtitle (`≈ $28.99 @ 34.50`), and Unified Settlement includes a 1-click **Backfill Historical Rates** button for Super-Admin if any legacy multi-currency rows have `fx_rates === null` (tested in Edge Cases 15, 16 & 17).
 
 ### 4.8 Streamlined Dashboard Hierarchy, Mobile-First Layout & Custom PWA App Icons
 - **Single-Line Top Navbar & Collapsible Mobile Group Switcher (`< lg`):**
@@ -180,3 +184,9 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 13. ✅ **Bulletproof Supabase Keep-Alive Heartbeat & Persistent Audit Log (`/api/heartbeat` + `public.heartbeat_logs`):**
     - Upgraded `GET /api/heartbeat` (`src/app/api/heartbeat/route.ts`) to run uncached on every request (`await connection()`, `cache: 'no-store'`, `Cache-Control: no-store, max-age=0`), triggered daily via `vercel.json` (`0 9 * * *`) and `cron-job.org`.
     - Executes fault-tolerant read/write/storage activity across `groups`, `group_members`, `expenses`, `storage.from('receipts').list()`, and `public.heartbeat_logs` (inserting `{ triggered_by, groups_count }` and auto-pruning rows older than 30 days).
+
+### Phase 4: Personalized Member URLs & Transaction-Time Locked FX Conversion (Completed ✅)
+14. ✅ **Clean `/[slug]/[member]` Personalized Member URLs:**
+    - Migrated group route to `src/app/[slug]/[[...member]]/page.tsx`, supporting `/[slug]/[member]`, legacy `?m=<name>`, and bare `?[name]` query URLs (`resolveMemberIdentityFromUrl`, tested in Edge Case 17), clean `window.history.replaceState` syncing on identity selection/reset, and 1-click general + personalized member link copying in the Group Header and `MemberInviteModal`.
+15. ✅ **Transaction-Time Locked FX Rates (`expenses.fx_rates`):**
+    - Added date-aware `fetchTransactionFxRates` (`api.frankfurter.dev` historical + `open.er-api.com` live fallback), inline FX rate preview/override pills in Add & Edit Transaction forms, ledger converted subtitles (`≈ $28.99 @ 34.50`), per-transaction locked FX unified reconciliation (`calculateUnifiedReconciliation` & `calculateUnifiedCategorySpend`, tested in Edge Case 16), 1-click Super-Admin **Backfill Historical Rates**, and lossless CSV `FX_Rates` export/import.

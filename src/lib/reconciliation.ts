@@ -9,6 +9,8 @@
 import {
   normalizeCurrencyCode,
   getCurrencySymbol,
+  normalizeFxRatesMap,
+  type FxRatesMap,
 } from './currencies.ts';
 
 export const EXPENSE_CATEGORIES = [
@@ -77,6 +79,8 @@ export interface ExpenseRecord {
   currency: string;
   type: 'expense' | 'payment';
   category?: string;
+  date?: string;
+  fxRates?: FxRatesMap | null;
   splits: SplitRecord[];
   description?: string;
   /** Backwards compatibility aliases */
@@ -510,11 +514,125 @@ export function convertCentsToTargetCurrency(
 }
 
 /**
+ * Resolves the per-transaction FX multiplier (`1 unit of expCurrency = mult units of targetCurrency`).
+ *
+ * Priority:
+ * 1. Transaction's own locked `fxRates` (`fxRates[targetCode] / fxRates[expCode]`), or bridged via a shared currency if `targetCode` was added later.
+ * 2. Group-level `fallbackExchangeRates` (`1 targetCurrency = X expCurrency`) ONLY for legacy rows where `fxRates` is null/missing.
+ */
+export function resolveExpenseFxMultiplier(
+  expCurrency: string,
+  targetCurrency: string,
+  expFxRates?: FxRatesMap | null,
+  fallbackExchangeRates: Record<string, number> = {}
+): number {
+  const expCode = normalizeCurrencyCode(expCurrency);
+  const targetCode = normalizeCurrencyCode(targetCurrency);
+  if (expCode === targetCode) return 1;
+
+  const normalizedFx = normalizeFxRatesMap(expFxRates, expCode);
+  if (normalizedFx) {
+    const baseSelf =
+      Number.isFinite(normalizedFx[expCode]) && normalizedFx[expCode] > 0
+        ? normalizedFx[expCode]
+        : 1;
+
+    if (
+      Number.isFinite(normalizedFx[targetCode]) &&
+      normalizedFx[targetCode] > 0
+    ) {
+      return normalizedFx[targetCode] / baseSelf;
+    }
+
+    // Bridge via any shared currency present in both normalizedFx and fallbackExchangeRates
+    for (const [pivotCode, pivotVal] of Object.entries(normalizedFx)) {
+      if (pivotCode === expCode || !Number.isFinite(pivotVal) || pivotVal <= 0) {
+        continue;
+      }
+      if (pivotCode in fallbackExchangeRates) {
+        const expToPivot = pivotVal / baseSelf;
+        const pivotToTarget = convertCentsToTargetCurrency(
+          1,
+          pivotCode,
+          targetCode,
+          fallbackExchangeRates
+        );
+        if (Number.isFinite(pivotToTarget) && pivotToTarget > 0) {
+          return expToPivot * pivotToTarget;
+        }
+      }
+    }
+  }
+
+  return convertCentsToTargetCurrency(
+    1,
+    expCode,
+    targetCode,
+    fallbackExchangeRates
+  );
+}
+
+/**
+ * Aggregates spending by category across all currencies converted into `targetCurrency`,
+ * converting each transaction at its locked `fxRates` (falling back to `exchangeRates` only for legacy unlocked rows).
+ */
+export function calculateUnifiedCategorySpend(
+  expenses: ExpenseRecord[],
+  targetCurrency: string = 'USD',
+  exchangeRates: Record<string, number> = {}
+): CategorySpendRecord[] {
+  const targetCode = normalizeCurrencyCode(targetCurrency);
+  const categoryTotals = new Map<string, number>();
+  let totalSpendCents = 0;
+
+  for (const exp of expenses) {
+    if (exp.type !== 'expense') continue;
+    const rawCents =
+      typeof exp.amountCents === 'number'
+        ? Math.round(exp.amountCents)
+        : Math.round((exp.amount || 0) * 100);
+    if (rawCents <= 0) continue;
+
+    const expCode = normalizeCurrencyCode(exp.currency);
+    const mult = resolveExpenseFxMultiplier(
+      expCode,
+      targetCode,
+      exp.fxRates,
+      exchangeRates
+    );
+    const convertedCents =
+      expCode === targetCode ? rawCents : Math.round(rawCents * mult);
+    if (convertedCents <= 0) continue;
+
+    const cat = (exp.category || '').trim() || 'General';
+    categoryTotals.set(cat, (categoryTotals.get(cat) || 0) + convertedCents);
+    totalSpendCents += convertedCents;
+  }
+
+  return Array.from(categoryTotals.entries())
+    .map(([category, amountCents]) => ({
+      category,
+      amountCents,
+      amountFormatted: (amountCents / 100).toFixed(2),
+      percentage:
+        totalSpendCents > 0 ? (amountCents / totalSpendCents) * 100 : 0,
+    }))
+    .sort((a, b) => {
+      if (b.amountCents !== a.amountCents) {
+        return b.amountCents - a.amountCents;
+      }
+      return a.category.localeCompare(b.category);
+    });
+}
+
+/**
  * Calculates a unified cross-currency Member Breakdown and greedy Cash-Flow Minimization
  * Settlement Plan converted into `targetCurrency`.
  *
- * Deterministically resolves any 1-cent rounding remainder across members so that
- * `SUM(netBalanceCents) === 0` before running the greedy settlement algorithm.
+ * Converts each transaction and its splits individually using that transaction's own
+ * locked `expense.fxRates` (falling back to `exchangeRates` only for legacy unlocked rows).
+ * Uses Largest Remainder per transaction so `SUM(convertedSplits) === convertedAmountCents`
+ * and `SUM(netBalanceCents) === 0` hold strictly without end-of-trip drift.
  */
 export function calculateUnifiedReconciliation(
   members: MemberRecord[],
@@ -531,114 +649,193 @@ export function calculateUnifiedReconciliation(
     };
   }
 
-  // Discover all distinct currencies present in expenses
-  const activeCurrencies = Array.from(
-    new Set(expenses.map((e) => normalizeCurrencyCode(e.currency)))
-  );
-  if (activeCurrencies.length === 0) {
-    activeCurrencies.push(targetCode);
-  }
+  const memberOrderMap = new Map<string, number>();
+  const paidByMember = new Map<string, number>();
+  const shareByMember = new Map<string, number>();
+  const netByMember = new Map<string, number>();
 
-  const exactPaidByMember = new Map<string, number>();
-  const exactShareByMember = new Map<string, number>();
-  const exactNetByMember = new Map<string, number>();
-
-  for (const m of members) {
-    exactPaidByMember.set(m.id, 0);
-    exactShareByMember.set(m.id, 0);
-    exactNetByMember.set(m.id, 0);
-  }
-
-  for (const curCode of activeCurrencies) {
-    const curBreakdown = calculateMemberBreakdown(members, expenses, curCode);
-    for (const rec of curBreakdown) {
-      const paidTarget = convertCentsToTargetCurrency(
-        rec.paidCents,
-        curCode,
-        targetCode,
-        exchangeRates
-      );
-      const shareTarget = convertCentsToTargetCurrency(
-        rec.shareCents,
-        curCode,
-        targetCode,
-        exchangeRates
-      );
-      const netTarget = convertCentsToTargetCurrency(
-        rec.netBalanceCents,
-        curCode,
-        targetCode,
-        exchangeRates
-      );
-
-      exactPaidByMember.set(
-        rec.memberId,
-        (exactPaidByMember.get(rec.memberId) || 0) + paidTarget
-      );
-      exactShareByMember.set(
-        rec.memberId,
-        (exactShareByMember.get(rec.memberId) || 0) + shareTarget
-      );
-      exactNetByMember.set(
-        rec.memberId,
-        (exactNetByMember.get(rec.memberId) || 0) + netTarget
-      );
-    }
-  }
-
-  // Round each member's converted Paid, Share, and Net Balance to integer cents
-  const roundedEntries = members.map((m, index) => {
-    const exactNet = exactNetByMember.get(m.id) || 0;
-    const roundedNet = Math.round(exactNet);
-    const roundingError = roundedNet - exactNet; // positive if rounded up, negative if rounded down
-    return {
-      memberId: m.id,
-      memberName: m.name,
-      index,
-      paidCents: Math.round(exactPaidByMember.get(m.id) || 0),
-      shareCents: Math.round(exactShareByMember.get(m.id) || 0),
-      exactNet,
-      netBalanceCents: roundedNet,
-      roundingError,
-    };
+  members.forEach((m, idx) => {
+    memberOrderMap.set(m.id, idx);
+    paidByMember.set(m.id, 0);
+    shareByMember.set(m.id, 0);
+    netByMember.set(m.id, 0);
   });
 
-  // Deterministic 1-cent remainder resolution so SUM(netBalanceCents) === 0 holds strictly
-  const residualCents = roundedEntries.reduce(
-    (sum, item) => sum + item.netBalanceCents,
-    0
-  );
+  for (const exp of expenses) {
+    const payerId = exp.paidByMemberId || exp.payerId || '';
+    const totalCents =
+      typeof exp.amountCents === 'number'
+        ? Math.round(exp.amountCents)
+        : Math.round((exp.amount || 0) * 100);
 
-  if (residualCents !== 0 && roundedEntries.length > 0) {
-    const step = residualCents > 0 ? -1 : 1;
-    let remainingToAdjust = Math.abs(residualCents);
+    if (!payerId || totalCents <= 0) continue;
 
-    // Sort candidates by who was rounded most in the direction of the residual, then by largest |exactNet|, then by member order
-    const candidates = [...roundedEntries].sort((a, b) => {
-      const errDiff =
-        residualCents > 0
-          ? b.roundingError - a.roundingError
-          : a.roundingError - b.roundingError;
-      if (Math.abs(errDiff) > 1e-7) return errDiff;
-      const magDiff = Math.abs(b.exactNet) - Math.abs(a.exactNet);
-      if (Math.abs(magDiff) > 1e-7) return magDiff;
-      return a.index - b.index;
-    });
+    const effectiveSplits =
+      exp.splits && exp.splits.length > 0
+        ? exp.splits
+        : exp.type !== 'payment' && members.length > 0
+          ? splitAmountEqually(
+              totalCents,
+              members.map((m) => m.id)
+            )
+          : [];
 
-    let cIdx = 0;
-    while (remainingToAdjust > 0) {
-      candidates[cIdx % candidates.length].netBalanceCents += step;
-      remainingToAdjust--;
-      cIdx++;
+    if (effectiveSplits.length === 0) continue;
+
+    const validSplits: Array<{
+      participantId: string;
+      splitCents: number;
+      index: number;
+      memberOrder: number;
+    }> = [];
+    let allocatedTotalCents = 0;
+
+    for (let i = 0; i < effectiveSplits.length; i++) {
+      const split = effectiveSplits[i];
+      const participantId = split.memberId || split.userId || '';
+      if (!participantId) continue;
+
+      const rawSplitCents =
+        typeof split.splitAmountCents === 'number'
+          ? Math.round(split.splitAmountCents)
+          : Math.round((split.amount || 0) * 100);
+
+      const splitCents =
+        exp.type === 'payment' &&
+        effectiveSplits.length === 1 &&
+        rawSplitCents <= 0
+          ? totalCents
+          : rawSplitCents;
+
+      if (splitCents <= 0) continue;
+
+      allocatedTotalCents += splitCents;
+      validSplits.push({
+        participantId,
+        splitCents,
+        index: i,
+        memberOrder: memberOrderMap.get(participantId) ?? i,
+      });
+    }
+
+    if (allocatedTotalCents <= 0 || validSplits.length === 0) continue;
+
+    const expCode = normalizeCurrencyCode(exp.currency);
+    const mult = resolveExpenseFxMultiplier(
+      expCode,
+      targetCode,
+      exp.fxRates,
+      exchangeRates
+    );
+
+    let convertedTotalCents: number;
+    let convertedSplits: Array<{
+      participantId: string;
+      convertedCents: number;
+    }>;
+
+    if (expCode === targetCode || Math.abs(mult - 1) < 1e-12) {
+      convertedTotalCents = allocatedTotalCents;
+      convertedSplits = validSplits.map((s) => ({
+        participantId: s.participantId,
+        convertedCents: s.splitCents,
+      }));
+    } else {
+      convertedTotalCents = Math.round(allocatedTotalCents * mult);
+      if (convertedTotalCents <= 0) continue;
+
+      const allocations = validSplits.map((s) => {
+        const exact = s.splitCents * mult;
+        const floored = Math.max(0, Math.floor(exact));
+        const fraction = exact - floored;
+        return {
+          ...s,
+          floored,
+          fraction,
+          adjusted: floored,
+        };
+      });
+
+      const sumFloored = allocations.reduce((acc, a) => acc + a.floored, 0);
+      let remainder = convertedTotalCents - sumFloored;
+
+      if (remainder > 0) {
+        const sortedDesc = [...allocations].sort((a, b) => {
+          if (Math.abs(b.fraction - a.fraction) > 1e-9) {
+            return b.fraction - a.fraction;
+          }
+          if (a.memberOrder !== b.memberOrder) {
+            return a.memberOrder - b.memberOrder;
+          }
+          return a.index - b.index;
+        });
+        let idx = 0;
+        while (remainder > 0 && sortedDesc.length > 0) {
+          sortedDesc[idx % sortedDesc.length].adjusted += 1;
+          remainder--;
+          idx++;
+        }
+      } else if (remainder < 0) {
+        const sortedAsc = [...allocations]
+          .filter((a) => a.adjusted > 0)
+          .sort((a, b) => {
+            if (Math.abs(a.fraction - b.fraction) > 1e-9) {
+              return a.fraction - b.fraction;
+            }
+            if (b.memberOrder !== a.memberOrder) {
+              return b.memberOrder - a.memberOrder;
+            }
+            return b.index - a.index;
+          });
+        let idx = 0;
+        while (remainder < 0 && sortedAsc.length > 0) {
+          const target = sortedAsc[idx % sortedAsc.length];
+          if (target.adjusted > 0) {
+            target.adjusted -= 1;
+            remainder++;
+          }
+          idx++;
+        }
+      }
+
+      convertedSplits = allocations.map((a) => ({
+        participantId: a.participantId,
+        convertedCents: a.adjusted,
+      }));
+    }
+
+    // Credit payer (+convertedTotalCents) and debit participants (-convertedCents)
+    netByMember.set(
+      payerId,
+      (netByMember.get(payerId) || 0) + convertedTotalCents
+    );
+    if (exp.type === 'expense') {
+      paidByMember.set(
+        payerId,
+        (paidByMember.get(payerId) || 0) + convertedTotalCents
+      );
+    }
+
+    for (const cs of convertedSplits) {
+      netByMember.set(
+        cs.participantId,
+        (netByMember.get(cs.participantId) || 0) - cs.convertedCents
+      );
+      if (exp.type === 'expense') {
+        shareByMember.set(
+          cs.participantId,
+          (shareByMember.get(cs.participantId) || 0) + cs.convertedCents
+        );
+      }
     }
   }
 
-  const memberBreakdown: MemberSummaryRecord[] = roundedEntries.map((item) => ({
-    memberId: item.memberId,
-    memberName: item.memberName,
-    paidCents: item.paidCents,
-    shareCents: item.shareCents,
-    netBalanceCents: item.netBalanceCents,
+  const memberBreakdown: MemberSummaryRecord[] = members.map((m) => ({
+    memberId: m.id,
+    memberName: m.name,
+    paidCents: paidByMember.get(m.id) || 0,
+    shareCents: shareByMember.get(m.id) || 0,
+    netBalanceCents: netByMember.get(m.id) || 0,
   }));
 
   // Run greedy cash-flow minimization on unified balances
@@ -852,6 +1049,7 @@ export interface ParsedCsvTransaction {
   currencySymbol: string;
   type: 'expense' | 'payment';
   paidByMemberName: string;
+  fxRates?: FxRatesMap | null;
   splits: {
     memberName: string;
     splitAmountCents: number;
@@ -903,14 +1101,15 @@ export function parseCsvLine(line: string): string[] {
  * Parses a unified Settle Up CSV string into member names and exact cent transactions.
  *
  * Header format:
- *   Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,...
+ *   Date,Description,Category,Cost,Currency,<Member 1>,<Member 2>,[,FX_Rates]
  *
  * Rules:
- * - Reads member names from header index 5 (6th column) onward.
+ * - Reads member names from header index 5 (6th column) onward, excluding optional trailing `FX_Rates`.
  * - Skips empty lines and the 'Total balance' summary row (Description === 'Total balance' or Cost is empty).
  * - Reconstructs paidByMemberName (column where valCents > 0) and exact expense_splits:
  *   - For any member with valCents < 0: split_amount_cents = Math.abs(valCents)
  *   - For the payer (valCents > 0): if amount_cents - valCents > 0, split_amount_cents = amount_cents - valCents
+ * - Parses optional `FX_Rates` JSON metadata per row when present.
  */
 export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
   const lines = csvContent
@@ -919,7 +1118,8 @@ export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
     .split('\n');
 
   let headerCols: string[] | null = null;
-  let memberNames: string[] = [];
+  let memberColsMeta: Array<{ name: string; colIndex: number }> = [];
+  let fxRatesColIndex = -1;
   const transactions: ParsedCsvTransaction[] = [];
 
   for (const rawLine of lines) {
@@ -930,7 +1130,17 @@ export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
 
     if (!headerCols) {
       headerCols = cols.map((c) => c.trim());
-      memberNames = headerCols.slice(5).filter((name) => name.length > 0);
+      memberColsMeta = [];
+      for (let idx = 5; idx < headerCols.length; idx++) {
+        const colName = headerCols[idx];
+        if (!colName) continue;
+        const lower = colName.toLowerCase();
+        if (lower === 'fx_rates' || lower === 'fx rates') {
+          fxRatesColIndex = idx;
+          continue;
+        }
+        memberColsMeta.push({ name: colName, colIndex: idx });
+      }
       continue;
     }
 
@@ -962,9 +1172,8 @@ export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
     let paidByMemberName = '';
     const splits: { memberName: string; splitAmountCents: number }[] = [];
 
-    for (let mIdx = 0; mIdx < memberNames.length; mIdx++) {
-      const memberName = memberNames[mIdx];
-      const rawCell = (cols[5 + mIdx] || '0').trim();
+    for (const { name: memberName, colIndex } of memberColsMeta) {
+      const rawCell = (cols[colIndex] || '0').trim();
       const parsedVal = parseFloat(rawCell || '0');
       if (isNaN(parsedVal)) continue;
 
@@ -991,6 +1200,19 @@ export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
       continue;
     }
 
+    let fxRates: FxRatesMap | null = null;
+    if (fxRatesColIndex >= 0) {
+      const rawFxCell = (cols[fxRatesColIndex] || '').trim();
+      if (rawFxCell) {
+        try {
+          const parsedJson = JSON.parse(rawFxCell);
+          fxRates = normalizeFxRatesMap(parsedJson, currency);
+        } catch {
+          fxRates = null;
+        }
+      }
+    }
+
     transactions.push({
       date: rawDate || new Date().toISOString().split('T')[0],
       description:
@@ -1002,12 +1224,13 @@ export function parseGroupCsv(csvContent: string): ParsedGroupCsvResult {
       currencySymbol,
       type,
       paidByMemberName,
+      ...(fxRates ? { fxRates } : {}),
       splits,
     });
   }
 
   return {
-    memberNames,
+    memberNames: memberColsMeta.map((m) => m.name),
     transactions,
   };
 }
@@ -1031,6 +1254,7 @@ export interface CsvExportExpense extends ExpenseRecord {
 
 /**
  * Generates the unified Settle Up CSV export string matching `<slug>_<YYYY-MM-DD>_export.csv`.
+ * Appends an optional trailing `FX_Rates` JSON metadata column when any exported transaction has locked `fxRates`.
  */
 export function generateGroupCsv(
   members: MemberRecord[],
@@ -1040,16 +1264,24 @@ export function generateGroupCsv(
   const todayStr =
     exportDateStr || new Date().toISOString().split('T')[0];
 
-  const headerRow = [
+  const includeFxColumn = expenses.some(
+    (exp) => Boolean(normalizeFxRatesMap(exp.fxRates, exp.currency))
+  );
+
+  const headerCols = [
     'Date',
     'Description',
     'Category',
     'Cost',
     'Currency',
     ...members.map((m) => escapeCsvCell(m.name)),
-  ].join(',');
+  ];
+  if (includeFxColumn) {
+    headerCols.push('FX_Rates');
+  }
+  const headerRow = headerCols.join(',');
 
-  // Track net balances per currency code ('USD' | 'EUR') in integer cents
+  // Track net balances per currency code ('USD' | 'EUR' | ...) in integer cents
   const netBalancesByCurrency = new Map<string, Map<string, number>>();
   const ensureCurrencyMap = (curCode: string) => {
     if (!netBalancesByCurrency.has(curCode)) {
@@ -1117,16 +1349,20 @@ export function generateGroupCsv(
       return (deltaCents / 100).toFixed(2);
     });
 
-    transactionRows.push(
-      [
-        escapeCsvCell(dateStr),
-        escapeCsvCell(descStr),
-        escapeCsvCell(category),
-        costFormatted,
-        currencyCode,
-        ...memberCols,
-      ].join(',')
-    );
+    const rowCells = [
+      escapeCsvCell(dateStr),
+      escapeCsvCell(descStr),
+      escapeCsvCell(category),
+      costFormatted,
+      currencyCode,
+      ...memberCols,
+    ];
+    if (includeFxColumn) {
+      const normalizedFx = normalizeFxRatesMap(exp.fxRates, currencyCode);
+      rowCells.push(normalizedFx ? escapeCsvCell(JSON.stringify(normalizedFx)) : '');
+    }
+
+    transactionRows.push(rowCells.join(','));
   }
 
   if (netBalancesByCurrency.size === 0) {
@@ -1138,9 +1374,18 @@ export function generateGroupCsv(
     const memberTotals = members.map((m) =>
       ((balMap.get(m.id) || 0) / 100).toFixed(2)
     );
-    footerRows.push(
-      [todayStr, 'Total balance', ' ', ' ', curCode, ...memberTotals].join(',')
-    );
+    const footerCells = [
+      todayStr,
+      'Total balance',
+      ' ',
+      ' ',
+      curCode,
+      ...memberTotals,
+    ];
+    if (includeFxColumn) {
+      footerCells.push('');
+    }
+    footerRows.push(footerCells.join(','));
   }
 
   return [headerRow, ...transactionRows, '', ...footerRows].join('\n');
@@ -1157,4 +1402,111 @@ export function deriveGroupNameFromCsvFilename(filename: string): string {
     .trim();
   return stripped || withoutExt || 'Imported Group';
 }
+
+// ============================================================================
+// Personalized Member URL Identity Resolution
+// ============================================================================
+
+export function safeDecodeUrlComponent(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+const RESERVED_QUERY_KEYS = new Set([
+  'shared_receipt',
+  'share_error',
+  'm',
+  'groupid',
+  'join',
+]);
+
+/**
+ * Resolves a group member identity from URL parameters and optional localStorage fallback
+ * following strict priority:
+ * 1. Path segment: `/[slug]/[member]` (URL-decoded, case-insensitive match on display_name)
+ * 2. Legacy query param: `/[slug]?m=<name>`
+ * 3. Bare valueless query string: `/[slug]?<name>` (single non-reserved key with value `""`)
+ * 4. Stored `localStorage` member ID or name
+ */
+export function resolveMemberIdentityFromUrl<
+  T extends { id: string; name: string; displayName?: string }
+>(
+  members: T[],
+  options: {
+    pathMember?: string | null;
+    search?: string | null;
+    storedMember?: string | null;
+  }
+): {
+  member: T | undefined;
+  source: 'path' | 'query_m' | 'query_bare' | 'storage' | null;
+} {
+  const matchCandidate = (rawCandidate?: string | null): T | undefined => {
+    if (!rawCandidate) return undefined;
+    const decoded = safeDecodeUrlComponent(rawCandidate).trim().toLowerCase();
+    if (!decoded) return undefined;
+    return members.find((m) => {
+      const display = (m.displayName || m.name || '').trim().toLowerCase();
+      const name = (m.name || '').trim().toLowerCase();
+      return (
+        display === decoded ||
+        name === decoded ||
+        m.id.toLowerCase() === decoded
+      );
+    });
+  };
+
+  // 1. Path segment: /[slug]/[member]
+  if (options.pathMember && options.pathMember.trim().length > 0) {
+    const byPath = matchCandidate(options.pathMember);
+    if (byPath) {
+      return { member: byPath, source: 'path' };
+    }
+  }
+
+  // 2 & 3. Query string formats
+  if (options.search) {
+    const cleanSearch = options.search.startsWith('?')
+      ? options.search.slice(1)
+      : options.search;
+    const params = new URLSearchParams(cleanSearch);
+
+    // 2. Legacy query param: ?m=<name>
+    const mParam = params.get('m');
+    if (mParam && mParam.trim().length > 0) {
+      const byQueryM = matchCandidate(mParam);
+      if (byQueryM) {
+        return { member: byQueryM, source: 'query_m' };
+      }
+    }
+
+    // 3. Bare valueless query string: ?<name>
+    const nonReservedEntries = Array.from(params.entries()).filter(
+      ([key]) => !RESERVED_QUERY_KEYS.has(key.trim().toLowerCase())
+    );
+    if (
+      nonReservedEntries.length === 1 &&
+      nonReservedEntries[0][1] === ''
+    ) {
+      const byBareKey = matchCandidate(nonReservedEntries[0][0]);
+      if (byBareKey) {
+        return { member: byBareKey, source: 'query_bare' };
+      }
+    }
+  }
+
+  // 4. Fallback to saved localStorage identity
+  if (options.storedMember && options.storedMember.trim().length > 0) {
+    const byStorage = matchCandidate(options.storedMember);
+    if (byStorage) {
+      return { member: byStorage, source: 'storage' };
+    }
+  }
+
+  return { member: undefined, source: null };
+}
+
 

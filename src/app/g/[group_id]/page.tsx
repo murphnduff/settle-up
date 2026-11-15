@@ -13,7 +13,7 @@ function LegacyGroupRedirect() {
   useEffect(() => {
     if (groupId) {
       const target = memberParam
-        ? `/${groupId}?m=${encodeURIComponent(memberParam)}`
+        ? `/${groupId}/${encodeURIComponent(memberParam)}`
         : `/${groupId}`;
       router.replace(target);
     } else {

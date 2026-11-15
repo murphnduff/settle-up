@@ -14,7 +14,9 @@ import {
   calculateSettlements,
   calculateMemberBreakdown,
   calculateCategorySpend,
+  calculateUnifiedCategorySpend,
   calculateUnifiedReconciliation,
+  resolveMemberIdentityFromUrl,
   splitAmountEqually,
   splitAmountByPercentage,
   validateExactSplits,
@@ -35,6 +37,11 @@ import {
   getCurrencySymbol,
   formatCurrency,
   buildGroupCurrencies,
+  fetchTransactionFxRates,
+  normalizeFxRatesMap,
+  getLockedRateToTarget,
+  formatFxDisplayQuote,
+  type FxRatesMap,
 } from "@/lib/currencies";
 import MemberInviteModal, {
   Group,
@@ -65,7 +72,6 @@ import {
   Plus,
   Receipt,
   ArrowRightLeft,
-  Wallet,
   Sparkles,
   Edit3,
   Share2,
@@ -81,8 +87,6 @@ import {
   ChevronDown,
   ChevronRight,
   Lock,
-  Tag,
-  Camera,
   FileText,
   ExternalLink,
   Loader2,
@@ -173,6 +177,7 @@ function mapAndSortExpenses(rows: any[]): ExpenseItem[] {
       type: (isPayment ? "payment" : "expense") as "expense" | "payment",
       category: resolvedCategory,
       receiptUrl: resolvedReceiptUrl,
+      fxRates: normalizeFxRatesMap(e.fx_rates, curr),
       date: cleanDate,
       createdAt: typeof e.created_at === "string" ? e.created_at : "",
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -299,12 +304,52 @@ async function resolveGroupBySlugOrId(
   return null;
 }
 
+function legacyCopyText(text: string): boolean {
+  if (typeof document === "undefined") return false;
+  const field = Object.assign(document.createElement("textarea"), {
+    value: text,
+  });
+  field.setAttribute("readonly", "");
+  field.style.cssText = "position:fixed;inset-block-start:0;opacity:0";
+  document.body.append(field);
+  field.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    field.remove();
+  }
+}
+
+function buildCleanGroupMemberUrl(
+  slugOrId: string,
+  memberName?: string | null
+): string {
+  const basePath = memberName
+    ? `/${slugOrId}/${encodeURIComponent(memberName)}`
+    : `/${slugOrId}`;
+  if (typeof window === "undefined") return basePath;
+  const currentParams = new URLSearchParams(window.location.search);
+  const preserved = new URLSearchParams();
+  const sharedReceipt = currentParams.get("shared_receipt");
+  if (sharedReceipt) {
+    preserved.set("shared_receipt", sharedReceipt);
+  }
+  const shareError = currentParams.get("share_error");
+  if (shareError) {
+    preserved.set("share_error", shareError);
+  }
+  const qs = preserved.toString();
+  return qs ? `${basePath}?${qs}` : basePath;
+}
+
 export function SettleUpDashboard({
   initialSlug,
   initialGroupId,
+  initialMember,
 }: {
   initialSlug?: string;
   initialGroupId?: string;
+  initialMember?: string;
 }) {
   const supabase = useMemo(() => createClient(), []);
   const routeTarget = initialSlug || initialGroupId || "";
@@ -312,6 +357,10 @@ export function SettleUpDashboard({
   const [user, setUser] = useState<User | null>(null);
   const [authInitialized, setAuthInitialized] = useState(false);
   const [groups, setGroups] = useState<Group[]>([]);
+  const groupsRef = useRef<Group[]>([]);
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
   const [activeGroupId, setActiveGroupId] = useState<string>("");
   const [members, setMembers] = useState<GroupMember[]>([]);
   const [activeMemberId, setActiveMemberId] = useState<string>("");
@@ -335,7 +384,20 @@ export function SettleUpDashboard({
   const [customIsoInput, setCustomIsoInput] = useState<string>("");
   const [isSavingCurrencies, setIsSavingCurrencies] = useState<boolean>(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
-  const [copiedGroupLink, setCopiedGroupLink] = useState(false);
+  const [copyFeedbackTarget, setCopyFeedbackTarget] = useState<
+    "idle" | "group" | "member" | "failed"
+  >("idle");
+  const [copyStatusText, setCopyStatusText] = useState<string>("");
+  const [isCopyMenuOpen, setIsCopyMenuOpen] = useState<boolean>(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastCopyAnnouncementRef = useRef<string>("");
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) {
+        clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
   const [showArchivedGroups, setShowArchivedGroups] = useState(false);
   const [isMobileGroupsOpen, setIsMobileGroupsOpen] = useState(false);
   const [isManageMenuOpen, setIsManageMenuOpen] = useState(false);
@@ -362,6 +424,7 @@ export function SettleUpDashboard({
   >({});
   const [isFetchingRates, setIsFetchingRates] = useState<boolean>(false);
   const [isSavingRates, setIsSavingRates] = useState<boolean>(false);
+  const [isBackfillingRates, setIsBackfillingRates] = useState<boolean>(false);
 
   // Add Transaction Form state
   const [description, setDescription] = useState("");
@@ -371,6 +434,18 @@ export function SettleUpDashboard({
   const [transactionDate, setTransactionDate] = useState<string>(() =>
     getTodayLocalDate()
   );
+  const [manualAddFx, setManualAddFx] = useState<{
+    key: string;
+    rates: FxRatesMap;
+  } | null>(null);
+  const [autoFetchedAddFx, setAutoFetchedAddFx] = useState<{
+    key: string;
+    rates: FxRatesMap;
+  } | null>(null);
+  const [isRefreshingAddFx, setIsRefreshingAddFx] = useState<boolean>(false);
+  const [isEditingAddFx, setIsEditingAddFx] = useState<boolean>(false);
+  const [addFxRateInput, setAddFxRateInput] = useState<string>("");
+  const [addFxBilledInput, setAddFxBilledInput] = useState<string>("");
   const [type, setType] = useState<"expense" | "payment">("expense");
   const [category, setCategory] = useState<string>("General");
   const [isCustomCategory, setIsCustomCategory] = useState<boolean>(false);
@@ -624,7 +699,7 @@ export function SettleUpDashboard({
     };
   }, [authInitialized, isSuperAdmin, routeTarget, supabase]);
 
-  // Load group members & expenses when activeGroupId changes, and resolve ?m=<display_name> or localStorage identity
+  // Load group members & expenses when activeGroupId changes, and resolve /[slug]/[member], ?m=<name>, ?<name>, or localStorage identity
   useEffect(() => {
     if (!activeGroupId) return;
     let cancelled = false;
@@ -632,15 +707,32 @@ export function SettleUpDashboard({
     // Save activeGroupId to recent groups in localStorage
     addRecentGroupId(activeGroupId);
 
-    const params =
-      typeof window !== "undefined"
-        ? new URLSearchParams(window.location.search)
-        : null;
-    const urlMemberParam = params?.get("m")?.trim() || "";
     const storedMemberValue =
       typeof window !== "undefined"
         ? localStorage.getItem(memberStorageKey(activeGroupId)) || ""
         : "";
+
+    let livePathMember = "";
+    let isRootStealthPath = false;
+    if (typeof window !== "undefined") {
+      const segs = window.location.pathname.split("/").filter(Boolean);
+      isRootStealthPath = segs.length === 0;
+      if (
+        segs.length >= 2 &&
+        !["g", "join", "share-receipt"].includes(segs[0].toLowerCase())
+      ) {
+        livePathMember = segs[1];
+      } else if (
+        segs.length === 1 &&
+        initialMember &&
+        initialSlug &&
+        segs[0].toLowerCase() === initialSlug.toLowerCase()
+      ) {
+        livePathMember = initialMember;
+      }
+    } else if (initialMember) {
+      livePathMember = initialMember;
+    }
 
     supabase
       .from("group_members")
@@ -663,26 +755,12 @@ export function SettleUpDashboard({
         setMembers(list);
         setSelectedMembers(list.map((u) => u.id));
 
-        // Match member by ?m=<display_name> (case-insensitive) or ?m=<member_id>, or fallback to localStorage
-        let matchedMember: GroupMember | undefined;
-
-        if (urlMemberParam) {
-          const lowerUrlParam = urlMemberParam.toLowerCase();
-          matchedMember = list.find(
-            (m) =>
-              m.name.trim().toLowerCase() === lowerUrlParam ||
-              m.id.toLowerCase() === lowerUrlParam
-          );
-        }
-
-        if (!matchedMember && storedMemberValue) {
-          const lowerStored = storedMemberValue.toLowerCase();
-          matchedMember = list.find(
-            (m) =>
-              m.id.toLowerCase() === lowerStored ||
-              m.name.trim().toLowerCase() === lowerStored
-          );
-        }
+        const resolved = resolveMemberIdentityFromUrl(list, {
+          pathMember: livePathMember,
+          search: typeof window !== "undefined" ? window.location.search : "",
+          storedMember: storedMemberValue,
+        });
+        const matchedMember = resolved.member;
 
         if (matchedMember) {
           setActiveMemberId(matchedMember.id);
@@ -692,6 +770,27 @@ export function SettleUpDashboard({
               memberStorageKey(activeGroupId),
               matchedMember.id
             );
+
+            // Normalize URL to clean /[slug]/[member] path (unless user opened stealth "/" with no member URL param)
+            if (!isRootStealthPath || resolved.source !== "storage") {
+              const grp = groupsRef.current.find((g) => g.id === activeGroupId);
+              const fallbackSeg = window.location.pathname
+                .split("/")
+                .filter(Boolean)[0];
+              const slugOrId = grp
+                ? grp.slug || generateGroupSlug(grp.name) || grp.id
+                : fallbackSeg &&
+                    !["g", "join", "share-receipt"].includes(
+                      fallbackSeg.toLowerCase()
+                    )
+                  ? fallbackSeg
+                  : initialSlug || activeGroupId;
+              window.history.replaceState(
+                null,
+                "",
+                buildCleanGroupMemberUrl(slugOrId, matchedMember.name)
+              );
+            }
           }
         } else {
           setActiveMemberId("");
@@ -718,7 +817,7 @@ export function SettleUpDashboard({
     return () => {
       cancelled = true;
     };
-  }, [activeGroupId, supabase]);
+  }, [activeGroupId, initialMember, initialSlug, supabase]);
 
   // Select member identity ("Who are you in this group?")
   const handleSelectIdentity = (member: GroupMember) => {
@@ -737,7 +836,7 @@ export function SettleUpDashboard({
       window.history.replaceState(
         null,
         "",
-        `/${slugOrId}?m=${encodeURIComponent(member.name)}`
+        buildCleanGroupMemberUrl(slugOrId, member.name)
       );
     }
   };
@@ -747,6 +846,7 @@ export function SettleUpDashboard({
     setActiveGroupId(group.id);
     setIsMobileGroupsOpen(false);
     setIsManageMenuOpen(false);
+    setIsCopyMenuOpen(false);
     addRecentGroupId(group.id);
     if (typeof window !== "undefined") {
       const slugOrId = group.slug || generateGroupSlug(group.name) || group.id;
@@ -754,8 +854,31 @@ export function SettleUpDashboard({
     }
   };
 
-  // Copy Main Group Link (https://split.murphnduff.org/<group.slug>)
-  const handleCopyGroupLink = async () => {
+  // Report copy status for sighted and screen reader users (modern-web-guidance copy-button pattern)
+  const reportCopyOutcome = (
+    targetKind: "group" | "member",
+    ok: boolean,
+    labelMessage: string
+  ) => {
+    if (copyTimerRef.current) {
+      clearTimeout(copyTimerRef.current);
+    }
+    let announced = ok ? labelMessage : "Copy failed";
+    if (announced === lastCopyAnnouncementRef.current) {
+      announced += "\u00A0";
+    }
+    lastCopyAnnouncementRef.current = announced;
+    setCopyFeedbackTarget(ok ? targetKind : "failed");
+    setCopyStatusText(announced);
+    copyTimerRef.current = setTimeout(() => {
+      setCopyFeedbackTarget("idle");
+      setCopyStatusText("");
+      copyTimerRef.current = null;
+    }, 2200);
+  };
+
+  // Copy Group or Personalized Member Link (https://split.murphnduff.org/<slug> or /<slug>/<member>)
+  const handleCopyGroupOrMemberLink = async (memberName?: string | null) => {
     if (!activeGroup) return;
     const origin =
       typeof window !== "undefined" && window.location?.origin
@@ -763,13 +886,26 @@ export function SettleUpDashboard({
         : "https://split.murphnduff.org";
     const slugOrId =
       activeGroup.slug || generateGroupSlug(activeGroup.name) || activeGroup.id;
-    const url = `${origin}/${slugOrId}`;
+    const cleanMember = (memberName || "").trim();
+    const url = cleanMember
+      ? `${origin}/${slugOrId}/${encodeURIComponent(cleanMember)}`
+      : `${origin}/${slugOrId}`;
+    setIsCopyMenuOpen(false);
+
     try {
       await navigator.clipboard.writeText(url);
-      setCopiedGroupLink(true);
-      setTimeout(() => setCopiedGroupLink(false), 2500);
+      reportCopyOutcome(
+        cleanMember ? "member" : "group",
+        true,
+        cleanMember ? `Copied ${cleanMember}'s link` : "Copied group link"
+      );
     } catch {
-      // fallback
+      const ok = legacyCopyText(url);
+      reportCopyOutcome(
+        cleanMember ? "member" : "group",
+        ok,
+        cleanMember ? `Copied ${cleanMember}'s link` : "Copied group link"
+      );
     }
   };
 
@@ -818,7 +954,10 @@ export function SettleUpDashboard({
     setHistorySearchQuery("");
     setIsUnifiedMode(false);
     setIsManageMenuOpen(false);
+    setIsCopyMenuOpen(false);
     setIsMobileGroupsOpen(false);
+    setManualAddFx(null);
+    setIsEditingAddFx(false);
 
     const savedRates = activeGroup.exchange_rates || {};
     const initialInputs: Record<string, string> = { [defCur]: "1" };
@@ -1013,6 +1152,95 @@ export function SettleUpDashboard({
       ),
     [members, expenses, unifiedTargetCurrency, numericExchangeRates]
   );
+
+  // Unified Spend by Category Result
+  const unifiedCategorySpend = useMemo(
+    () =>
+      calculateUnifiedCategorySpend(
+        expenses,
+        unifiedTargetCurrency,
+        numericExchangeRates
+      ),
+    [expenses, unifiedTargetCurrency, numericExchangeRates]
+  );
+
+  // Legacy unlocked multi-currency expenses missing transaction-time fx_rates
+  const unlockedFxExpenses = useMemo(
+    () =>
+      hasMultipleCurrencies ? expenses.filter((e) => !e.fxRates) : [],
+    [hasMultipleCurrencies, expenses]
+  );
+
+  // 1-Click Backfill Historical FX Rates for Legacy Unlocked Multi-Currency Expenses (Super-Admin)
+  const handleBackfillHistoricalRates = async () => {
+    if (!isSuperAdmin || !activeGroup || unlockedFxExpenses.length === 0) {
+      return;
+    }
+    setIsBackfillingRates(true);
+    try {
+      const uniquePairKeys = Array.from(
+        new Set(
+          unlockedFxExpenses.map((e) => {
+            const iso = normalizeCurrencyCode(e.currency);
+            const dt = (e.date || getTodayLocalDate()).split("T")[0];
+            return `${iso}::${dt}`;
+          })
+        )
+      );
+
+      const ratesByPair = new Map<string, FxRatesMap>();
+      await Promise.all(
+        uniquePairKeys.map(async (pairKey) => {
+          const [iso, dt] = pairKey.split("::");
+          try {
+            const fetched = await fetchTransactionFxRates(
+              iso,
+              dt,
+              activeGroupCurrencies
+            );
+            ratesByPair.set(pairKey, fetched);
+          } catch {
+            // Skip failed pair so other rows still backfill
+          }
+        })
+      );
+
+      let updatedCount = 0;
+      await Promise.all(
+        unlockedFxExpenses.map(async (exp) => {
+          const iso = normalizeCurrencyCode(exp.currency);
+          const dt = (exp.date || getTodayLocalDate()).split("T")[0];
+          const rates = ratesByPair.get(`${iso}::${dt}`);
+          if (!rates) return;
+          const { error } = await supabase
+            .from("expenses")
+            .update({ fx_rates: rates })
+            .eq("id", exp.id);
+          if (!error) {
+            updatedCount++;
+          }
+        })
+      );
+
+      await refreshExpenses(activeGroup.id);
+      setNotification({
+        type: "success",
+        message: `Locked historical exchange rates for ${updatedCount} transaction${
+          updatedCount === 1 ? "" : "s"
+        }.`,
+      });
+    } catch (err: unknown) {
+      setNotification({
+        type: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : "Failed to backfill historical exchange rates.",
+      });
+    } finally {
+      setIsBackfillingRates(false);
+    }
+  };
 
   // Switch target currency in Unified Settlement mode and rebase existing rates so 1 newTarget = X otherCur remains consistent
   const handleSelectUnifiedTargetCurrency = (nextTargetRaw: string) => {
@@ -1579,6 +1807,146 @@ export function SettleUpDashboard({
       ? (totalCents / 100 / selectedMembers.length).toFixed(2)
       : null;
 
+  // Date-aware FX auto-fetch & override helpers for Add Transaction form
+  const normalizedAddCurrency = normalizeCurrencyCode(currency);
+  const cleanAddDate = (transactionDate || getTodayLocalDate()).split("T")[0];
+  const currentAddFxKey = `${normalizedAddCurrency}::${cleanAddDate}`;
+
+  const resolvedAddFxRates: FxRatesMap | null = useMemo(() => {
+    if (manualAddFx && manualAddFx.key === currentAddFxKey) {
+      return manualAddFx.rates;
+    }
+    if (autoFetchedAddFx && autoFetchedAddFx.key === currentAddFxKey) {
+      return autoFetchedAddFx.rates;
+    }
+    return null;
+  }, [manualAddFx, autoFetchedAddFx, currentAddFxKey]);
+
+  const needsAddFxRates = Boolean(
+    activeGroup &&
+      !activeGroup.is_archived &&
+      (activeGroupCurrencies.length > 1 ||
+        normalizedAddCurrency !== activeDefaultCurrency)
+  );
+  const shouldAutoFetchAddFx = needsAddFxRates && !resolvedAddFxRates;
+
+  useEffect(() => {
+    if (!shouldAutoFetchAddFx) return;
+    let cancelled = false;
+
+    fetchTransactionFxRates(
+      normalizedAddCurrency,
+      cleanAddDate,
+      activeGroupCurrencies
+    )
+      .then((rates) => {
+        if (!cancelled) {
+          setAutoFetchedAddFx({ key: currentAddFxKey, rates });
+        }
+      })
+      .catch(() => {
+        // Silent fallback on network errors
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    shouldAutoFetchAddFx,
+    normalizedAddCurrency,
+    cleanAddDate,
+    activeGroupCurrencies,
+    currentAddFxKey,
+  ]);
+
+  const lockedAddRateToDefault = useMemo(
+    () =>
+      getLockedRateToTarget(
+        normalizedAddCurrency,
+        activeDefaultCurrency,
+        resolvedAddFxRates
+      ),
+    [normalizedAddCurrency, activeDefaultCurrency, resolvedAddFxRates]
+  );
+
+  const fxAddQuoteInfo = useMemo(
+    () =>
+      lockedAddRateToDefault && lockedAddRateToDefault > 0
+        ? formatFxDisplayQuote(
+            normalizedAddCurrency,
+            activeDefaultCurrency,
+            lockedAddRateToDefault
+          )
+        : null,
+    [normalizedAddCurrency, activeDefaultCurrency, lockedAddRateToDefault]
+  );
+
+  const convertedAddDefaultCents =
+    lockedAddRateToDefault && totalCents > 0
+      ? Math.round(totalCents * lockedAddRateToDefault)
+      : null;
+
+  const handleRefreshAddFx = async () => {
+    setIsRefreshingAddFx(true);
+    try {
+      const rates = await fetchTransactionFxRates(
+        normalizedAddCurrency,
+        cleanAddDate,
+        activeGroupCurrencies
+      );
+      setManualAddFx({ key: currentAddFxKey, rates });
+      setAutoFetchedAddFx({ key: currentAddFxKey, rates });
+      setIsEditingAddFx(false);
+    } finally {
+      setIsRefreshingAddFx(false);
+    }
+  };
+
+  const handleOpenEditAddFx = () => {
+    setAddFxRateInput(fxAddQuoteInfo ? fxAddQuoteInfo.shortRateText : "");
+    setAddFxBilledInput(
+      convertedAddDefaultCents && convertedAddDefaultCents > 0
+        ? (convertedAddDefaultCents / 100).toFixed(2)
+        : ""
+    );
+    setIsEditingAddFx(true);
+  };
+
+  const handleApplyAddFxOverride = () => {
+    const billedVal = parseFloat(addFxBilledInput);
+    const rateVal = parseFloat(addFxRateInput);
+    let nextRateExpToDefault: number | null = null;
+
+    const currentConvertedStr =
+      convertedAddDefaultCents && convertedAddDefaultCents > 0
+        ? (convertedAddDefaultCents / 100).toFixed(2)
+        : "";
+    if (
+      addFxBilledInput.trim() &&
+      addFxBilledInput.trim() !== currentConvertedStr &&
+      !isNaN(billedVal) &&
+      billedVal > 0 &&
+      totalCents > 0
+    ) {
+      nextRateExpToDefault = (billedVal * 100) / totalCents;
+    } else if (!isNaN(rateVal) && rateVal > 0) {
+      const useInverse = fxAddQuoteInfo ? fxAddQuoteInfo.isInverse : true;
+      nextRateExpToDefault = useInverse ? 1 / rateVal : rateVal;
+    } else if (!isNaN(billedVal) && billedVal > 0 && totalCents > 0) {
+      nextRateExpToDefault = (billedVal * 100) / totalCents;
+    }
+
+    if (nextRateExpToDefault && nextRateExpToDefault > 0) {
+      const updatedMap: FxRatesMap = {
+        ...(resolvedAddFxRates || {}),
+        [normalizedAddCurrency]: 1,
+        [activeDefaultCurrency]: Number(nextRateExpToDefault.toPrecision(10)),
+      };
+      setManualAddFx({ key: currentAddFxKey, rates: updatedMap });
+      setIsEditingAddFx(false);
+    }
+  };
+
   // Live percentage summary for Add Transaction form
   const percentageSummary = useMemo(() => {
     const pctRecord: Record<string, number> = {};
@@ -1793,6 +2161,42 @@ export function SettleUpDashboard({
       }
 
       // 2. Build entire expensesToInsert and splitsToInsert arrays in memory using crypto.randomUUID()
+      // When importing multi-currency CSVs lacking FX_Rates, auto-fetch historical rates by row Date
+      const allImportCurrencies = buildGroupCurrencies(
+        targetGroup.currencies || ["USD"],
+        targetGroup.default_currency || "USD",
+        csvCurrencies
+      );
+      const historicalFxByPair = new Map<string, FxRatesMap>();
+      if (allImportCurrencies.length > 1) {
+        const missingFxPairs = Array.from(
+          new Set(
+            parsedCsv.transactions
+              .filter((txn) => !txn.fxRates)
+              .map((txn) => {
+                const isoCur = normalizeCurrencyCode(txn.currency);
+                const txDate = (txn.date || getTodayLocalDate()).split("T")[0];
+                return `${isoCur}::${txDate}`;
+              })
+          )
+        );
+        await Promise.all(
+          missingFxPairs.map(async (pairKey) => {
+            const [isoCur, txDate] = pairKey.split("::");
+            try {
+              const fetched = await fetchTransactionFxRates(
+                isoCur,
+                txDate,
+                allImportCurrencies
+              );
+              historicalFxByPair.set(pairKey, fetched);
+            } catch {
+              // Keep null if offline
+            }
+          })
+        );
+      }
+
       const expensesToInsert: Array<Record<string, unknown>> = [];
       const splitsToInsert: Array<Record<string, unknown>> = [];
       const fallbackCurrencyById = new Map<string, string>();
@@ -1815,6 +2219,9 @@ export function SettleUpDashboard({
               });
 
         const isoCur = normalizeCurrencyCode(txn.currency);
+        const txDate = (txn.date || getTodayLocalDate()).split("T")[0];
+        const rowFxRates =
+          txn.fxRates || historicalFxByPair.get(`${isoCur}::${txDate}`) || null;
         fallbackCurrencyById.set(expenseId, getCurrencySymbol(isoCur));
         amountDollarsById.set(
           expenseId,
@@ -1832,8 +2239,9 @@ export function SettleUpDashboard({
               : (txn.category || "").trim() || "General",
           amount_cents: txn.amountCents,
           currency: isoCur,
+          fx_rates: rowFxRates,
           type: txn.type,
-          date: txn.date || getTodayLocalDate(),
+          date: txDate,
         });
 
         for (const s of txn.splits) {
@@ -1859,6 +2267,17 @@ export function SettleUpDashboard({
         for (let attempt = 0; attempt < 4 && expError; attempt++) {
           const msg = expError.message?.toLowerCase() || "";
           let updated = false;
+          if (
+            msg.includes("fx_rates") &&
+            bulkExpensesPayload.some((row) => "fx_rates" in row)
+          ) {
+            bulkExpensesPayload = bulkExpensesPayload.map((row) => {
+              const rest = { ...row };
+              delete rest.fx_rates;
+              return rest;
+            });
+            updated = true;
+          }
           if (
             (msg.includes("expenses_currency_check") ||
               msg.includes("currency")) &&
@@ -2194,6 +2613,24 @@ export function SettleUpDashboard({
       : (category || "").trim() || "General";
 
     const normalizedIsoCurrency = normalizeCurrencyCode(currency);
+    const cleanTxDate = (transactionDate || getTodayLocalDate()).split("T")[0];
+
+    let finalFxRates: FxRatesMap | null = resolvedAddFxRates;
+    if (
+      !finalFxRates &&
+      (activeGroupCurrencies.length > 1 ||
+        normalizedIsoCurrency !== activeDefaultCurrency)
+    ) {
+      try {
+        finalFxRates = await fetchTransactionFxRates(
+          normalizedIsoCurrency,
+          cleanTxDate,
+          activeGroupCurrencies
+        );
+      } catch {
+        finalFxRates = null;
+      }
+    }
 
     const expensePayload: Record<string, unknown> = {
       group_id: activeGroupId,
@@ -2206,8 +2643,9 @@ export function SettleUpDashboard({
       receipt_url: type === "payment" ? null : receiptUrl,
       amount_cents: totalCents,
       currency: normalizedIsoCurrency,
+      fx_rates: finalFxRates,
       type,
-      date: transactionDate || getTodayLocalDate(),
+      date: cleanTxDate,
     };
 
     // 1. Insert into expenses (auto-adapts if legacy NOT NULL or currency check constraints exist in DB)
@@ -2220,6 +2658,10 @@ export function SettleUpDashboard({
     for (let attempt = 0; attempt < 4 && expError; attempt++) {
       const msg = expError.message?.toLowerCase() || "";
       let updated = false;
+      if (msg.includes("fx_rates") && "fx_rates" in expensePayload) {
+        delete expensePayload.fx_rates;
+        updated = true;
+      }
       const symbolFallback = getCurrencySymbol(normalizedIsoCurrency);
       if (
         (msg.includes("expenses_currency_check") || msg.includes("currency")) &&
@@ -2323,6 +2765,10 @@ export function SettleUpDashboard({
     setReceiptScanError(null);
     setPercentageValues({});
     setExactValues({});
+    setManualAddFx(null);
+    setIsEditingAddFx(false);
+    setAddFxRateInput("");
+    setAddFxBilledInput("");
     startTransition(() => {
       refreshExpenses(activeGroupId);
     });
@@ -2402,8 +2848,8 @@ export function SettleUpDashboard({
         </button>
       </div>
 
-      {/* Shared Multi-Currency Unified Toggle (Visible on Settle Up & Members tabs when 2+ currencies exist) */}
-      {hasMultipleCurrencies && analyticsTab !== "categories" && (
+      {/* Shared Multi-Currency Unified Toggle (Visible on Settle Up, Members & Categories tabs when 2+ currencies exist) */}
+      {hasMultipleCurrencies && (
         <div className="space-y-2.5">
           <button
             type="button"
@@ -2422,7 +2868,7 @@ export function SettleUpDashboard({
             </span>
           </button>
 
-          {isUnifiedMode && analyticsTab === "settle" && (
+          {isUnifiedMode && (
             <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5 text-xs">
               <div className="flex items-center justify-between gap-2">
                 <label className="font-semibold text-slate-700">
@@ -2443,80 +2889,115 @@ export function SettleUpDashboard({
                 </select>
               </div>
 
-              <div className="space-y-2 pt-2 border-t border-slate-200/80">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11px] font-semibold text-slate-600">
-                    Exchange Rates
-                  </span>
-                  <button
-                    type="button"
-                    disabled={isFetchingRates}
-                    onClick={handleFetchLiveRates}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 transition cursor-pointer disabled:opacity-50"
-                  >
-                    <RefreshCw
-                      className={`w-3 h-3 ${
-                        isFetchingRates ? "animate-spin" : ""
-                      }`}
-                    />
-                    <span>
-                      {isFetchingRates ? "Fetching..." : "Fetch Live Rates"}
-                    </span>
-                  </button>
-                </div>
-
-                <div className="space-y-1.5">
-                  {activeGroupCurrencies
-                    .filter(
-                      (code) =>
-                        code !== normalizeCurrencyCode(unifiedTargetCurrency)
-                    )
-                    .map((otherCode) => (
-                      <div
-                        key={otherCode}
-                        className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
-                      >
-                        <span className="text-[11px] font-medium text-slate-600 shrink-0">
-                          1 {unifiedTargetCurrency} =
-                        </span>
-                        <div className="flex items-center gap-1.5">
-                          <input
-                            type="number"
-                            step="any"
-                            min="0.000001"
-                            value={
-                              exchangeRatesInput[otherCode] ??
-                              String(numericExchangeRates[otherCode] ?? 1)
-                            }
-                            onChange={(e) =>
-                              setExchangeRatesInput((prev) => ({
-                                ...prev,
-                                [otherCode]: e.target.value,
-                              }))
-                            }
-                            className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                          />
-                          <span className="text-[11px] font-bold text-slate-700 w-8">
-                            {otherCode}
-                          </span>
-                        </div>
-                      </div>
-                    ))}
-                </div>
-
-                {!activeGroup?.is_archived && (
-                  <button
-                    type="button"
-                    disabled={isSavingRates}
-                    onClick={handleSaveExchangeRates}
-                    className="w-full py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white transition cursor-pointer disabled:opacity-50"
-                  >
-                    {isSavingRates
-                      ? "Saving Rates..."
-                      : "Save Exchange Rates"}
-                  </button>
-                )}
+              <div className="px-2.5 py-2 rounded-lg bg-emerald-50/80 border border-emerald-200/80 text-[11px] text-emerald-950 space-y-1.5">
+                <p className="leading-snug">
+                  <strong>Transaction-Time FX Active:</strong> Expenses with
+                  locked rates convert at their transaction-date rate.{" "}
+                  {unlockedFxExpenses.length > 0
+                    ? `${unlockedFxExpenses.length} legacy unlocked transaction${
+                        unlockedFxExpenses.length === 1 ? " uses" : "s use"
+                      } the fallback rates below.`
+                    : "All multi-currency transactions in this group have locked historical rates."}
+                </p>
+                {isSuperAdmin &&
+                  !activeGroup?.is_archived &&
+                  unlockedFxExpenses.length > 0 && (
+                    <button
+                      type="button"
+                      disabled={isBackfillingRates}
+                      onClick={handleBackfillHistoricalRates}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-bold bg-emerald-700 hover:bg-emerald-800 text-white transition cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`w-3 h-3 ${
+                          isBackfillingRates ? "animate-spin" : ""
+                        }`}
+                      />
+                      <span>
+                        {isBackfillingRates
+                          ? "Backfilling Historical Rates..."
+                          : `Backfill Historical Rates (${unlockedFxExpenses.length})`}
+                      </span>
+                    </button>
+                  )}
               </div>
+
+              {analyticsTab === "settle" && (
+                <div className="space-y-2 pt-2 border-t border-slate-200/80">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold text-slate-600">
+                      Fallback Group Rates (for unlocked rows)
+                    </span>
+                    <button
+                      type="button"
+                      disabled={isFetchingRates}
+                      onClick={handleFetchLiveRates}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 transition cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`w-3 h-3 ${
+                          isFetchingRates ? "animate-spin" : ""
+                        }`}
+                      />
+                      <span>
+                        {isFetchingRates ? "Fetching..." : "Fetch Live Rates"}
+                      </span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    {activeGroupCurrencies
+                      .filter(
+                        (code) =>
+                          code !== normalizeCurrencyCode(unifiedTargetCurrency)
+                      )
+                      .map((otherCode) => (
+                        <div
+                          key={otherCode}
+                          className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
+                        >
+                          <span className="text-[11px] font-medium text-slate-600 shrink-0">
+                            1 {unifiedTargetCurrency} =
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="number"
+                              step="any"
+                              min="0.000001"
+                              value={
+                                exchangeRatesInput[otherCode] ??
+                                String(numericExchangeRates[otherCode] ?? 1)
+                              }
+                              onChange={(e) =>
+                                setExchangeRatesInput((prev) => ({
+                                  ...prev,
+                                  [otherCode]: e.target.value,
+                                }))
+                              }
+                              className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            />
+                            <span className="text-[11px] font-bold text-slate-700 w-8">
+                              {otherCode}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+
+                  {!activeGroup?.is_archived && (
+                    <button
+                      type="button"
+                      disabled={isSavingRates}
+                      onClick={handleSaveExchangeRates}
+                      className="w-full py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white transition cursor-pointer disabled:opacity-50"
+                    >
+                      {isSavingRates
+                        ? "Saving Rates..."
+                        : "Save Fallback Rates"}
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -2527,7 +3008,7 @@ export function SettleUpDashboard({
         <div className="space-y-2.5">
           <p className="text-[11px] text-slate-500 leading-snug">
             {hasMultipleCurrencies && isUnifiedMode
-              ? `Unified cross-currency cash-flow minimization converted into ${unifiedTargetCurrency}.`
+              ? `Unified cross-currency cash-flow minimization into ${unifiedTargetCurrency} using each transaction's locked date rate.`
               : "Greedy cash-flow minimization pairing largest debtors with largest creditors."}
           </p>
 
@@ -2882,72 +3363,119 @@ export function SettleUpDashboard({
       {analyticsTab === "categories" && (
         <div className="space-y-3">
           <p className="text-[11px] text-slate-500 leading-snug">
-            Group expenses aggregated by category (excludes settlement
-            payments).
+            {hasMultipleCurrencies && isUnifiedMode
+              ? `All group expenses converted into ${unifiedTargetCurrency} using transaction-date FX rates (excludes settlement payments).`
+              : "Group expenses aggregated by category (excludes settlement payments)."}
           </p>
 
-          {displayCurrencies.map((code, idx) => {
-            const catList = categorySpendByCurrency[code] || [];
-            const sym = getCurrencySymbol(code);
-            const isSecondary = idx % 2 === 1;
-            if (idx > 0 && catList.length === 0) return null;
-
-            return (
-              <div
-                key={code}
-                className={`space-y-2.5 ${
-                  idx > 0 ? "pt-3 border-t border-slate-100" : ""
-                }`}
-              >
-                {displayCurrencies.length > 1 && (
-                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                    <span
-                      className={`w-2 h-2 rounded-full ${
-                        isSecondary ? "bg-indigo-600" : "bg-blue-600"
-                      }`}
-                    ></span>
-                    {code} ({sym}) Categories
-                  </div>
-                )}
-
-                {catList.length === 0 ? (
-                  <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
-                    No {code} expenses recorded yet.
-                  </div>
-                ) : (
-                  <div className="space-y-2.5">
-                    {catList.map((c) => (
-                      <div key={c.category} className="space-y-1 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-semibold text-slate-800 truncate">
-                            {c.category}
-                          </span>
-                          <span className="text-slate-600 font-medium shrink-0">
-                            <strong className="text-slate-900">
-                              {formatCurrency(c.amountCents, code)}
-                            </strong>{" "}
-                            <span className="text-[11px] text-slate-400">
-                              ({c.percentage.toFixed(1)}%)
-                            </span>
-                          </span>
-                        </div>
-                        <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                          <div
-                            className={`h-full rounded-full transition-all ${
-                              isSecondary ? "bg-indigo-600" : "bg-blue-600"
-                            }`}
-                            style={{
-                              width: `${Math.min(100, Math.max(2, c.percentage))}%`,
-                            }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+          {hasMultipleCurrencies && isUnifiedMode ? (
+            <div className="space-y-2.5">
+              <div className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                Unified {unifiedTargetCurrency} (
+                {getCurrencySymbol(unifiedTargetCurrency)}) Categories
               </div>
-            );
-          })}
+              {unifiedCategorySpend.length === 0 ? (
+                <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                  No expenses recorded yet.
+                </div>
+              ) : (
+                <div className="space-y-2.5">
+                  {unifiedCategorySpend.map((c) => (
+                    <div key={c.category} className="space-y-1 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-slate-800 truncate">
+                          {c.category}
+                        </span>
+                        <span className="text-slate-600 font-medium shrink-0">
+                          <strong className="text-slate-900">
+                            {formatCurrency(
+                              c.amountCents,
+                              unifiedTargetCurrency
+                            )}
+                          </strong>{" "}
+                          <span className="text-[11px] text-slate-400">
+                            ({c.percentage.toFixed(1)}%)
+                          </span>
+                        </span>
+                      </div>
+                      <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all bg-emerald-600"
+                          style={{
+                            width: `${Math.min(100, Math.max(2, c.percentage))}%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            displayCurrencies.map((code, idx) => {
+              const catList = categorySpendByCurrency[code] || [];
+              const sym = getCurrencySymbol(code);
+              const isSecondary = idx % 2 === 1;
+              if (idx > 0 && catList.length === 0) return null;
+
+              return (
+                <div
+                  key={code}
+                  className={`space-y-2.5 ${
+                    idx > 0 ? "pt-3 border-t border-slate-100" : ""
+                  }`}
+                >
+                  {displayCurrencies.length > 1 && (
+                    <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                        }`}
+                      ></span>
+                      {code} ({sym}) Categories
+                    </div>
+                  )}
+
+                  {catList.length === 0 ? (
+                    <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                      No {code} expenses recorded yet.
+                    </div>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {catList.map((c) => (
+                        <div key={c.category} className="space-y-1 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-slate-800 truncate">
+                              {c.category}
+                            </span>
+                            <span className="text-slate-600 font-medium shrink-0">
+                              <strong className="text-slate-900">
+                                {formatCurrency(c.amountCents, code)}
+                              </strong>{" "}
+                              <span className="text-[11px] text-slate-400">
+                                ({c.percentage.toFixed(1)}%)
+                              </span>
+                            </span>
+                          </div>
+                          <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full transition-all ${
+                                isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                              }`}
+                              style={{
+                                width: `${Math.min(100, Math.max(2, c.percentage))}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
         </div>
       )}
     </div>
@@ -3459,29 +3987,155 @@ export function SettleUpDashboard({
                   )}
                 </div>
 
-                {/* Primary Actions: 🔗 Copy Link, 💱 Currencies, ⚙️ Manage Menu (or Export CSV for non-admins) */}
+                {/* Primary Actions: 🔗 Copy Link (Group + Member), 💱 Currencies, ⚙️ Manage Menu (or Export CSV for non-admins) */}
                 <div className="flex items-center gap-1.5 flex-wrap shrink-0">
-                  <button
-                    type="button"
-                    onClick={handleCopyGroupLink}
-                    className={`inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs cursor-pointer ${
-                      copiedGroupLink
-                        ? "bg-emerald-600 text-white"
-                        : "bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
-                    }`}
-                  >
-                    {copiedGroupLink ? (
-                      <>
-                        <Check className="w-3.5 h-3.5 shrink-0" />
-                        <span>Copied!</span>
-                      </>
+                  <div className="relative inline-flex items-center">
+                    <button
+                      type="button"
+                      onClick={() => handleCopyGroupOrMemberLink(null)}
+                      data-copied={
+                        copyFeedbackTarget === "group" ? "" : undefined
+                      }
+                      data-failed={
+                        copyFeedbackTarget === "failed" ? "" : undefined
+                      }
+                      className={`min-h-6 min-w-6 inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold transition shadow-2xs cursor-pointer ${
+                        members.length > 0 && !activeMemberObj
+                          ? "rounded-l-xl border-r-0"
+                          : "rounded-xl"
+                      } ${
+                        copyFeedbackTarget === "group"
+                          ? "bg-emerald-600 text-white border border-emerald-600"
+                          : copyFeedbackTarget === "failed"
+                            ? "bg-rose-600 text-white border border-rose-600"
+                            : "bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
+                      }`}
+                    >
+                      {copyFeedbackTarget === "group" ? (
+                        <>
+                          <Check
+                            className="w-3.5 h-3.5 shrink-0"
+                            aria-hidden="true"
+                          />
+                          <span>Copied!</span>
+                        </>
+                      ) : copyFeedbackTarget === "failed" ? (
+                        <span>Copy failed</span>
+                      ) : (
+                        <>
+                          <Share2
+                            className="w-3.5 h-3.5 shrink-0"
+                            aria-hidden="true"
+                          />
+                          <span>Copy Link</span>
+                        </>
+                      )}
+                    </button>
+
+                    {activeMemberObj ? (
+                      <div className="inline-flex items-center ml-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyGroupOrMemberLink(activeMemberObj.name)
+                          }
+                          data-copied={
+                            copyFeedbackTarget === "member" ? "" : undefined
+                          }
+                          className={`min-h-6 min-w-6 inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-l-xl transition shadow-2xs cursor-pointer border border-r-0 ${
+                            copyFeedbackTarget === "member"
+                              ? "bg-emerald-600 text-white border-emerald-600"
+                              : "bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200"
+                          }`}
+                        >
+                          {copyFeedbackTarget === "member" ? (
+                            <>
+                              <Check
+                                className="w-3.5 h-3.5 shrink-0"
+                                aria-hidden="true"
+                              />
+                              <span>Copied!</span>
+                            </>
+                          ) : (
+                            <>
+                              <UserCheck
+                                className="w-3.5 h-3.5 shrink-0"
+                                aria-hidden="true"
+                              />
+                              <span>Copy {activeMemberObj.name}&apos;s Link</span>
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Choose member link to copy"
+                          onClick={() => setIsCopyMenuOpen((prev) => !prev)}
+                          className="min-h-6 min-w-6 inline-flex items-center justify-center px-1.5 py-1.5 text-xs font-semibold rounded-r-xl transition shadow-2xs cursor-pointer bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200"
+                        >
+                          <ChevronDown
+                            className="w-3.5 h-3.5 shrink-0"
+                            aria-hidden="true"
+                          />
+                        </button>
+                      </div>
                     ) : (
-                      <>
-                        <Share2 className="w-3.5 h-3.5 shrink-0" />
-                        <span>Copy Link</span>
-                      </>
+                      members.length > 0 && (
+                        <button
+                          type="button"
+                          aria-label="Choose member link to copy"
+                          onClick={() => setIsCopyMenuOpen((prev) => !prev)}
+                          className="min-h-6 min-w-6 inline-flex items-center justify-center px-1.5 py-1.5 text-xs font-semibold rounded-r-xl transition shadow-2xs cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
+                        >
+                          <ChevronDown
+                            className="w-3.5 h-3.5 shrink-0"
+                            aria-hidden="true"
+                          />
+                        </button>
+                      )
                     )}
-                  </button>
+
+                    {/* Outside live region so screen readers reliably announce repeat copy outcomes */}
+                    <span role="status" className="sr-only">
+                      {copyStatusText}
+                    </span>
+
+                    {isCopyMenuOpen && (
+                      <div className="absolute right-0 top-full mt-1.5 w-56 bg-white border border-slate-200 rounded-xl shadow-lg p-1.5 z-30 space-y-1 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyGroupOrMemberLink(null)}
+                          className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-slate-100 transition cursor-pointer text-left"
+                        >
+                          <span className="truncate">General Group Link</span>
+                          <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                            /{activeGroup.slug}
+                          </span>
+                        </button>
+                        {members.length > 0 && (
+                          <div className="pt-1 border-t border-slate-100 space-y-0.5">
+                            <div className="px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                              Personalized Links
+                            </div>
+                            {members.map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() =>
+                                  handleCopyGroupOrMemberLink(m.name)
+                                }
+                                className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 transition cursor-pointer text-left"
+                              >
+                                <span className="truncate">{m.name}</span>
+                                <span className="text-[10px] font-mono text-slate-400 truncate max-w-[7rem]">
+                                  /{activeGroup.slug}/{m.name}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
 
                   {isSuperAdmin && !activeGroup.is_archived && (
                     <button
@@ -3633,7 +4287,7 @@ export function SettleUpDashboard({
                         </button>
                       );
                     })}
-                    {isSuperAdmin && activeMemberObj && (
+                    {activeMemberObj && (
                       <>
                         <span className="text-slate-300 text-xs">•</span>
                         <button
@@ -3654,7 +4308,7 @@ export function SettleUpDashboard({
                               window.history.replaceState(
                                 null,
                                 "",
-                                `/${slugOrId}`
+                                buildCleanGroupMemberUrl(slugOrId, null)
                               );
                             }
                           }}
@@ -4010,7 +4664,10 @@ export function SettleUpDashboard({
                       {activeGroupCurrencies.length > 1 && (
                         <select
                           value={normalizeCurrencyCode(currency)}
-                          onChange={(e) => setCurrency(e.target.value)}
+                          onChange={(e) => {
+                            setCurrency(e.target.value);
+                            setIsEditingAddFx(false);
+                          }}
                           aria-label="Transaction currency"
                           className="border border-slate-300 rounded-lg px-2 py-1.5 text-xs font-bold text-slate-800 bg-slate-50 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition cursor-pointer shrink-0"
                         >
@@ -4027,6 +4684,123 @@ export function SettleUpDashboard({
                     </div>
                   </div>
                 </div>
+
+                {/* Compact Inline FX Pill under Amount when selected currency !== group.default_currency */}
+                {normalizedAddCurrency !== activeDefaultCurrency && (
+                  <div className="px-3 py-2 rounded-xl bg-emerald-50/70 border border-emerald-200/80 text-xs space-y-2">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-1.5 text-emerald-950 min-w-0 flex-wrap">
+                        {(shouldAutoFetchAddFx || isRefreshingAddFx) &&
+                        !fxAddQuoteInfo ? (
+                          <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-800">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            <span>
+                              Fetching rate on {cleanAddDate}...
+                            </span>
+                          </span>
+                        ) : fxAddQuoteInfo ? (
+                          <span className="text-[11px] font-medium leading-snug">
+                            Rate on <strong>{cleanAddDate}</strong>:{" "}
+                            <strong>{fxAddQuoteInfo.quoteText}</strong>
+                            {convertedAddDefaultCents &&
+                              convertedAddDefaultCents > 0 && (
+                                <span className="text-emerald-800 font-semibold ml-1">
+                                  (≈{" "}
+                                  {formatCurrency(
+                                    convertedAddDefaultCents,
+                                    activeDefaultCurrency
+                                  )}{" "}
+                                  {activeDefaultCurrency})
+                                </span>
+                              )}
+                          </span>
+                        ) : (
+                          <span className="text-[11px] text-emerald-800">
+                            No locked rate yet for {normalizedAddCurrency} →{" "}
+                            {activeDefaultCurrency}.
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={handleRefreshAddFx}
+                          disabled={isRefreshingAddFx}
+                          title="Refresh rate for selected date"
+                          className="inline-flex items-center gap-1 text-emerald-700 hover:text-emerald-950 font-semibold cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${
+                              isRefreshingAddFx ? "animate-spin" : ""
+                            }`}
+                          />
+                          <span>Refresh</span>
+                        </button>
+                        <span className="text-emerald-300">•</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            isEditingAddFx
+                              ? setIsEditingAddFx(false)
+                              : handleOpenEditAddFx()
+                          }
+                          className="font-bold text-emerald-800 hover:text-emerald-950 underline cursor-pointer"
+                        >
+                          {isEditingAddFx ? "Close" : "Edit"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {isEditingAddFx && (
+                      <div className="pt-2 border-t border-emerald-200/80 grid grid-cols-1 sm:grid-cols-2 gap-2 items-end">
+                        <div>
+                          <label className="block text-[10px] font-bold uppercase tracking-wider text-emerald-800 mb-0.5">
+                            {fxAddQuoteInfo?.isInverse ?? true
+                              ? `1 ${activeDefaultCurrency} in ${normalizedAddCurrency}`
+                              : `1 ${normalizedAddCurrency} in ${activeDefaultCurrency}`}
+                          </label>
+                          <input
+                            type="number"
+                            step="any"
+                            min="0.000001"
+                            value={addFxRateInput}
+                            onChange={(e) => setAddFxRateInput(e.target.value)}
+                            placeholder="e.g. 34.50"
+                            className="w-full border border-emerald-300 rounded-lg px-2 py-1 text-xs font-semibold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold uppercase tracking-wider text-emerald-800 mb-0.5">
+                            Or Exact {activeDefaultCurrency} Billed
+                          </label>
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0.01"
+                              value={addFxBilledInput}
+                              onChange={(e) =>
+                                setAddFxBilledInput(e.target.value)
+                              }
+                              placeholder={
+                                totalCents > 0 ? "Exact card charge" : "Enter amount first"
+                              }
+                              className="flex-1 min-w-0 border border-emerald-300 rounded-lg px-2 py-1 text-xs font-semibold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            />
+                            <button
+                              type="button"
+                              onClick={handleApplyAddFxOverride}
+                              className="px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-700 hover:bg-emerald-800 text-white transition cursor-pointer shrink-0"
+                            >
+                              Apply
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Description (2 cols) + Date (1 col) */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -4572,6 +5346,32 @@ export function SettleUpDashboard({
                         exp.amountCents,
                         exp.currency
                       );
+                      const expIsoCode = normalizeCurrencyCode(exp.currency);
+                      const expLockedRateToDefault =
+                        exp.fxRates && expIsoCode !== activeDefaultCurrency
+                          ? getLockedRateToTarget(
+                              expIsoCode,
+                              activeDefaultCurrency,
+                              exp.fxRates
+                            )
+                          : null;
+                      const expFxQuote =
+                        expLockedRateToDefault && expLockedRateToDefault > 0
+                          ? formatFxDisplayQuote(
+                              expIsoCode,
+                              activeDefaultCurrency,
+                              expLockedRateToDefault
+                            )
+                          : null;
+                      const expConvertedDefaultStr =
+                        expLockedRateToDefault && expLockedRateToDefault > 0
+                          ? formatCurrency(
+                              Math.round(
+                                exp.amountCents * expLockedRateToDefault
+                              ),
+                              activeDefaultCurrency
+                            )
+                          : null;
 
                       return (
                         <div
@@ -4648,6 +5448,15 @@ export function SettleUpDashboard({
                               <span className="font-bold text-slate-900 text-sm">
                                 {expFormatted}
                               </span>
+                              {expConvertedDefaultStr && expFxQuote && (
+                                <span
+                                  className="block text-[11px] font-medium text-slate-500 mt-0.5"
+                                  title={`Locked rate on ${exp.date}: ${expFxQuote.quoteText}`}
+                                >
+                                  ≈ {expConvertedDefaultStr} @{" "}
+                                  {expFxQuote.shortRateText}
+                                </span>
+                              )}
                               <span
                                 className={`block text-[10px] uppercase font-bold tracking-wider mt-0.5 ${
                                   isPayment ? "text-blue-700" : "text-rose-600"
@@ -5017,6 +5826,7 @@ export function SettleUpDashboard({
           members={members}
           existingCategories={groupCategories}
           groupCurrencies={activeGroupCurrencies}
+          defaultCurrency={activeDefaultCurrency}
           onCurrencyAdded={(code) => {
             ensureCurrenciesInGroup([code]);
           }}

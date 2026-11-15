@@ -11,7 +11,9 @@ import {
   calculateBalancesByCurrency,
   calculateMemberBreakdown,
   calculateCategorySpend,
+  calculateUnifiedCategorySpend,
   calculateUnifiedReconciliation,
+  resolveMemberIdentityFromUrl,
   buildGroupCategories,
   EXPENSE_CATEGORIES,
   canDeleteMember,
@@ -19,6 +21,8 @@ import {
 import {
   formatCurrency,
   normalizeCurrencyCode,
+  getLockedRateToTarget,
+  formatFxDisplayQuote,
 } from './currencies.ts';
 import {
   normalizeParsedReceipt,
@@ -893,6 +897,228 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
       0
     );
     assert.strictEqual(sumUnifiedBalances, 0);
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 16: Transaction-Time Locked FX Rates Across Different Dates
+  // --------------------------------------------------------------------------
+  it('Edge Case 16: Two THB expenses on different dates with different locked fx_rates convert at their respective transaction-time rates with strict zero-sum cent conservation', () => {
+    // Fallback group rate deliberately differs (e.g. 1 USD = 35.00 THB) to prove locked per-transaction fxRates take precedence!
+    const fallbackGroupRates = { USD: 1, THB: 35 };
+
+    // Day 1 (2026-12-01): 1 USD = 34.00 THB -> 1 THB = 1/34 USD (0.0294117647)
+    // Murph pays ฿3,400.00 THB (340,000 cents) -> converts to exactly $100.00 USD (10,000 cents)
+    // Split 3 ways: 113,334c, 113,333c, 113,333c -> converted shares sum to 10,000c ($33.34, $33.33, $33.33)
+    const day1Splits = splitAmountEqually(340000, [murph.id, kev.id, fitz.id]);
+
+    // Day 5 (2026-12-05): 1 USD = 36.00 THB -> 1 THB = 1/36 USD (0.0277777778)
+    // Kev pays ฿3,600.00 THB (360,000 cents) -> converts to exactly $100.00 USD (10,000 cents)
+    //Wait: at end-of-trip 35.00 rate these two expenses would NOT be equal ($97.14 vs $102.86),
+    // but at their locked transaction-date rates (34.00 on Day 1, 36.00 on Day 5), BOTH equal $100.00 USD!
+    const day5Splits = splitAmountEqually(360000, [murph.id, kev.id, fitz.id]);
+
+    // Day 8 (2026-12-08): Odd-cent non-divisible rate: 1 USD = 34.50 THB -> 1 THB = 1/34.50 USD
+    // Fitz pays ฿1,000.00 THB (100,000 cents) -> 100,000 / 34.50 = 2898.5507c -> rounds to $28.99 USD (2,899 cents)
+    const day8Splits = splitAmountEqually(100000, [murph.id, kev.id, fitz.id]);
+
+    const datedThbExpenses: ExpenseRecord[] = [
+      {
+        id: 'exp-thb-day1',
+        paidByMemberId: murph.id,
+        amountCents: 340000,
+        currency: 'THB',
+        type: 'expense',
+        category: 'Lodging',
+        date: '2026-12-01',
+        fxRates: { THB: 1, USD: Number((1 / 34).toPrecision(10)) },
+        splits: day1Splits,
+      },
+      {
+        id: 'exp-thb-day5',
+        paidByMemberId: kev.id,
+        amountCents: 360000,
+        currency: 'THB',
+        type: 'expense',
+        category: 'Food & Drink',
+        date: '2026-12-05',
+        fxRates: { THB: 1, USD: Number((1 / 36).toPrecision(10)) },
+        splits: day5Splits,
+      },
+      {
+        id: 'exp-thb-day8',
+        paidByMemberId: fitz.id,
+        amountCents: 100000,
+        currency: 'THB',
+        type: 'expense',
+        category: 'Transport',
+        date: '2026-12-08',
+        fxRates: { THB: 1, USD: Number((1 / 34.5).toPrecision(10)) },
+        splits: day8Splits,
+      },
+    ];
+
+    const unified = calculateUnifiedReconciliation(
+      allMembers,
+      datedThbExpenses,
+      'USD',
+      fallbackGroupRates
+    );
+
+    const murphRow = unified.memberBreakdown.find((m) => m.memberId === murph.id)!;
+    const kevRow = unified.memberBreakdown.find((m) => m.memberId === kev.id)!;
+    const fitzRow = unified.memberBreakdown.find((m) => m.memberId === fitz.id)!;
+
+    // Verify each transaction converted at its own date's locked fx_rates (NOT the 35.00 fallback rate!)
+    assert.strictEqual(murphRow.paidCents, 10000); // ฿3,400 @ 34.00 = $100.00
+    assert.strictEqual(kevRow.paidCents, 10000);   // ฿3,600 @ 36.00 = $100.00
+    assert.strictEqual(fitzRow.paidCents, 2899);   // ฿1,000 @ 34.50 = $28.99
+
+    // Verify sum(convertedShares) === sum(convertedPaid) === 22,899 cents
+    const totalPaid = murphRow.paidCents + kevRow.paidCents + fitzRow.paidCents;
+    const totalShares = murphRow.shareCents + kevRow.shareCents + fitzRow.shareCents;
+    assert.strictEqual(totalPaid, 22899);
+    assert.strictEqual(totalShares, 22899);
+
+    // Verify strict zero-sum integer-cent net balances across all members
+    const netSum = unified.memberBreakdown.reduce(
+      (acc, r) => acc + r.netBalanceCents,
+      0
+    );
+    assert.strictEqual(netSum, 0);
+
+    // Verify each member's paidCents - shareCents === netBalanceCents
+    for (const row of unified.memberBreakdown) {
+      assert.strictEqual(row.paidCents - row.shareCents, row.netBalanceCents);
+    }
+
+    // Verify legacy unlocked expense (fxRates: null) falls back to fallbackGroupRates (35.00)
+    const mixedWithLegacy: ExpenseRecord[] = [
+      ...datedThbExpenses,
+      {
+        id: 'exp-thb-legacy-unlocked',
+        paidByMemberId: fitz.id,
+        amountCents: 350000, // ฿3,500 @ fallback 35.00 = $100.00 (10,000c)
+        currency: 'THB',
+        type: 'expense',
+        category: 'Activities',
+        date: '2026-11-28',
+        fxRates: null,
+        splits: splitAmountEqually(350000, [murph.id, kev.id, fitz.id]),
+      },
+    ];
+
+    const mixedUnified = calculateUnifiedReconciliation(
+      allMembers,
+      mixedWithLegacy,
+      'USD',
+      fallbackGroupRates
+    );
+    const fitzMixed = mixedUnified.memberBreakdown.find((m) => m.memberId === fitz.id)!;
+    assert.strictEqual(fitzMixed.paidCents, 2899 + 10000);
+    assert.strictEqual(
+      mixedUnified.memberBreakdown.reduce((acc, r) => acc + r.netBalanceCents, 0),
+      0
+    );
+
+    // Verify unified category spend also honors per-transaction locked fxRates
+    const unifiedCats = calculateUnifiedCategorySpend(
+      datedThbExpenses,
+      'USD',
+      fallbackGroupRates
+    );
+    assert.strictEqual(
+      unifiedCats.reduce((acc, c) => acc + c.amountCents, 0),
+      22899
+    );
+
+    // Verify FX display quote helper produces human-friendly "1 USD = 34.50 THB"
+    const lockedMult = getLockedRateToTarget(
+      'THB',
+      'USD',
+      datedThbExpenses[2].fxRates
+    )!;
+    const quote = formatFxDisplayQuote('THB', 'USD', lockedMult);
+    assert.strictEqual(quote.quoteText, '1 USD = 34.50 THB');
+    assert.strictEqual(quote.shortRateText, '34.50');
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 17: Personalized Member URL Identity Resolution & CSV FX_Rates Round-Trip
+  // --------------------------------------------------------------------------
+  it('Edge Case 17: resolveMemberIdentityFromUrl honors path > ?m= > bare ?<name> > storage priority and CSV preserves FX_Rates', () => {
+    const groupMembers = [
+      { id: 'id-murph', name: 'Murph', displayName: 'Murph' },
+      { id: 'id-kev', name: 'Kev', displayName: 'Kev' },
+      { id: 'id-mary-jo', name: 'Mary Jo', displayName: 'Mary Jo' },
+    ];
+
+    // 1. Path segment takes top priority (case-insensitive & URL-decoded)
+    const r1 = resolveMemberIdentityFromUrl(groupMembers, {
+      pathMember: 'mary%20jo',
+      search: '?m=Kev',
+      storedMember: 'id-murph',
+    });
+    assert.strictEqual(r1.member?.id, 'id-mary-jo');
+    assert.strictEqual(r1.source, 'path');
+
+    // 2. Legacy ?m=<name> takes second priority over bare query and storage
+    const r2 = resolveMemberIdentityFromUrl(groupMembers, {
+      pathMember: '',
+      search: '?m=kev',
+      storedMember: 'id-murph',
+    });
+    assert.strictEqual(r2.member?.id, 'id-kev');
+    assert.strictEqual(r2.source, 'query_m');
+
+    // 3. Bare valueless query string ?<name> matches member (even alongside ?shared_receipt=...)
+    const r3 = resolveMemberIdentityFromUrl(groupMembers, {
+      pathMember: undefined,
+      search: '?Kev',
+      storedMember: 'id-murph',
+    });
+    assert.strictEqual(r3.member?.id, 'id-kev');
+    assert.strictEqual(r3.source, 'query_bare');
+
+    // 4. Reserved query key ?shared_receipt=... does not false-match and falls back to localStorage
+    const r4 = resolveMemberIdentityFromUrl(groupMembers, {
+      pathMember: undefined,
+      search: '?shared_receipt=https%3A%2F%2Fexample.com%2Fr.jpg',
+      storedMember: 'id-murph',
+    });
+    assert.strictEqual(r4.member?.id, 'id-murph');
+    assert.strictEqual(r4.source, 'storage');
+
+    // 5. CSV export includes FX_Rates column when locked fxRates exist and round-trips cleanly via parseGroupCsv
+    const expensesWithFx: ExpenseRecord[] = [
+      {
+        id: 'csv-fx-1',
+        paidByMemberId: murph.id,
+        description: 'Bangkok TukTuk',
+        category: 'Transport',
+        amountCents: 69000,
+        currency: 'THB',
+        type: 'expense',
+        date: '2026-12-10',
+        fxRates: { THB: 1, USD: 0.0289855072 },
+        splits: [
+          { memberId: murph.id, splitAmountCents: 34500 },
+          { memberId: kev.id, splitAmountCents: 34500 },
+        ],
+      },
+    ];
+
+    const exportedCsv = generateGroupCsv(allMembers, expensesWithFx, '2026-12-10');
+    assert.ok(exportedCsv.split('\n')[0].endsWith(',FX_Rates'));
+
+    const reimported = parseGroupCsv(exportedCsv);
+    assert.strictEqual(reimported.transactions.length, 1);
+    assert.strictEqual(reimported.transactions[0].currency, 'THB');
+    assert.ok(reimported.transactions[0].fxRates);
+    assert.strictEqual(reimported.transactions[0].fxRates?.THB, 1);
+    assert.ok(
+      Math.abs((reimported.transactions[0].fxRates?.USD || 0) - 0.0289855072) <
+        1e-9
+    );
   });
 });
 
