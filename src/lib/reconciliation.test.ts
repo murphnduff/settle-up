@@ -1120,6 +1120,81 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
         1e-9
     );
   });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 18: 3,600 THB Split 6 Ways Settled in USD (Regression Guard Against 1:1 Fallback)
+  // --------------------------------------------------------------------------
+  it('Edge Case 18: 3,600 THB split 6 ways with locked fx_rates converts to $105.88 USD (never $3,600.00) and falls back to static approx rates when empty', () => {
+    const sixMembers: MemberRecord[] = [
+      { id: 'm1', name: 'Murph' },
+      { id: 'm2', name: 'Kev' },
+      { id: 'm3', name: 'Fitz' },
+      { id: 'm4', name: 'Dave' },
+      { id: 'm5', name: 'Sam' },
+      { id: 'm6', name: 'Alex' },
+    ];
+
+    const thbExpense: ExpenseRecord = {
+      id: 'exp-thb-3600',
+      paidByMemberId: 'm1',
+      amountCents: 360000, // ฿3,600.00 THB
+      currency: 'THB',
+      type: 'expense',
+      category: 'Dining out',
+      date: '2026-11-15',
+      fxRates: { THB: 1, USD: 0.02941176 },
+      splits: splitAmountEqually(
+        360000,
+        sixMembers.map((m) => m.id)
+      ),
+    };
+
+    const unified = calculateUnifiedReconciliation(
+      sixMembers,
+      [thbExpense],
+      'USD',
+      {}
+    );
+
+    const payerRow = unified.memberBreakdown.find((m) => m.memberId === 'm1')!;
+    // 360,000 * 0.02941176 = 10,588.2336 -> rounds to 10,588 cents ($105.88), NEVER 360,000 ($3,600.00)
+    assert.strictEqual(payerRow.paidCents, 10588);
+
+    const totalShares = unified.memberBreakdown.reduce(
+      (acc, r) => acc + r.shareCents,
+      0
+    );
+    assert.strictEqual(totalShares, 10588);
+
+    const netSum = unified.memberBreakdown.reduce(
+      (acc, r) => acc + r.netBalanceCents,
+      0
+    );
+    assert.strictEqual(netSum, 0);
+
+    const catSpend = calculateUnifiedCategorySpend([thbExpense], 'USD', {});
+    assert.strictEqual(catSpend[0].amountCents, 10588);
+
+    // Even when BOTH fxRates and group.exchange_rates are completely empty/null,
+    // static approximate fallback prevents ฿3,600.00 from rendering as $3,600.00
+    const unlockedFallback = calculateUnifiedReconciliation(
+      sixMembers,
+      [{ ...thbExpense, fxRates: null }],
+      'USD',
+      {}
+    );
+    const unlockedPayer = unlockedFallback.memberBreakdown.find(
+      (m) => m.memberId === 'm1'
+    )!;
+    assert.strictEqual(unlockedPayer.paidCents, 10588);
+    assert.strictEqual(
+      unlockedFallback.memberBreakdown.reduce(
+        (acc, r) => acc + r.netBalanceCents,
+        0
+      ),
+      0
+    );
+  });
 });
 
 

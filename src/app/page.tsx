@@ -41,6 +41,7 @@ import {
   normalizeFxRatesMap,
   getLockedRateToTarget,
   formatFxDisplayQuote,
+  getStaticApproxExchangeRate,
   type FxRatesMap,
 } from "@/lib/currencies";
 import MemberInviteModal, {
@@ -1116,6 +1117,10 @@ export function SettleUpDashboard({
   const numericExchangeRates = useMemo(() => {
     const target = normalizeCurrencyCode(unifiedTargetCurrency);
     const map: Record<string, number> = { [target]: 1 };
+    const saved = activeGroup?.exchange_rates || {};
+    const savedTargetPivot =
+      saved[target] && saved[target] > 0 ? saved[target] : 1;
+
     for (const code of activeGroupCurrencies) {
       if (code === target) {
         map[code] = 1;
@@ -1124,13 +1129,13 @@ export function SettleUpDashboard({
       const raw = parseFloat(exchangeRatesInput[code] || "");
       if (!isNaN(raw) && raw > 0) {
         map[code] = raw;
-      } else if (
-        activeGroup?.exchange_rates?.[code] &&
-        activeGroup.exchange_rates[code] > 0
-      ) {
-        map[code] = activeGroup.exchange_rates[code];
+      } else if (saved[code] && saved[code] > 0) {
+        map[code] = Number((saved[code] / savedTargetPivot).toPrecision(10));
       } else {
-        map[code] = 1;
+        const approx = getStaticApproxExchangeRate(target, code);
+        if (approx && approx > 0) {
+          map[code] = approx;
+        }
       }
     }
     return map;
@@ -1164,12 +1169,18 @@ export function SettleUpDashboard({
     [expenses, unifiedTargetCurrency, numericExchangeRates]
   );
 
-  // Legacy unlocked multi-currency expenses missing transaction-time fx_rates
-  const unlockedFxExpenses = useMemo(
-    () =>
-      hasMultipleCurrencies ? expenses.filter((e) => !e.fxRates) : [],
-    [hasMultipleCurrencies, expenses]
-  );
+  // Legacy unlocked multi-currency expenses missing transaction-time fx_rates (null or missing targetCurrency)
+  const normalizedUnifiedTarget = normalizeCurrencyCode(unifiedTargetCurrency);
+  const unlockedFxExpenses = useMemo(() => {
+    if (!hasMultipleCurrencies) return [];
+    return expenses.filter((e) => {
+      if (!e.fxRates) return true;
+      const expCode = normalizeCurrencyCode(e.currency);
+      if (expCode === normalizedUnifiedTarget) return false;
+      const rate = Number(e.fxRates[normalizedUnifiedTarget]);
+      return !Number.isFinite(rate) || rate <= 0;
+    });
+  }, [hasMultipleCurrencies, expenses, normalizedUnifiedTarget]);
 
   // 1-Click Backfill Historical FX Rates for Legacy Unlocked Multi-Currency Expenses (Super-Admin)
   const handleBackfillHistoricalRates = async () => {
@@ -1178,6 +1189,9 @@ export function SettleUpDashboard({
     }
     setIsBackfillingRates(true);
     try {
+      const targetCurrenciesForBackfill = Array.from(
+        new Set([...activeGroupCurrencies, normalizedUnifiedTarget])
+      );
       const uniquePairKeys = Array.from(
         new Set(
           unlockedFxExpenses.map((e) => {
@@ -1196,7 +1210,7 @@ export function SettleUpDashboard({
             const fetched = await fetchTransactionFxRates(
               iso,
               dt,
-              activeGroupCurrencies
+              targetCurrenciesForBackfill
             );
             ratesByPair.set(pairKey, fetched);
           } catch {
@@ -1206,29 +1220,60 @@ export function SettleUpDashboard({
       );
 
       let updatedCount = 0;
+      let lastDbError: string | null = null;
+      const updatedRatesById = new Map<string, FxRatesMap>();
+
       await Promise.all(
         unlockedFxExpenses.map(async (exp) => {
           const iso = normalizeCurrencyCode(exp.currency);
           const dt = (exp.date || getTodayLocalDate()).split("T")[0];
-          const rates = ratesByPair.get(`${iso}::${dt}`);
-          if (!rates) return;
+          const fetchedRates = ratesByPair.get(`${iso}::${dt}`);
+          if (!fetchedRates) return;
+
+          const mergedRates = normalizeFxRatesMap(
+            { ...fetchedRates, ...(exp.fxRates || {}), [iso]: 1 },
+            iso
+          );
+          if (!mergedRates) return;
+
           const { error } = await supabase
             .from("expenses")
-            .update({ fx_rates: rates })
+            .update({ fx_rates: mergedRates })
             .eq("id", exp.id);
-          if (!error) {
+          if (error) {
+            lastDbError = error.message;
+          } else {
             updatedCount++;
+            updatedRatesById.set(exp.id, mergedRates);
           }
         })
       );
 
+      if (updatedRatesById.size > 0) {
+        setExpenses((prev) =>
+          prev.map((e) =>
+            updatedRatesById.has(e.id)
+              ? { ...e, fxRates: updatedRatesById.get(e.id)! }
+              : e
+          )
+        );
+      }
+
       await refreshExpenses(activeGroup.id);
-      setNotification({
-        type: "success",
-        message: `Locked historical exchange rates for ${updatedCount} transaction${
-          updatedCount === 1 ? "" : "s"
-        }.`,
-      });
+
+      if (updatedCount === 0 && lastDbError) {
+        setNotification({
+          type: "error",
+          message: `Could not backfill historical rates: ${lastDbError}`,
+        });
+      } else {
+        setNotification({
+          type: "success",
+          message: `Locked historical exchange rates for ${updatedCount} transaction${
+            updatedCount === 1 ? "" : "s"
+          }.`,
+        });
+      }
     } catch (err: unknown) {
       setNotification({
         type: "error",

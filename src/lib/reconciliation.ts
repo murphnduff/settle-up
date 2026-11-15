@@ -10,6 +10,7 @@ import {
   normalizeCurrencyCode,
   getCurrencySymbol,
   normalizeFxRatesMap,
+  getStaticApproxExchangeRate,
   type FxRatesMap,
 } from './currencies.ts';
 
@@ -503,22 +504,33 @@ export function convertCentsToTargetCurrency(
 
   const rawFromRate = Number(exchangeRates[fromCode]);
   const rawTargetRate = Number(exchangeRates[targetCode]);
+  const hasFrom = Number.isFinite(rawFromRate) && rawFromRate > 0;
+  const hasTarget = Number.isFinite(rawTargetRate) && rawTargetRate > 0;
 
-  const fromRate =
-    Number.isFinite(rawFromRate) && rawFromRate > 0 ? rawFromRate : 1;
-  const targetRate =
-    Number.isFinite(rawTargetRate) && rawTargetRate > 0 ? rawTargetRate : 1;
+  if (hasFrom && hasTarget) {
+    return amountCents * (rawTargetRate / rawFromRate);
+  }
+  if (hasFrom) {
+    // exchangeRates is quoted relative to targetCode (1 targetCode = rawFromRate fromCode)
+    return amountCents / rawFromRate;
+  }
+  if (hasTarget) {
+    // exchangeRates is quoted relative to fromCode (1 fromCode = rawTargetRate targetCode)
+    return amountCents * rawTargetRate;
+  }
 
-  // When rates are quoted as `1 targetCurrency = X fromCurrency`, targetRate is 1 and fromRate is X -> amountCents / X
-  return amountCents * (targetRate / fromRate);
+  // Last-resort built-in static approximate fallback so foreign currencies never silently fall back to 1:1
+  const approx = getStaticApproxExchangeRate(fromCode, targetCode);
+  return amountCents * (approx ?? 1);
 }
 
 /**
  * Resolves the per-transaction FX multiplier (`1 unit of expCurrency = mult units of targetCurrency`).
  *
  * Priority:
- * 1. Transaction's own locked `fxRates` (`fxRates[targetCode] / fxRates[expCode]`), or bridged via a shared currency if `targetCode` was added later.
- * 2. Group-level `fallbackExchangeRates` (`1 targetCurrency = X expCurrency`) ONLY for legacy rows where `fxRates` is null/missing.
+ * 1. Transaction's own locked `fxRates` (`fxRates[targetCode] / fxRates[expCode]`), or bridged via a shared currency.
+ * 2. Group-level `fallbackExchangeRates` (`1 targetCurrency = X expCurrency` or inverse) for legacy unlocked rows.
+ * 3. Built-in static approximate fallback table (`STATIC_APPROX_RATES_PER_USD`) so `expCode !== targetCode` never silently defaults to `1`.
  */
 export function resolveExpenseFxMultiplier(
   expCurrency: string,
@@ -549,7 +561,10 @@ export function resolveExpenseFxMultiplier(
       if (pivotCode === expCode || !Number.isFinite(pivotVal) || pivotVal <= 0) {
         continue;
       }
-      if (pivotCode in fallbackExchangeRates) {
+      if (
+        pivotCode in fallbackExchangeRates &&
+        Number(fallbackExchangeRates[pivotCode]) > 0
+      ) {
         const expToPivot = pivotVal / baseSelf;
         const pivotToTarget = convertCentsToTargetCurrency(
           1,
@@ -560,6 +575,17 @@ export function resolveExpenseFxMultiplier(
         if (Number.isFinite(pivotToTarget) && pivotToTarget > 0) {
           return expToPivot * pivotToTarget;
         }
+      }
+    }
+
+    // Bridge via a shared pivot in built-in approximate rates (e.g. USD)
+    for (const [pivotCode, pivotVal] of Object.entries(normalizedFx)) {
+      if (pivotCode === expCode || !Number.isFinite(pivotVal) || pivotVal <= 0) {
+        continue;
+      }
+      const pivotToTarget = getStaticApproxExchangeRate(pivotCode, targetCode);
+      if (pivotToTarget && pivotToTarget > 0) {
+        return (pivotVal / baseSelf) * pivotToTarget;
       }
     }
   }

@@ -248,11 +248,19 @@ export default function EditExpenseModal({
     key: string;
     rates: FxRatesMap | null;
     isManual?: boolean;
-  } | null>(() => ({
-    key: initialFxKey,
-    rates: normalizeFxRatesMap(expense?.fxRates, initialCurrency),
-    isManual: false,
-  }));
+  } | null>(() => {
+    const initialNormalized = normalizeFxRatesMap(
+      expense?.fxRates,
+      initialCurrency
+    );
+    return initialNormalized
+      ? {
+          key: initialFxKey,
+          rates: initialNormalized,
+          isManual: false,
+        }
+      : null;
+  });
   const [autoFetchedFx, setAutoFetchedFx] = useState<{
     key: string;
     rates: FxRatesMap;
@@ -722,18 +730,22 @@ export default function EditExpenseModal({
 
       let finalFxRates = resolvedFxRates;
       if (
-        !finalFxRates &&
-        isMultiCurrencyContext &&
-        savedOrManualFx?.key !== currentFxKey
+        (!finalFxRates ||
+          (normalizedCurrency !== normalizedDefaultCurrency &&
+            !(finalFxRates[normalizedDefaultCurrency] > 0))) &&
+        isMultiCurrencyContext
       ) {
         try {
-          finalFxRates = await fetchTransactionFxRates(
+          const fetched = await fetchTransactionFxRates(
             normalizedCurrency,
             cleanDate,
             availableCurrencies
           );
+          finalFxRates = finalFxRates
+            ? { ...fetched, ...finalFxRates, [normalizedCurrency]: 1 }
+            : fetched;
         } catch {
-          finalFxRates = null;
+          // Keep existing finalFxRates if offline
         }
       }
 

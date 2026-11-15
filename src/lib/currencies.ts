@@ -177,6 +177,51 @@ export function buildGroupCurrencies(
 export type FxRatesMap = Record<string, number>;
 
 /**
+ * Built-in static approximate exchange rates relative to 1 USD (`1 USD = X currency`).
+ * Used strictly as a last-resort safety fallback when neither `expense.fx_rates` nor
+ * `group.exchange_rates` has a valid rate, so cross-currency amounts never silently
+ * fall back to `1:1` (e.g. `3,600 THB` rendering as `$3,600.00`).
+ */
+export const STATIC_APPROX_RATES_PER_USD: Record<string, number> = {
+  USD: 1,
+  THB: 34.0,
+  AUD: 1.52,
+  EUR: 0.92,
+  GBP: 0.79,
+  CAD: 1.38,
+  JPY: 154,
+  NZD: 1.67,
+  CHF: 0.88,
+  MXN: 20.1,
+};
+
+export const CORE_FX_CURRENCIES = ["USD", "AUD", "THB", "EUR", "GBP"] as const;
+
+/**
+ * Returns the static approximate conversion multiplier (`1 fromCurrency = X toCurrency`),
+ * or `null` if either currency is unknown to the built-in table.
+ */
+export function getStaticApproxExchangeRate(
+  fromCurrency: string,
+  toCurrency: string
+): number | null {
+  const fromCode = normalizeCurrencyCode(fromCurrency);
+  const toCode = normalizeCurrencyCode(toCurrency);
+  if (fromCode === toCode) return 1;
+  const fromPerUsd = STATIC_APPROX_RATES_PER_USD[fromCode];
+  const toPerUsd = STATIC_APPROX_RATES_PER_USD[toCode];
+  if (
+    Number.isFinite(fromPerUsd) &&
+    fromPerUsd > 0 &&
+    Number.isFinite(toPerUsd) &&
+    toPerUsd > 0
+  ) {
+    return Number((toPerUsd / fromPerUsd).toPrecision(10));
+  }
+  return null;
+}
+
+/**
  * Safely normalizes a raw JSONB `fx_rates` map into uppercase 3-letter ISO keys
  * with positive finite numeric values. Returns `null` if no valid rates exist.
  */
@@ -320,7 +365,7 @@ export async function fetchTransactionFxRates(
 
   const normalizedTargets = Array.from(
     new Set(
-      targetCurrencies
+      [...CORE_FX_CURRENCIES, ...targetCurrencies]
         .filter(Boolean)
         .map((c) => normalizeCurrencyCode(c))
         .filter((c) => c !== base)
