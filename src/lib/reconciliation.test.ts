@@ -796,8 +796,10 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     assert.strictEqual(formatCurrency(4000, 'AUD'), 'A$40.00');
     assert.strictEqual(formatCurrency(125000, 'THB'), '฿1,250.00');
     assert.strictEqual(formatCurrency(1500, 'EUR'), '€15.00');
+    assert.strictEqual(formatCurrency(150000, 'ISK'), 'kr1,500.00');
     assert.strictEqual(normalizeCurrencyCode('฿'), 'THB');
     assert.strictEqual(normalizeCurrencyCode('A$'), 'AUD');
+    assert.strictEqual(normalizeCurrencyCode('kr'), 'ISK');
 
     // 2. Multi-currency trip expenses across USD, AUD, and THB:
     // Exchange rates relative to USD: 1 USD = 1.50 AUD, 1 USD = 34.00 THB

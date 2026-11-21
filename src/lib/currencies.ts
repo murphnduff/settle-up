@@ -17,6 +17,7 @@ export const SUPPORTED_CURRENCIES: readonly CurrencyDefinition[] = [
   { code: "NZD", symbol: "NZ$", name: "New Zealand Dollar", label: "New Zealand Dollar", pillLabel: "NZ$ NZD" },
   { code: "CHF", symbol: "CHF", name: "Swiss Franc", label: "Swiss Franc", pillLabel: "CHF" },
   { code: "MXN", symbol: "Mex$", name: "Mexican Peso", label: "Mexican Peso", pillLabel: "Mex$ MXN" },
+  { code: "ISK", symbol: "kr", name: "Icelandic Króna", label: "Icelandic Króna", pillLabel: "kr ISK" },
 ] as const;
 
 const SYMBOL_TO_ISO_MAP: Record<string, string> = {
@@ -44,6 +45,9 @@ const SYMBOL_TO_ISO_MAP: Record<string, string> = {
   MEX$: "MXN",
   MX$: "MXN",
   MXN: "MXN",
+  KR: "ISK",
+  IKR: "ISK",
+  ISK: "ISK",
 };
 
 const CURRENCY_BY_CODE = new Map<string, CurrencyDefinition>(
@@ -193,6 +197,7 @@ export const STATIC_APPROX_RATES_PER_USD: Record<string, number> = {
   NZD: 1.67,
   CHF: 0.88,
   MXN: 20.1,
+  ISK: 138.0,
 };
 
 export const CORE_FX_CURRENCIES = ["USD", "AUD", "THB", "EUR", "GBP"] as const;

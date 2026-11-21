@@ -13,7 +13,7 @@ const RECEIPT_EXTRACTION_PROMPT = `Extract receipt details into strict JSON:
 {"description":"Merchant + brief item","amount":0.00,"currency":"USD","date":"YYYY-MM-DD","category":"Category"}
 Rules:
 - amount: final total charged (positive number).
-- currency: 3-letter ISO code (USD, EUR, AUD, THB, GBP, CAD, JPY, NZD, CHF, MXN).
+- currency: 3-letter ISO code (USD, EUR, AUD, THB, GBP, CAD, JPY, NZD, CHF, MXN, ISK).
 - date: YYYY-MM-DD (infer current year if omitted; "" if none).
 - category: one of [${EXPENSE_CATEGORIES.join(", ")}] or a 1-2 word custom category.`;
 
