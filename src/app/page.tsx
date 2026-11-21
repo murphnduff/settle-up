@@ -374,6 +374,8 @@ export function SettleUpDashboard({
   ]);
   const [newGroupDefaultCurrency, setNewGroupDefaultCurrency] =
     useState<string>("USD");
+  const [newGroupCustomIsoInput, setNewGroupCustomIsoInput] =
+    useState<string>("");
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [isCurrencyModalOpen, setIsCurrencyModalOpen] = useState(false);
@@ -2533,6 +2535,7 @@ export function SettleUpDashboard({
     setAddAdminAsMember(true);
     setNewGroupCurrencies(["USD"]);
     setNewGroupDefaultCurrency("USD");
+    setNewGroupCustomIsoInput("");
     setShowNewGroupCurrencies(false);
     setGroups((prev) => [normalizedNewGroup, ...prev]);
     handleSelectGroup(normalizedNewGroup);
@@ -3910,7 +3913,13 @@ export function SettleUpDashboard({
                   {showNewGroupCurrencies && (
                     <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
                       <div className="flex flex-wrap gap-1">
-                        {SUPPORTED_CURRENCIES.map((cur) => {
+                        {Array.from(
+                          new Set([
+                            ...SUPPORTED_CURRENCIES.map((c) => c.code),
+                            ...newGroupCurrencies,
+                          ])
+                        ).map((code) => {
+                          const cur = getCurrencyInfo(code);
                           const isSelected = newGroupCurrencies.includes(
                             cur.code
                           );
@@ -3945,6 +3954,54 @@ export function SettleUpDashboard({
                             </button>
                           );
                         })}
+                      </div>
+                      <div className="flex gap-1.5 pt-1 border-t border-slate-200/80">
+                        <input
+                          type="text"
+                          maxLength={3}
+                          placeholder="Custom ISO (e.g. SGD)"
+                          value={newGroupCustomIsoInput}
+                          onChange={(e) =>
+                            setNewGroupCustomIsoInput(
+                              e.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase()
+                            )
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              const clean = newGroupCustomIsoInput
+                                .trim()
+                                .toUpperCase();
+                              if (/^[A-Z]{3}$/.test(clean)) {
+                                setNewGroupCurrencies((prev) =>
+                                  prev.includes(clean) ? prev : [...prev, clean]
+                                );
+                                setNewGroupCustomIsoInput("");
+                              }
+                            }
+                          }}
+                          className="flex-1 min-w-0 border border-slate-300 rounded-md px-2 py-1 text-[11px] font-mono uppercase text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const clean = newGroupCustomIsoInput
+                              .trim()
+                              .toUpperCase();
+                            if (/^[A-Z]{3}$/.test(clean)) {
+                              setNewGroupCurrencies((prev) =>
+                                prev.includes(clean) ? prev : [...prev, clean]
+                              );
+                              setNewGroupCustomIsoInput("");
+                            }
+                          }}
+                          disabled={
+                            !/^[A-Z]{3}$/.test(newGroupCustomIsoInput.trim())
+                          }
+                          className="px-2 py-1 rounded-md text-[11px] font-semibold bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                        >
+                          + Add
+                        </button>
                       </div>
                       {newGroupCurrencies.length > 1 && (
                         <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80 text-[11px]">
@@ -5673,8 +5730,22 @@ export function SettleUpDashboard({
                     placeholder="e.g. SGD, HKD, ZAR"
                     value={customIsoInput}
                     onChange={(e) =>
-                      setCustomIsoInput(e.target.value.toUpperCase())
+                      setCustomIsoInput(
+                        e.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase()
+                      )
                     }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        const clean = customIsoInput.trim().toUpperCase();
+                        if (/^[A-Z]{3}$/.test(clean)) {
+                          setEditingGroupCurrencies((prev) =>
+                            prev.includes(clean) ? prev : [...prev, clean]
+                          );
+                          setCustomIsoInput("");
+                        }
+                      }
+                    }}
                     className="flex-1 border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-mono uppercase text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                   <button
@@ -5688,7 +5759,8 @@ export function SettleUpDashboard({
                         setCustomIsoInput("");
                       }
                     }}
-                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
+                    disabled={!/^[A-Z]{3}$/.test(customIsoInput.trim())}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     + Add ISO
                   </button>
