@@ -116,9 +116,9 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 
 ### 4.7 Per-Group Custom Currencies & Cross-Currency Unified Settlement (`src/lib/currencies.ts` & `src/lib/reconciliation.ts`)
 - **Supported Currency Catalog (`SUPPORTED_CURRENCIES`):**
-  - First-class support for `USD` (`$`), `EUR` (`€`), `AUD` (`A$`), `THB` (`฿`), `GBP` (`£`), `CAD` (`C$`), `JPY` (`¥`), `NZD` (`NZ$`), `CHF` (`CHF`), `MXN` (`Mex$`), plus any custom 3-letter ISO currency code via `formatCurrency(cents, currencyCode)`.
+  - First-class support for `USD` (`$`), `EUR` (`€`), `AUD` (`A$`), `THB` (`฿`), `GBP` (`£`), `CAD` (`C$`), `JPY` (`¥`), `NZD` (`NZ$`), `CHF` (`CHF`), `MXN` (`Mex$`), and `ISK` (`kr`), plus any custom 3-letter ISO currency code via `formatCurrency(cents, currencyCode)`.
 - **Per-Group Currency Management:**
-  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency selection in Create Group and a **Manage Group Currencies** modal (`Currencies` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
+  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency pill selection and custom 3-letter ISO code entry in both **Create Group** and the **Manage Group Currencies** modal (`Currencies` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
   - **Clean Single-Currency UX:** Groups with only 1 currency enabled hide currency switcher tabs and dropdowns so the UI stays minimal.
   - **Auto-Enable on AI Receipt Scan & CSV Import:** Scanning a receipt or importing a CSV with a new currency automatically appends that currency to `group.currencies`.
 - **Transaction-Time Locked FX Rates (`fetchTransactionFxRates` & `expenses.fx_rates`):**
