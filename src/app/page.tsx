@@ -62,6 +62,9 @@ import EditExpenseModal, {
   getTodayLocalDate,
   formatTransactionDate,
 } from "@/components/EditExpenseModal";
+import ConfirmPaymentModal, {
+  type PaymentDraft,
+} from "@/components/ConfirmPaymentModal";
 import {
   prepareFastAiReceiptPayload,
   compressReceiptForStorage,
@@ -123,6 +126,9 @@ function normalizeGroup(row: any): Group {
     row?.default_currency ||
       (Array.isArray(row?.currencies) ? row.currencies[0] : "USD")
   );
+  const settlementCurrency = row?.settlement_currency
+    ? normalizeCurrencyCode(row.settlement_currency)
+    : null;
   const currencies = buildGroupCurrencies(
     Array.isArray(row?.currencies) ? row.currencies : [defaultCurrency],
     defaultCurrency
@@ -148,6 +154,7 @@ function normalizeGroup(row: any): Group {
     is_archived: Boolean(row?.is_archived),
     currencies,
     default_currency: defaultCurrency,
+    settlement_currency: settlementCurrency,
     exchange_rates: exchangeRates,
     created_at: row.created_at,
   };
@@ -331,11 +338,12 @@ function legacyCopyText(text: string): boolean {
 
 function buildCleanGroupMemberUrl(
   slugOrId: string,
-  memberName?: string | null
+  memberName?: string | null,
+  view: "dashboard" | "settle" = "dashboard"
 ): string {
-  const basePath = memberName
-    ? `/${slugOrId}/${encodeURIComponent(memberName)}`
-    : `/${slugOrId}`;
+  const memberPart = memberName ? `/${encodeURIComponent(memberName)}` : "";
+  const settlePart = view === "settle" ? "/settle" : "";
+  const basePath = `/${slugOrId}${memberPart}${settlePart}`;
   if (typeof window === "undefined") return basePath;
   const currentParams = new URLSearchParams(window.location.search);
   const preserved = new URLSearchParams();
@@ -355,13 +363,30 @@ export function SettleUpDashboard({
   initialSlug,
   initialGroupId,
   initialMember,
+  initialView = "dashboard",
 }: {
   initialSlug?: string;
   initialGroupId?: string;
   initialMember?: string;
+  initialView?: "dashboard" | "settle";
 }) {
   const supabase = useMemo(() => createClient(), []);
   const routeTarget = initialSlug || initialGroupId || "";
+  const [currentView, setCurrentView] = useState<"dashboard" | "settle">(
+    initialView
+  );
+  const currentViewRef = useRef<"dashboard" | "settle">(initialView);
+  useEffect(() => {
+    currentViewRef.current = currentView;
+  }, [currentView]);
+  const [mobileTab, setMobileTab] = useState<"log" | "settle" | "activity">(
+    "log"
+  );
+  const [confirmPaymentDraft, setConfirmPaymentDraft] =
+    useState<PaymentDraft | null>(null);
+  const [showFxDetails, setShowFxDetails] = useState<boolean>(false);
+  const [isSettleIdentityPickerOpen, setIsSettleIdentityPickerOpen] =
+    useState<boolean>(false);
 
   const [user, setUser] = useState<User | null>(null);
   const [authInitialized, setAuthInitialized] = useState(false);
@@ -382,6 +407,8 @@ export function SettleUpDashboard({
   ]);
   const [newGroupDefaultCurrency, setNewGroupDefaultCurrency] =
     useState<string>("USD");
+  const [newGroupSettlementCurrency, setNewGroupSettlementCurrency] =
+    useState<string>("USD");
   const [newGroupCustomIsoInput, setNewGroupCustomIsoInput] =
     useState<string>("");
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
@@ -391,6 +418,8 @@ export function SettleUpDashboard({
     string[]
   >(["USD"]);
   const [editingDefaultCurrency, setEditingDefaultCurrency] =
+    useState<string>("USD");
+  const [editingSettlementCurrency, setEditingSettlementCurrency] =
     useState<string>("USD");
   const [customIsoInput, setCustomIsoInput] = useState<string>("");
   const [isSavingCurrencies, setIsSavingCurrencies] = useState<boolean>(false);
@@ -433,7 +462,7 @@ export function SettleUpDashboard({
   } | null>(null);
 
   // Unified Settlement (Cross-Currency Conversion) state
-  const [isUnifiedMode, setIsUnifiedMode] = useState<boolean>(false);
+  const [unifiedModePref, setUnifiedModePref] = useState<boolean | null>(null);
   const [unifiedTargetCurrency, setUnifiedTargetCurrency] =
     useState<string>("USD");
   const [exchangeRatesInput, setExchangeRatesInput] = useState<
@@ -480,7 +509,6 @@ export function SettleUpDashboard({
 
   // Add Transaction Receipt & AI Extraction state
   const addTransactionFormRef = useRef<HTMLFormElement>(null);
-  const [isFormHighlighted, setIsFormHighlighted] = useState<boolean>(false);
   const addReceiptCameraInputRef = useRef<HTMLInputElement>(null);
   const addReceiptInputRef = useRef<HTMLInputElement>(null);
   const addReceiptPdfInputRef = useRef<HTMLInputElement>(null);
@@ -556,61 +584,58 @@ export function SettleUpDashboard({
     return () => authListener.subscription.unsubscribe();
   }, [supabase]);
 
-  // Refresh members callback (includes household_name with safe fallback on legacy schemas)
-  const refreshMembers = useCallback(
-    async (groupId: string) => {
-      if (!groupId) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let data: any[] | null = null;
-      const res = await supabase
+  // Refresh members helper (includes household_name with safe fallback on legacy schemas)
+  const refreshMembers = async (groupId: string) => {
+    if (!groupId) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let data: any[] | null = null;
+    const res = await supabase
+      .from("group_members")
+      .select("id, group_id, display_name, household_name")
+      .eq("group_id", groupId);
+
+    if (
+      res.error &&
+      res.error.message?.toLowerCase().includes("household_name")
+    ) {
+      const fallback = await supabase
         .from("group_members")
-        .select("id, group_id, display_name, household_name")
+        .select("id, group_id, display_name")
         .eq("group_id", groupId);
-
-      if (
-        res.error &&
-        res.error.message?.toLowerCase().includes("household_name")
-      ) {
-        const fallback = await supabase
-          .from("group_members")
-          .select("id, group_id, display_name")
-          .eq("group_id", groupId);
-        if (fallback.error) {
-          console.error(
-            "Failed to fetch group_members:",
-            fallback.error.message
-          );
-          return;
-        }
-        data = fallback.data;
-      } else if (res.error) {
-        console.error("Failed to fetch group_members:", res.error.message);
+      if (fallback.error) {
+        console.error(
+          "Failed to fetch group_members:",
+          fallback.error.message
+        );
         return;
-      } else {
-        data = res.data;
       }
+      data = fallback.data;
+    } else if (res.error) {
+      console.error("Failed to fetch group_members:", res.error.message);
+      return;
+    } else {
+      data = res.data;
+    }
 
-      if (data) {
-        const list: GroupMember[] = data.map((m) => ({
-          id: m.id,
-          groupId: m.group_id,
-          name: m.display_name || "Member",
-          displayName: m.display_name || "Member",
-          householdName: m.household_name || null,
-          household_name: m.household_name || null,
-        }));
-        setMembers(list);
-        setSelectedMembers((prev) => {
-          if (prev.length === 0) {
-            return list.map((u) => u.id);
-          }
-          const valid = prev.filter((id) => list.some((u) => u.id === id));
-          return valid.length > 0 ? valid : list.map((u) => u.id);
-        });
-      }
-    },
-    [supabase]
-  );
+    if (data) {
+      const list: GroupMember[] = data.map((m) => ({
+        id: m.id,
+        groupId: m.group_id,
+        name: m.display_name || "Member",
+        displayName: m.display_name || "Member",
+        householdName: m.household_name || null,
+        household_name: m.household_name || null,
+      }));
+      setMembers(list);
+      setSelectedMembers((prev) => {
+        if (prev.length === 0) {
+          return list.map((u) => u.id);
+        }
+        const valid = prev.filter((id) => list.some((u) => u.id === id));
+        return valid.length > 0 ? valid : list.map((u) => u.id);
+      });
+    }
+  };
 
   // Refresh expenses callback (sorted by date descending, with created_at descending as tie-breaker)
   const refreshExpenses = useCallback(
@@ -760,7 +785,9 @@ export function SettleUpDashboard({
         segs.length >= 2 &&
         !["g", "join", "share-receipt"].includes(segs[0].toLowerCase())
       ) {
-        livePathMember = segs[1];
+        if (segs[1].toLowerCase() !== "settle") {
+          livePathMember = segs[1];
+        }
       } else if (
         segs.length === 1 &&
         initialMember &&
@@ -845,7 +872,11 @@ export function SettleUpDashboard({
               window.history.replaceState(
                 null,
                 "",
-                buildCleanGroupMemberUrl(slugOrId, matchedMember.name)
+                buildCleanGroupMemberUrl(
+                  slugOrId,
+                  matchedMember.name,
+                  currentViewRef.current
+                )
               );
             }
           }
@@ -893,14 +924,50 @@ export function SettleUpDashboard({
       window.history.replaceState(
         null,
         "",
-        buildCleanGroupMemberUrl(slugOrId, member.name)
+        buildCleanGroupMemberUrl(slugOrId, member.name, currentView)
       );
     }
   };
 
+  // Switch between main dashboard (/[slug]) and dedicated settle page (/[slug]/settle)
+  const handleNavigateView = (nextView: "dashboard" | "settle") => {
+    setCurrentView(nextView);
+    setIsSettleIdentityPickerOpen(false);
+    setIsManageMenuOpen(false);
+    setIsCopyMenuOpen(false);
+    if (typeof window !== "undefined" && activeGroup) {
+      const slugOrId =
+        activeGroup.slug ||
+        generateGroupSlug(activeGroup.name) ||
+        activeGroup.id;
+      const memberName =
+        members.find((m) => m.id === activeMemberId)?.name || null;
+      window.history.pushState(
+        null,
+        "",
+        buildCleanGroupMemberUrl(slugOrId, memberName, nextView)
+      );
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onPopState = () => {
+      const segs = window.location.pathname.split("/").filter(Boolean);
+      const isSettle =
+        (segs.length === 2 && segs[1].toLowerCase() === "settle") ||
+        (segs.length >= 3 && segs[2].toLowerCase() === "settle");
+      setCurrentView(isSettle ? "settle" : "dashboard");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
   // Switch active group and sync browser URL to /<slug>
   const handleSelectGroup = (group: Group) => {
     setActiveGroupId(group.id);
+    setCurrentView("dashboard");
     setIsMobileGroupsOpen(false);
     setIsManageMenuOpen(false);
     setIsCopyMenuOpen(false);
@@ -912,59 +979,67 @@ export function SettleUpDashboard({
   };
 
   // Report copy status for sighted and screen reader users (modern-web-guidance copy-button pattern)
-  const reportCopyOutcome = (
-    targetKind: "group" | "member",
-    ok: boolean,
-    labelMessage: string
-  ) => {
-    if (copyTimerRef.current) {
-      clearTimeout(copyTimerRef.current);
-    }
-    let announced = ok ? labelMessage : "Copy failed";
-    if (announced === lastCopyAnnouncementRef.current) {
-      announced += "\u00A0";
-    }
-    lastCopyAnnouncementRef.current = announced;
-    setCopyFeedbackTarget(ok ? targetKind : "failed");
-    setCopyStatusText(announced);
-    copyTimerRef.current = setTimeout(() => {
-      setCopyFeedbackTarget("idle");
-      setCopyStatusText("");
-      copyTimerRef.current = null;
-    }, 2200);
-  };
+  const reportCopyOutcome = useCallback(
+    (targetKind: "group" | "member", ok: boolean, labelMessage: string) => {
+      if (copyTimerRef.current) {
+        clearTimeout(copyTimerRef.current);
+      }
+      let announced = ok ? labelMessage : "Copy failed";
+      if (announced === lastCopyAnnouncementRef.current) {
+        announced += "\u00A0";
+      }
+      lastCopyAnnouncementRef.current = announced;
+      setCopyFeedbackTarget(ok ? targetKind : "failed");
+      setCopyStatusText(announced);
+      copyTimerRef.current = setTimeout(() => {
+        setCopyFeedbackTarget("idle");
+        setCopyStatusText("");
+        copyTimerRef.current = null;
+      }, 2200);
+    },
+    []
+  );
 
-  // Copy Group or Personalized Member Link (https://split.murphnduff.org/<slug> or /<slug>/<member>)
-  const handleCopyGroupOrMemberLink = async (memberName?: string | null) => {
-    if (!activeGroup) return;
-    const origin =
-      typeof window !== "undefined" && window.location?.origin
-        ? window.location.origin
-        : "https://split.murphnduff.org";
-    const slugOrId =
-      activeGroup.slug || generateGroupSlug(activeGroup.name) || activeGroup.id;
-    const cleanMember = (memberName || "").trim();
-    const url = cleanMember
-      ? `${origin}/${slugOrId}/${encodeURIComponent(cleanMember)}`
-      : `${origin}/${slugOrId}`;
-    setIsCopyMenuOpen(false);
+  // Copy Group, Personalized Member, or Settle Link
+  const handleCopyGroupOrMemberLink = useCallback(
+    async (
+      memberName?: string | null,
+      view: "dashboard" | "settle" = "dashboard"
+    ) => {
+      if (!activeGroup) return;
+      const origin =
+        typeof window !== "undefined" && window.location?.origin
+          ? window.location.origin
+          : "https://split.murphnduff.org";
+      const slugOrId =
+        activeGroup.slug ||
+        generateGroupSlug(activeGroup.name) ||
+        activeGroup.id;
+      const cleanMember = (memberName || "").trim();
+      const memberPart = cleanMember
+        ? `/${encodeURIComponent(cleanMember)}`
+        : "";
+      const settlePart = view === "settle" ? "/settle" : "";
+      const url = `${origin}/${slugOrId}${memberPart}${settlePart}`;
+      setIsCopyMenuOpen(false);
 
-    try {
-      await navigator.clipboard.writeText(url);
-      reportCopyOutcome(
-        cleanMember ? "member" : "group",
-        true,
-        cleanMember ? `Copied ${cleanMember}'s link` : "Copied group link"
-      );
-    } catch {
-      const ok = legacyCopyText(url);
-      reportCopyOutcome(
-        cleanMember ? "member" : "group",
-        ok,
-        cleanMember ? `Copied ${cleanMember}'s link` : "Copied group link"
-      );
-    }
-  };
+      const label =
+        view === "settle"
+          ? "Copied settle link"
+          : cleanMember
+            ? `Copied ${cleanMember}'s link`
+            : "Copied group link";
+
+      try {
+        await navigator.clipboard.writeText(url);
+        reportCopyOutcome(cleanMember ? "member" : "group", true, label);
+      } catch {
+        const ok = legacyCopyText(url);
+        reportCopyOutcome(cleanMember ? "member" : "group", ok, label);
+      }
+    },
+    [activeGroup, reportCopyOutcome]
+  );
 
   // Effective payer defaults to selected identity or first group member
   const effectivePayerId = useMemo(() => {
@@ -1004,12 +1079,16 @@ export function SettleUpDashboard({
     const defCur = normalizeCurrencyCode(
       activeGroup.default_currency || activeGroup.currencies?.[0] || "USD"
     );
+    const settleCur = normalizeCurrencyCode(
+      activeGroup.settlement_currency || defCur
+    );
     setCurrency(defCur);
-    setUnifiedTargetCurrency(defCur);
+    setUnifiedTargetCurrency(settleCur);
     setHistoryCurrencyFilter("all");
     setHistoryTypeFilter("all");
     setHistorySearchQuery("");
-    setIsUnifiedMode(false);
+    setUnifiedModePref(null);
+    setShowFxDetails(false);
     setIsManageMenuOpen(false);
     setIsCopyMenuOpen(false);
     setIsMobileGroupsOpen(false);
@@ -1017,7 +1096,7 @@ export function SettleUpDashboard({
     setIsEditingAddFx(false);
 
     const savedRates = activeGroup.exchange_rates || {};
-    const initialInputs: Record<string, string> = { [defCur]: "1" };
+    const initialInputs: Record<string, string> = { [settleCur]: "1" };
     for (const [k, v] of Object.entries(savedRates)) {
       if (typeof v === "number" && v > 0) {
         initialInputs[normalizeCurrencyCode(k)] = String(v);
@@ -1087,6 +1166,9 @@ export function SettleUpDashboard({
     () => activeGroupCurrencies.length > 1 || displayCurrencies.length > 1,
     [activeGroupCurrencies, displayCurrencies]
   );
+
+  // Default Unified Settlement ON whenever a group has 2+ currencies
+  const isUnifiedMode = hasMultipleCurrencies && (unifiedModePref ?? true);
 
   // Filtered transactions for the ledger (Currency + Type + Search Query)
   const filteredExpenses = useMemo(() => {
@@ -1539,25 +1621,41 @@ export function SettleUpDashboard({
     }
   };
 
-  // Save per-group currencies & default_currency (Super-Admin modal)
+  // Save per-group currencies, default_currency & settlement_currency (Super-Admin modal)
   const handleSaveGroupCurrencies = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isSuperAdmin || !activeGroup) return;
     setIsSavingCurrencies(true);
     try {
       const defCur = normalizeCurrencyCode(editingDefaultCurrency || "USD");
+      const settleCur = normalizeCurrencyCode(
+        editingSettlementCurrency || defCur
+      );
       const finalCurrencies = buildGroupCurrencies(
         editingGroupCurrencies,
-        defCur
+        defCur,
+        [settleCur]
       );
 
-      const { error } = await supabase
+      let { error } = await supabase
         .from("groups")
         .update({
           currencies: finalCurrencies,
           default_currency: defCur,
+          settlement_currency: settleCur,
         })
         .eq("id", activeGroup.id);
+
+      if (error && error.message?.toLowerCase().includes("settlement_currency")) {
+        const retry = await supabase
+          .from("groups")
+          .update({
+            currencies: finalCurrencies,
+            default_currency: defCur,
+          })
+          .eq("id", activeGroup.id);
+        error = retry.error;
+      }
 
       if (error) {
         throw new Error(error.message);
@@ -1570,15 +1668,17 @@ export function SettleUpDashboard({
                 ...g,
                 currencies: finalCurrencies,
                 default_currency: defCur,
+                settlement_currency: settleCur,
               }
             : g
         )
       );
       setCurrency(defCur);
+      setUnifiedTargetCurrency(settleCur);
       setIsCurrencyModalOpen(false);
       setNotification({
         type: "success",
-        message: `Updated currencies for "${activeGroup.name}" (${finalCurrencies.join(", ")} • Default: ${defCur}).`,
+        message: `Updated currencies for "${activeGroup.name}" (${finalCurrencies.join(", ")} • Expense: ${defCur}, Settle: ${settleCur}).`,
       });
     } catch (err: unknown) {
       alert(
@@ -1875,38 +1975,6 @@ export function SettleUpDashboard({
       cancelled = true;
     };
   }, [activeGroup, routeTarget, attachAndScanSharedReceipt]);
-
-  // 1-Click "Settle" button handler in the Settlement Plan
-  const handleQuickSettle = (
-    instruction: {
-      fromMemberId: string;
-      toMemberId: string;
-      amountCents: number;
-    },
-    targetCurrencyCode: string
-  ) => {
-    if (activeGroup?.is_archived) return;
-    const resolvedCurrency = normalizeCurrencyCode(targetCurrencyCode);
-
-    setType("payment");
-    setSplitMode("equal");
-    setPayerId(instruction.fromMemberId);
-    setSelectedMembers([instruction.toMemberId]);
-    setAmount((instruction.amountCents / 100).toFixed(2));
-    setCurrency(resolvedCurrency);
-    setDescription("Settlement Payment");
-    handleRemoveAddReceipt();
-
-    setIsFormHighlighted(true);
-    setTimeout(() => {
-      setIsFormHighlighted(false);
-    }, 2200);
-
-    addTransactionFormRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "center",
-    });
-  };
 
   const handleRemoveAddReceipt = () => {
     setReceiptUrl(null);
@@ -2585,9 +2653,13 @@ export function SettleUpDashboard({
     const trimmedName = newGroupName.trim();
     const generatedSlug = generateGroupSlug(trimmedName);
     const defaultCur = normalizeCurrencyCode(newGroupDefaultCurrency || "USD");
+    const settleCur = normalizeCurrencyCode(
+      newGroupSettlementCurrency || defaultCur
+    );
     const groupCurrencies = buildGroupCurrencies(
       newGroupCurrencies,
-      defaultCur
+      defaultCur,
+      [settleCur]
     );
 
     // 1. Try inserting with slug and currencies columns included
@@ -2599,9 +2671,29 @@ export function SettleUpDashboard({
         created_by: user.id,
         currencies: groupCurrencies,
         default_currency: defaultCur,
+        settlement_currency: settleCur,
       })
       .select("*")
       .single();
+
+    if (
+      groupError &&
+      groupError.message?.toLowerCase().includes("settlement_currency")
+    ) {
+      const retryNoSettle = await supabase
+        .from("groups")
+        .insert({
+          name: trimmedName,
+          slug: generatedSlug,
+          created_by: user.id,
+          currencies: groupCurrencies,
+          default_currency: defaultCur,
+        })
+        .select("*")
+        .single();
+      newGroupRow = retryNoSettle.data;
+      groupError = retryNoSettle.error;
+    }
 
     // Fallback if slug or currency columns have not yet been added in Supabase SQL
     if (groupError) {
@@ -2629,6 +2721,7 @@ export function SettleUpDashboard({
       slug: newGroupRow.slug || generatedSlug,
       currencies: newGroupRow.currencies || groupCurrencies,
       default_currency: newGroupRow.default_currency || defaultCur,
+      settlement_currency: newGroupRow.settlement_currency || settleCur,
     });
 
     if (addAdminAsMember) {
@@ -2642,6 +2735,7 @@ export function SettleUpDashboard({
     setAddAdminAsMember(true);
     setNewGroupCurrencies(["USD"]);
     setNewGroupDefaultCurrency("USD");
+    setNewGroupSettlementCurrency("USD");
     setNewGroupCustomIsoInput("");
     setShowNewGroupCurrencies(false);
     setGroups((prev) => [normalizedNewGroup, ...prev]);
@@ -3003,85 +3097,86 @@ export function SettleUpDashboard({
         </button>
       </div>
 
-      {/* Shared Multi-Currency Unified Toggle (Visible on Settle Up, Members & Categories tabs when 2+ currencies exist) */}
+      {/* Simplified Multi-Currency Settlement Controls (Defaults ON when 2+ currencies exist) */}
       {hasMultipleCurrencies && (
-        <div className="space-y-2.5">
-          <button
-            type="button"
-            onClick={() => setIsUnifiedMode((prev) => !prev)}
-            className={`w-full py-2 px-3 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1.5 cursor-pointer ${
-              isUnifiedMode
-                ? "bg-emerald-600 text-white border-emerald-600 shadow-2xs"
-                : "bg-emerald-50/70 hover:bg-emerald-100/80 text-emerald-900 border-emerald-200"
-            }`}
-          >
-            <Globe className="w-3.5 h-3.5 shrink-0" />
-            <span>
-              {isUnifiedMode
-                ? `🌐 Unified Settlement Active (${unifiedTargetCurrency})`
-                : "🌐 Unified Settlement (Convert All)"}
-            </span>
-          </button>
+        <div className="space-y-2">
+          {isUnifiedMode ? (
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <label className="font-semibold text-slate-700">
+                    Settle in:
+                  </label>
+                  <select
+                    value={normalizeCurrencyCode(unifiedTargetCurrency)}
+                    onChange={(e) =>
+                      handleSelectUnifiedTargetCurrency(e.target.value)
+                    }
+                    className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+                  >
+                    {activeGroupCurrencies.map((code) => (
+                      <option key={code} value={code}>
+                        {code} ({getCurrencySymbol(code)})
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-          {isUnifiedMode && (
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5 text-xs">
-              <div className="flex items-center justify-between gap-2">
-                <label className="font-semibold text-slate-700">
-                  Settle All In:
-                </label>
-                <select
-                  value={normalizeCurrencyCode(unifiedTargetCurrency)}
-                  onChange={(e) =>
-                    handleSelectUnifiedTargetCurrency(e.target.value)
-                  }
-                  className="border border-slate-300 rounded-lg px-2 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+                <button
+                  type="button"
+                  onClick={() => setUnifiedModePref(false)}
+                  className="text-[11px] font-medium text-slate-500 hover:text-slate-800 underline cursor-pointer"
                 >
-                  {activeGroupCurrencies.map((code) => (
-                    <option key={code} value={code}>
-                      {code} ({getCurrencySymbol(code)})
-                    </option>
-                  ))}
-                </select>
+                  Split by currency instead
+                </button>
               </div>
 
-              <div className="px-2.5 py-2 rounded-lg bg-emerald-50/80 border border-emerald-200/80 text-[11px] text-emerald-950 space-y-1.5">
-                <p className="leading-snug">
-                  <strong>Transaction-Time FX Active:</strong> Expenses with
-                  locked rates convert at their transaction-date rate.{" "}
-                  {unlockedFxExpenses.length > 0
-                    ? `${unlockedFxExpenses.length} legacy unlocked transaction${
-                        unlockedFxExpenses.length === 1 ? " uses" : "s use"
-                      } the fallback rates below.`
-                    : "All multi-currency transactions in this group have locked historical rates."}
-                </p>
-                {isSuperAdmin &&
-                  !activeGroup?.is_archived &&
-                  unlockedFxExpenses.length > 0 && (
-                    <button
-                      type="button"
-                      disabled={isBackfillingRates}
-                      onClick={handleBackfillHistoricalRates}
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-bold bg-emerald-700 hover:bg-emerald-800 text-white transition cursor-pointer disabled:opacity-50"
-                    >
-                      <RefreshCw
-                        className={`w-3 h-3 ${
-                          isBackfillingRates ? "animate-spin" : ""
-                        }`}
-                      />
-                      <span>
-                        {isBackfillingRates
-                          ? "Backfilling Historical Rates..."
-                          : `Backfill Historical Rates (${unlockedFxExpenses.length})`}
-                      </span>
-                    </button>
-                  )}
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowFxDetails((prev) => !prev)}
+                className="text-[11px] font-semibold text-slate-500 hover:text-slate-800 flex items-center gap-1 cursor-pointer pt-0.5"
+              >
+                <span>Exchange rate details</span>
+                <span>{showFxDetails ? "▴" : "▾"}</span>
+              </button>
 
-              {analyticsTab === "settle" && (
-                <div className="space-y-2 pt-2 border-t border-slate-200/80">
+              {showFxDetails && (
+                <div className="space-y-2.5 pt-2 border-t border-slate-200/80">
+                  <div className="px-2.5 py-2 rounded-lg bg-emerald-50/80 border border-emerald-200/80 text-[11px] text-emerald-950 space-y-1.5">
+                    <p className="leading-snug">
+                      Each expense uses its transaction-date exchange rate.{" "}
+                      {unlockedFxExpenses.length > 0
+                        ? `${unlockedFxExpenses.length} older transaction${
+                            unlockedFxExpenses.length === 1 ? " uses" : "s use"
+                          } the fallback rates below.`
+                        : "All multi-currency transactions have locked date rates."}
+                    </p>
+                    {isSuperAdmin &&
+                      !activeGroup?.is_archived &&
+                      unlockedFxExpenses.length > 0 && (
+                        <button
+                          type="button"
+                          disabled={isBackfillingRates}
+                          onClick={handleBackfillHistoricalRates}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-bold bg-emerald-700 hover:bg-emerald-800 text-white transition cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${
+                              isBackfillingRates ? "animate-spin" : ""
+                            }`}
+                          />
+                          <span>
+                            {isBackfillingRates
+                              ? "Updating..."
+                              : `Backfill Historical Rates (${unlockedFxExpenses.length})`}
+                          </span>
+                        </button>
+                      )}
+                  </div>
+
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-semibold text-slate-600">
-                      Fallback Group Rates (for unlocked rows)
+                      Fallback Rates
                     </span>
                     <button
                       type="button"
@@ -3106,37 +3201,48 @@ export function SettleUpDashboard({
                         (code) =>
                           code !== normalizeCurrencyCode(unifiedTargetCurrency)
                       )
-                      .map((otherCode) => (
-                        <div
-                          key={otherCode}
-                          className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
-                        >
-                          <span className="text-[11px] font-medium text-slate-600 shrink-0">
-                            1 {unifiedTargetCurrency} =
-                          </span>
-                          <div className="flex items-center gap-1.5">
-                            <input
-                              type="number"
-                              step="any"
-                              min="0.000001"
-                              value={
-                                exchangeRatesInput[otherCode] ??
-                                String(numericExchangeRates[otherCode] ?? 1)
-                              }
-                              onChange={(e) =>
-                                setExchangeRatesInput((prev) => ({
-                                  ...prev,
-                                  [otherCode]: e.target.value,
-                                }))
-                              }
-                              className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                            />
-                            <span className="text-[11px] font-bold text-slate-700 w-8">
-                              {otherCode}
+                      .map((otherCode) => {
+                        const rawRate = numericExchangeRates[otherCode] ?? 1;
+                        const humanQuote = formatFxDisplayQuote(
+                          otherCode,
+                          unifiedTargetCurrency,
+                          1 / rawRate
+                        );
+                        return (
+                          <div
+                            key={otherCode}
+                            className="flex items-center justify-between gap-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200"
+                          >
+                            <span className="text-[11px] font-medium text-slate-600 shrink-0">
+                              {humanQuote.quoteText}
                             </span>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[10px] text-slate-400">
+                                1 {unifiedTargetCurrency} =
+                              </span>
+                              <input
+                                type="number"
+                                step="any"
+                                min="0.000001"
+                                value={
+                                  exchangeRatesInput[otherCode] ??
+                                  String(numericExchangeRates[otherCode] ?? 1)
+                                }
+                                onChange={(e) =>
+                                  setExchangeRatesInput((prev) => ({
+                                    ...prev,
+                                    [otherCode]: e.target.value,
+                                  }))
+                                }
+                                className="w-20 border border-slate-300 rounded-md px-1.5 py-0.5 text-right text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                              />
+                              <span className="text-[11px] font-bold text-slate-700 w-8">
+                                {otherCode}
+                              </span>
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                   </div>
 
                   {!activeGroup?.is_archived && (
@@ -3153,6 +3259,19 @@ export function SettleUpDashboard({
                   )}
                 </div>
               )}
+            </div>
+          ) : (
+            <div className="flex items-center justify-between gap-2 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-[11px]">
+              <span className="text-slate-600 font-medium">
+                Showing separate currency ledgers
+              </span>
+              <button
+                type="button"
+                onClick={() => setUnifiedModePref(true)}
+                className="font-bold text-emerald-700 hover:text-emerald-900 underline cursor-pointer shrink-0"
+              >
+                Combine into {unifiedTargetCurrency}
+              </button>
             </div>
           )}
         </div>
@@ -3267,20 +3386,21 @@ export function SettleUpDashboard({
                             <button
                               type="button"
                               onClick={() =>
-                                handleQuickSettle(
-                                  {
-                                    fromMemberId: s.fromPrimaryMemberId,
-                                    toMemberId: s.toPrimaryMemberId,
-                                    amountCents: s.amountCents,
-                                  },
-                                  unifiedTargetCurrency
-                                )
+                                setConfirmPaymentDraft({
+                                  fromMemberId: s.fromPrimaryMemberId,
+                                  toMemberId: s.toPrimaryMemberId,
+                                  fromLabel: s.fromHouseholdName,
+                                  toLabel: s.toHouseholdName,
+                                  isHousehold: true,
+                                  amountCents: s.amountCents,
+                                  currency: unifiedTargetCurrency,
+                                })
                               }
                               title={`Record payment from ${s.fromHouseholdName} to ${s.toHouseholdName}`}
                               className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
                             >
                               <CheckCircle2 className="w-3 h-3" />
-                              <span>Settle</span>
+                              <span>Mark Paid</span>
                             </button>
                           )}
                         </div>
@@ -3356,13 +3476,21 @@ export function SettleUpDashboard({
                           <button
                             type="button"
                             onClick={() =>
-                              handleQuickSettle(s, unifiedTargetCurrency)
+                              setConfirmPaymentDraft({
+                                fromMemberId: s.fromMemberId,
+                                toMemberId: s.toMemberId,
+                                fromLabel: s.fromUser,
+                                toLabel: s.toUser,
+                                isHousehold: false,
+                                amountCents: s.amountCents,
+                                currency: unifiedTargetCurrency,
+                              })
                             }
-                            title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
+                            title={`Record payment from ${s.fromUser} to ${s.toUser}`}
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
                           >
                             <CheckCircle2 className="w-3 h-3" />
-                            <span>Settle</span>
+                            <span>Mark Paid</span>
                           </button>
                         )}
                       </div>
@@ -3438,14 +3566,15 @@ export function SettleUpDashboard({
                             <button
                               type="button"
                               onClick={() =>
-                                handleQuickSettle(
-                                  {
-                                    fromMemberId: s.fromPrimaryMemberId,
-                                    toMemberId: s.toPrimaryMemberId,
-                                    amountCents: s.amountCents,
-                                  },
-                                  code
-                                )
+                                setConfirmPaymentDraft({
+                                  fromMemberId: s.fromPrimaryMemberId,
+                                  toMemberId: s.toPrimaryMemberId,
+                                  fromLabel: s.fromHouseholdName,
+                                  toLabel: s.toHouseholdName,
+                                  isHousehold: true,
+                                  amountCents: s.amountCents,
+                                  currency: code,
+                                })
                               }
                               title={`Record payment from ${s.fromHouseholdName} to ${s.toHouseholdName}`}
                               className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold text-white shadow-2xs transition cursor-pointer shrink-0 ${
@@ -3455,7 +3584,7 @@ export function SettleUpDashboard({
                               }`}
                             >
                               <CheckCircle2 className="w-3 h-3" />
-                              <span>Settle</span>
+                              <span>Mark Paid</span>
                             </button>
                           )}
                         </div>
@@ -3530,8 +3659,18 @@ export function SettleUpDashboard({
                           {!activeGroup?.is_archived && (
                             <button
                               type="button"
-                              onClick={() => handleQuickSettle(s, code)}
-                              title={`Pre-fill settlement payment from ${s.fromUser} to ${s.toUser}`}
+                              onClick={() =>
+                                setConfirmPaymentDraft({
+                                  fromMemberId: s.fromMemberId,
+                                  toMemberId: s.toMemberId,
+                                  fromLabel: s.fromUser,
+                                  toLabel: s.toUser,
+                                  isHousehold: false,
+                                  amountCents: s.amountCents,
+                                  currency: code,
+                                })
+                              }
+                              title={`Record payment from ${s.fromUser} to ${s.toUser}`}
                               className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold text-white shadow-2xs transition cursor-pointer shrink-0 ${
                                 isSecondary
                                   ? "bg-indigo-600 hover:bg-indigo-700"
@@ -3539,7 +3678,7 @@ export function SettleUpDashboard({
                               }`}
                             >
                               <CheckCircle2 className="w-3 h-3" />
-                              <span>Settle</span>
+                              <span>Mark Paid</span>
                             </button>
                           )}
                         </div>
@@ -4051,6 +4190,771 @@ export function SettleUpDashboard({
 
   const showGroupsSidebar = isSuperAdmin || groups.length > 1 || !activeGroup;
 
+  const renderDedicatedSettleView = () => {
+    if (!activeGroup) return null;
+    const settleCurrency = isUnifiedMode
+      ? normalizeCurrencyCode(unifiedTargetCurrency)
+      : activeDefaultCurrency;
+
+    // Identify viewer's householdKey or individual key for the Hero Banner
+    const viewerHousehold = activeMemberObj
+      ? unifiedHouseholdResult.householdBreakdown.find((hh) =>
+          hh.members.some((m) => m.memberId === activeMemberObj.id)
+        )
+      : undefined;
+
+    type SettleTransferItem = {
+      key: string;
+      fromLabel: string;
+      toLabel: string;
+      fromMemberId: string;
+      toMemberId: string;
+      amountCents: number;
+      currency: string;
+      isHousehold: boolean;
+      involvesViewer: boolean;
+      viewerOwes: boolean;
+    };
+
+    const allTransfers: SettleTransferItem[] = [];
+    if (isUnifiedMode || !hasMultipleCurrencies) {
+      const targetCode = isUnifiedMode
+        ? normalizeCurrencyCode(unifiedTargetCurrency)
+        : activeDefaultCurrency;
+      if (isHouseholdView) {
+        const list = isUnifiedMode
+          ? unifiedHouseholdResult.settlements
+          : householdByCurrency[targetCode]?.settlements || [];
+        list.forEach((s, idx) => {
+          const involvesViewer = Boolean(
+            viewerHousehold &&
+              (s.fromHouseholdKey === viewerHousehold.householdKey ||
+                s.toHouseholdKey === viewerHousehold.householdKey)
+          );
+          const viewerOwes = Boolean(
+            viewerHousehold &&
+              s.fromHouseholdKey === viewerHousehold.householdKey
+          );
+          allTransfers.push({
+            key: `hh-${idx}`,
+            fromLabel: s.fromHouseholdName,
+            toLabel: s.toHouseholdName,
+            fromMemberId: s.fromPrimaryMemberId,
+            toMemberId: s.toPrimaryMemberId,
+            amountCents: s.amountCents,
+            currency: targetCode,
+            isHousehold: true,
+            involvesViewer,
+            viewerOwes,
+          });
+        });
+      } else {
+        const list = isUnifiedMode
+          ? unifiedResult.settlements
+          : settlementsByCurrency[targetCode] || [];
+        list.forEach((s, idx) => {
+          const involvesViewer = Boolean(
+            activeMemberObj &&
+              (s.fromMemberId === activeMemberObj.id ||
+                s.toMemberId === activeMemberObj.id)
+          );
+          const viewerOwes = Boolean(
+            activeMemberObj && s.fromMemberId === activeMemberObj.id
+          );
+          allTransfers.push({
+            key: `ind-${idx}`,
+            fromLabel: s.fromUser,
+            toLabel: s.toUser,
+            fromMemberId: s.fromMemberId,
+            toMemberId: s.toMemberId,
+            amountCents: s.amountCents,
+            currency: targetCode,
+            isHousehold: false,
+            involvesViewer,
+            viewerOwes,
+          });
+        });
+      }
+    } else {
+      displayCurrencies.forEach((code) => {
+        if (isHouseholdView) {
+          (householdByCurrency[code]?.settlements || []).forEach((s, idx) => {
+            const involvesViewer = Boolean(
+              viewerHousehold &&
+                (s.fromHouseholdKey === viewerHousehold.householdKey ||
+                  s.toHouseholdKey === viewerHousehold.householdKey)
+            );
+            const viewerOwes = Boolean(
+              viewerHousehold &&
+                s.fromHouseholdKey === viewerHousehold.householdKey
+            );
+            allTransfers.push({
+              key: `${code}-hh-${idx}`,
+              fromLabel: s.fromHouseholdName,
+              toLabel: s.toHouseholdName,
+              fromMemberId: s.fromPrimaryMemberId,
+              toMemberId: s.toPrimaryMemberId,
+              amountCents: s.amountCents,
+              currency: code,
+              isHousehold: true,
+              involvesViewer,
+              viewerOwes,
+            });
+          });
+        } else {
+          (settlementsByCurrency[code] || []).forEach((s, idx) => {
+            const involvesViewer = Boolean(
+              activeMemberObj &&
+                (s.fromMemberId === activeMemberObj.id ||
+                  s.toMemberId === activeMemberObj.id)
+            );
+            const viewerOwes = Boolean(
+              activeMemberObj && s.fromMemberId === activeMemberObj.id
+            );
+            allTransfers.push({
+              key: `${code}-ind-${idx}`,
+              fromLabel: s.fromUser,
+              toLabel: s.toUser,
+              fromMemberId: s.fromMemberId,
+              toMemberId: s.toMemberId,
+              amountCents: s.amountCents,
+              currency: code,
+              isHousehold: false,
+              involvesViewer,
+              viewerOwes,
+            });
+          });
+        }
+      });
+    }
+
+    const viewerTransfers = activeMemberObj
+      ? allTransfers.filter((t) => t.involvesViewer)
+      : [];
+    const otherTransfers = activeMemberObj
+      ? allTransfers.filter((t) => !t.involvesViewer)
+      : allTransfers;
+
+    const viewerNameLabel =
+      isHouseholdView && viewerHousehold?.isHousehold
+        ? viewerHousehold.householdName
+        : activeMemberObj?.name || "";
+
+    const renderBalanceRows = (
+      curCode: string,
+      title: string | null,
+      householdRows: HouseholdSummaryRecord[] | null,
+      individualRows: MemberSummaryRecord[]
+    ) => {
+      const renderSignedNet = (netCents: number) => {
+        const absFormatted = formatCurrency(Math.abs(netCents), curCode);
+        return netCents > 0
+          ? `+${absFormatted}`
+          : netCents < 0
+            ? `-${absFormatted}`
+            : formatCurrency(0, curCode);
+      };
+      const netColor = (netCents: number) =>
+        netCents > 0
+          ? "text-emerald-600 font-bold"
+          : netCents < 0
+            ? "text-rose-600 font-bold"
+            : "text-slate-400 font-medium";
+
+      return (
+        <div key={curCode} className="space-y-2">
+          {title && (
+            <div className="text-xs font-bold text-slate-700">{title}</div>
+          )}
+          <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden bg-white">
+            {householdRows
+              ? householdRows.map((hh) => {
+                  const isExpanded = Boolean(
+                    expandedHouseholds[hh.householdKey]
+                  );
+                  return (
+                    <div key={hh.householdKey}>
+                      <div
+                        onClick={
+                          hh.isHousehold
+                            ? () =>
+                                setExpandedHouseholds((prev) => ({
+                                  ...prev,
+                                  [hh.householdKey]: !isExpanded,
+                                }))
+                            : undefined
+                        }
+                        className={`px-3.5 py-2.5 space-y-1 ${
+                          hh.isHousehold
+                            ? "cursor-pointer hover:bg-slate-50/80"
+                            : ""
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            {hh.isHousehold && (
+                              <span className="text-indigo-600 text-xs shrink-0">
+                                {isExpanded ? "▾" : "▸"}
+                              </span>
+                            )}
+                            <span className="font-semibold text-xs sm:text-sm text-slate-900 truncate">
+                              {hh.householdName}
+                            </span>
+                            {hh.isHousehold && (
+                              <span className="text-[10px] font-semibold text-indigo-600 bg-indigo-50 px-1.5 rounded-full shrink-0">
+                                {hh.members.length}
+                              </span>
+                            )}
+                          </div>
+                          <span
+                            className={`text-xs sm:text-sm whitespace-nowrap shrink-0 ${netColor(
+                              hh.netBalanceCents
+                            )}`}
+                          >
+                            {renderSignedNet(hh.netBalanceCents)}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+                          <span>
+                            Paid{" "}
+                            <strong className="text-slate-700 font-medium">
+                              {formatCurrency(hh.paidCents, curCode)}
+                            </strong>
+                          </span>
+                          <span className="text-slate-300">·</span>
+                          <span>
+                            Share{" "}
+                            <strong className="text-slate-700 font-medium">
+                              {formatCurrency(hh.shareCents, curCode)}
+                            </strong>
+                          </span>
+                        </div>
+                      </div>
+                      {hh.isHousehold && isExpanded && (
+                        <div className="bg-slate-50/80 border-t border-slate-100 divide-y divide-slate-100">
+                          {hh.members.map((m) => (
+                            <div
+                              key={m.memberId}
+                              className="pl-8 pr-3.5 py-2 space-y-0.5 text-[11px]"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-medium text-slate-800 truncate">
+                                  {m.memberName}
+                                </span>
+                                <span
+                                  className={`whitespace-nowrap shrink-0 ${netColor(
+                                    m.netBalanceCents
+                                  )}`}
+                                >
+                                  {renderSignedNet(m.netBalanceCents)}
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                Paid {formatCurrency(m.paidCents, curCode)} ·
+                                Share {formatCurrency(m.shareCents, curCode)}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              : individualRows.map((row) => (
+                  <div key={row.memberId} className="px-3.5 py-2.5 space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-xs sm:text-sm text-slate-900 truncate">
+                        {row.memberName}
+                      </span>
+                      <span
+                        className={`text-xs sm:text-sm whitespace-nowrap shrink-0 ${netColor(
+                          row.netBalanceCents
+                        )}`}
+                      >
+                        {renderSignedNet(row.netBalanceCents)}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+                      <span>
+                        Paid{" "}
+                        <strong className="text-slate-700 font-medium">
+                          {formatCurrency(row.paidCents, curCode)}
+                        </strong>
+                      </span>
+                      <span className="text-slate-300">·</span>
+                      <span>
+                        Share{" "}
+                        <strong className="text-slate-700 font-medium">
+                          {formatCurrency(row.shareCents, curCode)}
+                        </strong>
+                      </span>
+                    </div>
+                  </div>
+                ))}
+          </div>
+        </div>
+      );
+    };
+
+    return (
+      <main className="max-w-2xl mx-auto p-4 sm:p-6 space-y-4">
+        {/* 1. Minimal Top Bar */}
+        <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs space-y-3">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div className="min-w-0">
+              <button
+                type="button"
+                onClick={() => handleNavigateView("dashboard")}
+                className="text-xs font-semibold text-blue-600 hover:text-blue-800 inline-flex items-center gap-1 cursor-pointer mb-1"
+              >
+                <span>← Back to Expenses</span>
+              </button>
+              <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight truncate">
+                {activeGroup.name} — Settle Up
+              </h2>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  const origin =
+                    typeof window !== "undefined" && window.location?.origin
+                      ? window.location.origin
+                      : "https://split.murphnduff.org";
+                  const slugOrId =
+                    activeGroup.slug ||
+                    generateGroupSlug(activeGroup.name) ||
+                    activeGroup.id;
+                  const memberPart = activeMemberObj?.name
+                    ? `/${encodeURIComponent(activeMemberObj.name)}`
+                    : "";
+                  const url = `${origin}/${slugOrId}${memberPart}/settle`;
+                  navigator.clipboard
+                    .writeText(url)
+                    .then(() => {
+                      setCopyFeedbackTarget("group");
+                      setCopyStatusText("Copied settle link");
+                      setTimeout(() => {
+                        setCopyFeedbackTarget("idle");
+                        setCopyStatusText("");
+                      }, 2200);
+                    })
+                    .catch(() => {
+                      const ok = legacyCopyText(url);
+                      setCopyFeedbackTarget(ok ? "group" : "failed");
+                      setCopyStatusText(ok ? "Copied settle link" : "Copy failed");
+                      setTimeout(() => {
+                        setCopyFeedbackTarget("idle");
+                        setCopyStatusText("");
+                      }, 2200);
+                    });
+                }}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
+                  copyFeedbackTarget !== "idle" && copyFeedbackTarget !== "failed"
+                    ? "bg-emerald-600 text-white border-emerald-600"
+                    : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
+                }`}
+              >
+                {copyFeedbackTarget !== "idle" &&
+                copyFeedbackTarget !== "failed" ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Share2 className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Copy Settle Link</span>
+                  </>
+                )}
+              </button>
+              <span role="status" className="sr-only">
+                {copyStatusText}
+              </span>
+            </div>
+          </div>
+
+          {/* Compact Viewing As Identity Chip */}
+          {members.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-slate-100">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="text-slate-600 font-medium flex items-center gap-1.5">
+                  <UserCheck className="w-3.5 h-3.5 text-blue-600" />
+                  <span>
+                    Viewing as:{" "}
+                    <strong className="text-slate-900">
+                      {activeMemberObj ? activeMemberObj.name : "Everyone"}
+                    </strong>
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setIsSettleIdentityPickerOpen((prev) => !prev)
+                  }
+                  className="text-[11px] font-semibold text-blue-600 hover:text-blue-800 underline cursor-pointer"
+                >
+                  {isSettleIdentityPickerOpen ? "Done" : "Switch"}
+                </button>
+              </div>
+              {isSettleIdentityPickerOpen && (
+                <div className="flex flex-wrap gap-1.5">
+                  {members.map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => {
+                        handleSelectIdentity(m);
+                        setIsSettleIdentityPickerOpen(false);
+                      }}
+                      className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer ${
+                        m.id === activeMemberId
+                          ? "bg-blue-600 text-white border-blue-600"
+                          : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-blue-50"
+                      }`}
+                    >
+                      {m.name}
+                    </button>
+                  ))}
+                  {activeMemberObj && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveMemberId("");
+                        if (activeGroupId && typeof window !== "undefined") {
+                          localStorage.removeItem(
+                            memberStorageKey(activeGroupId)
+                          );
+                          const slugOrId =
+                            activeGroup.slug ||
+                            generateGroupSlug(activeGroup.name) ||
+                            activeGroup.id;
+                          window.history.replaceState(
+                            null,
+                            "",
+                            buildCleanGroupMemberUrl(slugOrId, null, "settle")
+                          );
+                        }
+                        setIsSettleIdentityPickerOpen(false);
+                      }}
+                      className="px-2.5 py-1 rounded-full text-xs font-semibold border border-slate-200 text-slate-500 hover:bg-slate-100 cursor-pointer"
+                    >
+                      Show All
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 2. Personal / Household Hero Banner (when viewer identity is active) */}
+        {activeMemberObj && (
+          <div className="space-y-2.5">
+            {viewerTransfers.length === 0 ? (
+              <div className="p-4 sm:p-5 bg-emerald-50 border border-emerald-200 rounded-2xl text-center space-y-1">
+                <div className="text-sm sm:text-base font-bold text-emerald-900">
+                  {viewerNameLabel}: You&apos;re all settled up!
+                </div>
+                <p className="text-xs text-emerald-700">
+                  No payments needed for your{" "}
+                  {isHouseholdView && viewerHousehold?.isHousehold
+                    ? "household"
+                    : "account"}
+                  .
+                </p>
+              </div>
+            ) : (
+              viewerTransfers.map((t) => (
+                <div
+                  key={t.key}
+                  className={`p-4 sm:p-5 rounded-2xl border shadow-xs flex items-center justify-between gap-3 flex-wrap ${
+                    t.viewerOwes
+                      ? "bg-rose-50/70 border-rose-200"
+                      : "bg-emerald-50/70 border-emerald-200"
+                  }`}
+                >
+                  <div className="space-y-0.5 min-w-0">
+                    <div className="text-xs font-semibold text-slate-600">
+                      {viewerNameLabel}
+                    </div>
+                    <div className="text-base sm:text-lg font-bold text-slate-900">
+                      {t.viewerOwes ? (
+                        <>
+                          You owe {t.toLabel}{" "}
+                          <span className="text-rose-700">
+                            {formatCurrency(t.amountCents, t.currency)}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          {t.fromLabel} owes you{" "}
+                          <span className="text-emerald-700">
+                            {formatCurrency(t.amountCents, t.currency)}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {!activeGroup.is_archived && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfirmPaymentDraft({
+                          fromMemberId: t.fromMemberId,
+                          toMemberId: t.toMemberId,
+                          fromLabel: t.fromLabel,
+                          toLabel: t.toLabel,
+                          isHousehold: t.isHousehold,
+                          amountCents: t.amountCents,
+                          currency: t.currency,
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs transition cursor-pointer shrink-0"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Mark Paid</span>
+                    </button>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* 3. Clean Controls: Settle in + Group by Household + Collapsed Exchange Rate Details */}
+        {(hasMultipleCurrencies || hasHouseholds) && (
+          <div className="bg-white border border-slate-200 p-4 rounded-2xl shadow-xs space-y-3 text-xs">
+            {hasMultipleCurrencies && (
+              <div className="space-y-2">
+                {isUnifiedMode ? (
+                  <>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-2">
+                        <label className="font-semibold text-slate-700">
+                          Settle in:
+                        </label>
+                        <select
+                          value={normalizeCurrencyCode(settleCurrency)}
+                          onChange={(e) =>
+                            handleSelectUnifiedTargetCurrency(e.target.value)
+                          }
+                          className="border border-slate-300 rounded-lg px-2.5 py-1 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer"
+                        >
+                          {activeGroupCurrencies.map((code) => (
+                            <option key={code} value={code}>
+                              {code} ({getCurrencySymbol(code)})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setUnifiedModePref(false)}
+                        className="text-[11px] font-medium text-slate-500 hover:text-slate-800 underline cursor-pointer"
+                      >
+                        Split by currency instead
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowFxDetails((prev) => !prev)}
+                      className="text-[11px] font-semibold text-slate-500 hover:text-slate-800 flex items-center gap-1 cursor-pointer"
+                    >
+                      <span>Exchange rate details</span>
+                      <span>{showFxDetails ? "▴" : "▾"}</span>
+                    </button>
+
+                    {showFxDetails && (
+                      <div className="space-y-2 pt-2 border-t border-slate-100">
+                        {activeGroupCurrencies
+                          .filter(
+                            (code) =>
+                              code !==
+                              normalizeCurrencyCode(unifiedTargetCurrency)
+                          )
+                          .map((otherCode) => {
+                            const rawRate =
+                              numericExchangeRates[otherCode] ?? 1;
+                            const humanQuote = formatFxDisplayQuote(
+                              otherCode,
+                              unifiedTargetCurrency,
+                              1 / rawRate
+                            );
+                            return (
+                              <div
+                                key={otherCode}
+                                className="flex items-center justify-between text-[11px] text-slate-600 bg-slate-50 px-2.5 py-1.5 rounded-lg"
+                              >
+                                <span className="font-medium">
+                                  {humanQuote.quoteText}
+                                </span>
+                                <span className="text-slate-400">
+                                  fallback rate
+                                </span>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-600 font-medium">
+                      Showing separate currency ledgers
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setUnifiedModePref(true)}
+                      className="font-bold text-emerald-700 hover:text-emerald-900 underline cursor-pointer"
+                    >
+                      Combine into {unifiedTargetCurrency}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {hasHouseholds && (
+              <div className="grid grid-cols-2 bg-indigo-50/70 p-0.5 rounded-xl border border-indigo-100 text-[11px] font-semibold gap-1">
+                <button
+                  type="button"
+                  onClick={() => setGroupByHouseholdPref(true)}
+                  className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 ${
+                    isHouseholdView
+                      ? "bg-white text-indigo-700 shadow-2xs font-bold"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <Home className="w-3 h-3 shrink-0" />
+                  <span>Group by Household</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGroupByHouseholdPref(false)}
+                  className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 ${
+                    !isHouseholdView
+                      ? "bg-white text-blue-700 shadow-2xs font-bold"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <Users className="w-3 h-3 shrink-0" />
+                  <span>Show Individuals</span>
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 4. Remaining / Group Transfers */}
+        <div className="bg-white border border-slate-200 p-4 sm:p-5 rounded-2xl shadow-xs space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-bold text-slate-900">
+              {activeMemberObj ? "Other group transfers" : "Suggested transfers"}
+            </h3>
+            <span className="text-[11px] font-semibold text-slate-400">
+              {otherTransfers.length === 0
+                ? "None"
+                : `${otherTransfers.length} transfer${
+                    otherTransfers.length === 1 ? "" : "s"
+                  }`}
+            </span>
+          </div>
+
+          {otherTransfers.length === 0 ? (
+            <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+              {activeMemberObj && viewerTransfers.length > 0
+                ? "No other transfers needed in the group."
+                : "Everything in this group is settled up."}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {otherTransfers.map((t) => (
+                <div
+                  key={t.key}
+                  className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between gap-2 text-xs"
+                >
+                  <div className="space-y-0.5 min-w-0">
+                    <div className="text-slate-700">
+                      <span className="font-bold text-slate-900">
+                        {t.fromLabel}
+                      </span>{" "}
+                      pays{" "}
+                      <span className="font-bold text-slate-900">
+                        {t.toLabel}
+                      </span>
+                    </div>
+                    <div className="text-sm font-bold text-emerald-700">
+                      {formatCurrency(t.amountCents, t.currency)}
+                    </div>
+                  </div>
+                  {!activeGroup.is_archived && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfirmPaymentDraft({
+                          fromMemberId: t.fromMemberId,
+                          toMemberId: t.toMemberId,
+                          fromLabel: t.fromLabel,
+                          toLabel: t.toLabel,
+                          isHousehold: t.isHousehold,
+                          amountCents: t.amountCents,
+                          currency: t.currency,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
+                    >
+                      <CheckCircle2 className="w-3 h-3" />
+                      <span>Mark Paid</span>
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* 5. Expandable Household / Member Balances */}
+        <div className="bg-white border border-slate-200 p-4 sm:p-5 rounded-2xl shadow-xs space-y-3">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900">
+              {isHouseholdView ? "Household Balances" : "Member Balances"}
+            </h3>
+            {isHouseholdView && (
+              <p className="text-[11px] text-slate-500">
+                Tap a household to view individual shares.
+              </p>
+            )}
+          </div>
+          {hasMultipleCurrencies && isUnifiedMode
+            ? renderBalanceRows(
+                unifiedTargetCurrency,
+                null,
+                isHouseholdView
+                  ? unifiedHouseholdResult.householdBreakdown
+                  : null,
+                unifiedResult.memberBreakdown
+              )
+            : displayCurrencies.map((code) =>
+                renderBalanceRows(
+                  code,
+                  displayCurrencies.length > 1
+                    ? `${code} (${getCurrencySymbol(code)})`
+                    : null,
+                  isHouseholdView
+                    ? householdByCurrency[code]?.householdBreakdown || []
+                    : null,
+                  memberBreakdownByCurrency[code] || []
+                )
+              )}
+        </div>
+      </main>
+    );
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 overflow-x-hidden">
       <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 sm:py-3.5 flex items-center justify-between gap-2">
@@ -4179,7 +5083,9 @@ export function SettleUpDashboard({
         </div>
       )}
 
-      {!isSuperAdmin && groups.length === 0 && !activeGroup ? (
+      {currentView === "settle" && activeGroup ? (
+        renderDedicatedSettleView()
+      ) : !isSuperAdmin && groups.length === 0 && !activeGroup ? (
         <div className="max-w-md mx-auto px-6 py-24">
           <div className="bg-white border border-slate-200 p-8 rounded-2xl shadow-xs text-center space-y-4">
             <div className="mx-auto w-11 h-11 rounded-xl bg-slate-100 text-slate-700 flex items-center justify-center">
@@ -4524,23 +5430,44 @@ export function SettleUpDashboard({
                         </button>
                       </div>
                       {newGroupCurrencies.length > 1 && (
-                        <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80 text-[11px]">
-                          <span className="font-semibold text-slate-600">
-                            Default:
-                          </span>
-                          <select
-                            value={newGroupDefaultCurrency}
-                            onChange={(e) =>
-                              setNewGroupDefaultCurrency(e.target.value)
-                            }
-                            className="border border-slate-300 rounded-md px-1.5 py-0.5 text-[11px] font-bold text-slate-800 bg-white"
-                          >
-                            {newGroupCurrencies.map((code) => (
-                              <option key={code} value={code}>
-                                {code} ({getCurrencySymbol(code)})
-                              </option>
-                            ))}
-                          </select>
+                        <div className="space-y-1.5 pt-1 border-t border-slate-200/80 text-[11px]">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-slate-600">
+                              Default Expense:
+                            </span>
+                            <select
+                              value={newGroupDefaultCurrency}
+                              onChange={(e) => {
+                                const nextDef = e.target.value;
+                                setNewGroupDefaultCurrency(nextDef);
+                              }}
+                              className="border border-slate-300 rounded-md px-1.5 py-0.5 text-[11px] font-bold text-slate-800 bg-white"
+                            >
+                              {newGroupCurrencies.map((code) => (
+                                <option key={code} value={code}>
+                                  {code} ({getCurrencySymbol(code)})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-slate-600">
+                              Default Settle In:
+                            </span>
+                            <select
+                              value={newGroupSettlementCurrency}
+                              onChange={(e) =>
+                                setNewGroupSettlementCurrency(e.target.value)
+                              }
+                              className="border border-slate-300 rounded-md px-1.5 py-0.5 text-[11px] font-bold text-slate-800 bg-white"
+                            >
+                              {newGroupCurrencies.map((code) => (
+                                <option key={code} value={code}>
+                                  {code} ({getCurrencySymbol(code)})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -4617,8 +5544,16 @@ export function SettleUpDashboard({
                   )}
                 </div>
 
-                {/* Primary Actions: 🔗 Copy Link (Group + Member) & ⚙️ Manage Menu (Currencies, Members, CSV, Archive) */}
+                {/* Primary Actions: 🔗 Copy Link, 💸 Settle Up → & ⚙️ Manage Menu */}
                 <div className="flex items-center gap-1.5 flex-wrap shrink-0 max-w-full">
+                  <button
+                    type="button"
+                    onClick={() => handleNavigateView("settle")}
+                    className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-bold rounded-xl transition shadow-2xs cursor-pointer bg-emerald-600 hover:bg-emerald-700 text-white"
+                  >
+                    <span>Settle Up</span>
+                    <span>→</span>
+                  </button>
                   <div className="relative inline-flex items-center max-w-full">
                     <button
                       type="button"
@@ -4810,6 +5745,12 @@ export function SettleUpDashboard({
                                   setEditingDefaultCurrency(
                                     activeDefaultCurrency
                                   );
+                                  setEditingSettlementCurrency(
+                                    normalizeCurrencyCode(
+                                      activeGroup.settlement_currency ||
+                                        activeDefaultCurrency
+                                    )
+                                  );
                                   setCustomIsoInput("");
                                   setIsCurrencyModalOpen(true);
                                 }}
@@ -4941,7 +5882,11 @@ export function SettleUpDashboard({
                               window.history.replaceState(
                                 null,
                                 "",
-                                buildCleanGroupMemberUrl(slugOrId, null)
+                                buildCleanGroupMemberUrl(
+                                  slugOrId,
+                                  null,
+                                  currentView
+                                )
                               );
                             }
                           }}
@@ -4990,16 +5935,54 @@ export function SettleUpDashboard({
 
           {activeGroup && (
             <>
-              {/* Compact Add Transaction Form (First card below Group Header on both Desktop and Mobile; hidden when group is archived) */}
+              {/* Mobile Sticky 3-Tab Switcher (< lg): Log | Settle Up | Activity */}
+              <div className="lg:hidden sticky top-2 z-20 bg-white/95 backdrop-blur-xs border border-slate-200 p-1 rounded-2xl shadow-xs grid grid-cols-3 gap-1 text-xs font-bold">
+                <button
+                  type="button"
+                  onClick={() => setMobileTab("log")}
+                  className={`py-2 px-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 ${
+                    mobileTab === "log"
+                      ? "bg-slate-900 text-white shadow-2xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <span>➕</span>
+                  <span>Log</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMobileTab("settle")}
+                  className={`py-2 px-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 ${
+                    mobileTab === "settle"
+                      ? "bg-emerald-600 text-white shadow-2xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <span>💸</span>
+                  <span>Settle Up</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMobileTab("activity")}
+                  className={`py-2 px-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 ${
+                    mobileTab === "activity"
+                      ? "bg-blue-600 text-white shadow-2xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <span>🧾</span>
+                  <span>Activity</span>
+                </button>
+              </div>
+
+              {/* Compact Add Transaction Form (Shown on Desktop lg+ or Mobile 'Log' tab; hidden when group is archived) */}
               {!activeGroup.is_archived && (
               <form
                 ref={addTransactionFormRef}
                 onSubmit={handleAddExpense}
-                className={`bg-white border p-4 sm:p-5 rounded-2xl shadow-xs space-y-3 transition-all duration-300 ${
-                  isFormHighlighted
-                    ? "border-emerald-400 ring-2 ring-emerald-500/30 bg-emerald-50/10"
-                    : "border-slate-200"
-                }`}
+                className={`${
+                  mobileTab === "log" ? "block" : "hidden lg:block"
+                } bg-white border border-slate-200 p-4 sm:p-5 rounded-2xl shadow-xs space-y-3 transition-all duration-300`}
               >
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="font-bold text-slate-900 text-sm sm:text-base">
@@ -5887,11 +6870,17 @@ export function SettleUpDashboard({
               </form>
               )}
 
-              {/* Mobile Unified Balances & Analytics Card (< lg, placed below Add Transaction and above Transaction History) */}
-              <div className="lg:hidden">{renderBalancesAndAnalyticsCard()}</div>
+              {/* Mobile Unified Balances & Analytics Card (< lg, shown when Mobile 'Settle Up' tab is active) */}
+              {mobileTab === "settle" && (
+                <div className="lg:hidden">{renderBalancesAndAnalyticsCard()}</div>
+              )}
 
               {/* Ledger Table with Quick Type Filter, Search Input, Currency Filter, and Group-Wide Editing */}
-              <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
+              <div
+                className={`${
+                  mobileTab === "activity" ? "block" : "hidden lg:block"
+                } bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden`}
+              >
                 <div className="px-4 sm:px-5 py-3.5 border-b border-slate-200 space-y-2.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
@@ -6333,24 +7322,48 @@ export function SettleUpDashboard({
                 </div>
               </div>
 
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-600 block">
-                  Default Currency for New Transactions
-                </label>
-                <select
-                  value={editingDefaultCurrency}
-                  onChange={(e) => setEditingDefaultCurrency(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  {editingGroupCurrencies.map((code) => {
-                    const info = getCurrencyInfo(code);
-                    return (
-                      <option key={info.code} value={info.code}>
-                        {info.label}
-                      </option>
-                    );
-                  })}
-                </select>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-600 block">
+                    Default Expense Currency
+                  </label>
+                  <select
+                    value={editingDefaultCurrency}
+                    onChange={(e) => setEditingDefaultCurrency(e.target.value)}
+                    className="w-full border border-slate-300 rounded-lg p-2 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    {editingGroupCurrencies.map((code) => {
+                      const info = getCurrencyInfo(code);
+                      return (
+                        <option key={info.code} value={info.code}>
+                          {info.label}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-600 block">
+                    Default Settlement Currency
+                  </label>
+                  <select
+                    value={editingSettlementCurrency}
+                    onChange={(e) =>
+                      setEditingSettlementCurrency(e.target.value)
+                    }
+                    className="w-full border border-slate-300 rounded-lg p-2 text-xs font-bold text-slate-900 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    {editingGroupCurrencies.map((code) => {
+                      const info = getCurrencyInfo(code);
+                      return (
+                        <option key={info.code} value={info.code}>
+                          {info.label}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
               </div>
 
               <div className="pt-2 border-t border-slate-100 flex items-center justify-end gap-2">
@@ -6504,6 +7517,25 @@ export function SettleUpDashboard({
             </form>
           </div>
         </div>
+      )}
+
+      {/* Instant Confirm Payment Modal ("Mark Paid") */}
+      {confirmPaymentDraft && activeGroup && (
+        <ConfirmPaymentModal
+          key={`${confirmPaymentDraft.fromMemberId}-${confirmPaymentDraft.toMemberId}-${confirmPaymentDraft.amountCents}-${confirmPaymentDraft.currency}`}
+          isOpen={true}
+          onClose={() => setConfirmPaymentDraft(null)}
+          groupId={activeGroup.id}
+          createdBy={user?.id || activeGroup.created_by}
+          members={members}
+          groupCurrencies={activeGroupCurrencies}
+          defaultCurrency={activeDefaultCurrency}
+          paymentDraft={confirmPaymentDraft}
+          onPaymentRecorded={async (msg) => {
+            await refreshExpenses(activeGroup.id);
+            setNotification({ type: "success", message: msg });
+          }}
+        />
       )}
 
       {/* Edit Transaction Modal */}

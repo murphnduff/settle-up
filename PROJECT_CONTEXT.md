@@ -29,7 +29,7 @@
   - Global `noindex, nofollow, noarchive, nosnippet` metadata in `src/app/layout.tsx` and `X-Robots-Tag` HTTP headers in `next.config.ts`.
 
 ### 2.2 Database Tables & Schema
-- **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `currencies` (TEXT[] DEFAULT `ARRAY['USD']`), `default_currency` (TEXT DEFAULT `'USD'`), `exchange_rates` (JSONB DEFAULT `'{}'`), `created_at` (TIMESTAMPTZ).
+- **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `currencies` (TEXT[] DEFAULT `ARRAY['USD']`), `default_currency` (TEXT DEFAULT `'USD'`), `settlement_currency` (TEXT DEFAULT NULL — optional default currency for unified end-of-trip settlement), `exchange_rates` (JSONB DEFAULT `'{}'`), `created_at` (TIMESTAMPTZ).
 - **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `household_name` (TEXT DEFAULT NULL — optional family/couple sub-group label for household balance rollup). Unique constraint on `(group_id, lower(display_name))`.
 - **`heartbeat_logs`**: `id` (UUID PK), `triggered_by` (TEXT), `groups_count` (INTEGER), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (TEXT — any 3-letter ISO currency code such as `'USD'`, `'EUR'`, `'AUD'`, `'THB'`, `'GBP'`, `'CAD'`, `'JPY'`, `'NZD'`, `'CHF'`, `'MXN'`), `fx_rates` (JSONB DEFAULT NULL — transaction-time locked conversion rates normalized as `1 expense.currency = X targetCurrency`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
@@ -194,13 +194,17 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 15. ✅ **Transaction-Time Locked FX Rates (`expenses.fx_rates`):**
     - Added date-aware `fetchTransactionFxRates` (`api.frankfurter.dev` historical + `open.er-api.com` live fallback), inline FX rate preview/override pills in Add & Edit Transaction forms, ledger converted subtitles (`≈ $28.99 @ 34.50`), per-transaction locked FX unified reconciliation (`calculateUnifiedReconciliation` & `calculateUnifiedCategorySpend`, tested in Edge Case 16 & 18), 1-click Super-Admin **Backfill Historical Rates**, and lossless CSV `FX_Rates` export/import.
 
-### Phase 5: Remote Streamable HTTP MCP Server (Completed ✅)
-16. ✅ **Remote MCP Endpoint (`/api/mcp`):**
+### Phase 5: Remote Streamable HTTP MCP Server (In Progress — Pending Verification)
+16. 🔄 **Remote MCP Endpoint (`/api/mcp` — Pending Verification):**
     - Exposed Settle Up as a stateless Streamable HTTP MCP server at `src/app/api/mcp/route.ts` (`POST`, `GET`, `DELETE`) secured by `Authorization: Bearer <MCP_SECRET_KEY>` (`process.env.MCP_SECRET_KEY`) and server-side Supabase (`SUPABASE_SERVICE_ROLE_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
     - Implemented `list_groups`, `add_transaction` (with `splitAmountEqually` / exact splits and `fetchTransactionFxRates`), `get_settlement_plan` (per-currency or unified via `calculateUnifiedReconciliation`), and `list_recent_transactions`.
 
-### Phase 6: Traveler UX Polish & Household / Family Rollup (Pass 1 Completed ✅)
+### Phase 6: Traveler UX Polish & Household / Family Rollup (Pass 1 & Pass 2 Completed ✅)
 17. ✅ **Households / Family Sub-Groups (`group_members.household_name`):**
     - Added optional `household_name` assignment with quick-pick pills in `Manage Members` (`MemberInviteModal.tsx`), 1-tap Household quick-select chips in `Split Among` (`page.tsx` & `EditExpenseModal.tsx`), intra-household balance netting before greedy cash-flow minimization (`groupMemberBreakdownByHousehold`, `calculateHouseholdReconciliation`, `calculateUnifiedHouseholdReconciliation` tested in Edge Case 19), and expandable `▸` / `▾` household rows in **Members** with a `Group by Household` / `Show Individuals` toggle.
 18. ✅ **Mobile Overflow Fix, Unclipped Member Rows & Zero-Decimal Currency Formatting:**
     - Consolidated Group Header `Currencies` inside the `⚙️ Manage` dropdown, added `overflow-x-hidden` / `min-w-0` guards, replaced cramped 4-column mobile member tables with 2-line stacked rows (`sm:hidden`), omitted `.00` on whole-unit `ISK`/`JPY` amounts in `formatCurrency`, and removed developer jargon captions.
+19. ✅ **Default Settlement Currency (`groups.settlement_currency`), Instant "Mark Paid" Modal & Dedicated `/settle` Route:**
+    - Added `settlement_currency` configuration in Create Group and Manage Group Currencies, defaulted multi-currency groups to Unified Settlement ON with a clean `Settle in: [USD ▾]` selector, `Split by currency instead` link, and collapsed `Exchange rate details ▾` disclosure.
+    - Replaced scroll-to-form `Settle` buttons with an instant `ConfirmPaymentModal` (`Mark Paid` -> `Confirm Payment`, tested in Edge Case 20).
+    - Added dedicated distraction-free `/[slug]/settle` and `/[slug]/[member]/settle` routes (served via `src/app/[slug]/[[...member]]/page.tsx`) with a personal/household hero banner, `Settle Up →` header entry point, and a sticky mobile 3-tab switcher (`➕ Log` | `💸 Settle Up` | `🧾 Activity`) on `< lg` screens.

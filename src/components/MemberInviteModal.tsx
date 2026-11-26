@@ -42,6 +42,7 @@ export interface Group {
   is_archived?: boolean;
   currencies?: string[];
   default_currency?: string;
+  settlement_currency?: string | null;
   exchange_rates?: Record<string, number>;
   created_at?: string;
 }

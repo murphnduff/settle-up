@@ -1315,6 +1315,90 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     );
     assert.strictEqual(unifiedHh.settlements.length, 2);
   });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 20: Default Settlement Currency & Household Payment Recording Zeroes Out Balances
+  // --------------------------------------------------------------------------
+  it('Edge Case 20: settlement_currency selection (ISK expenses settled in USD) and household payment recording zero out household balances', () => {
+    const travelers: MemberRecord[] = [
+      { id: 'murph', name: 'Murph', householdName: 'Murph & Michelle' },
+      { id: 'michelle', name: 'Michelle', householdName: 'Murph & Michelle' },
+      { id: 'luke', name: 'Luke', householdName: "Luke's Family" },
+      { id: 'emma', name: 'Emma', householdName: "Luke's Family" },
+    ];
+
+    const groupConfig = {
+      default_currency: 'ISK',
+      settlement_currency: 'USD',
+    };
+    const resolvedSettlementCurrency =
+      groupConfig.settlement_currency || groupConfig.default_currency;
+    assert.strictEqual(resolvedSettlementCurrency, 'USD');
+
+    // Luke pays kr27,600 ISK (2,760,000 cents) at 1 USD = 138 ISK -> $200.00 USD (20,000c)
+    // Split 4 ways -> $50.00 USD each -> Murph & Michelle owe Luke's Family $100.00 USD (10,000c)
+    const expenses: ExpenseRecord[] = [
+      {
+        id: 'exp-isk-1',
+        paidByMemberId: 'luke',
+        amountCents: 2760000,
+        currency: 'ISK',
+        type: 'expense',
+        category: 'Lodging',
+        date: '2026-11-22',
+        fxRates: { ISK: 1, USD: Number((1 / 138).toPrecision(10)) },
+        splits: splitAmountEqually(
+          2760000,
+          travelers.map((m) => m.id)
+        ),
+      },
+    ];
+
+    const beforePayment = calculateUnifiedHouseholdReconciliation(
+      travelers,
+      expenses,
+      resolvedSettlementCurrency,
+      {}
+    );
+    assert.strictEqual(beforePayment.targetCurrency, 'USD');
+    assert.strictEqual(beforePayment.settlements.length, 1);
+    const transfer = beforePayment.settlements[0];
+    assert.strictEqual(transfer.fromHouseholdName, 'Murph & Michelle');
+    assert.strictEqual(transfer.toHouseholdName, "Luke's Family");
+    assert.strictEqual(transfer.amountCents, 10000);
+
+    // Record ConfirmPaymentModal payment using primaryMemberIds in USD
+    const withPayment: ExpenseRecord[] = [
+      ...expenses,
+      {
+        id: 'pay-usd-1',
+        paidByMemberId: transfer.fromPrimaryMemberId,
+        amountCents: transfer.amountCents,
+        currency: resolvedSettlementCurrency,
+        type: 'payment',
+        category: 'Payment',
+        date: '2026-11-26',
+        fxRates: { USD: 1, ISK: 138 },
+        splits: [
+          {
+            memberId: transfer.toPrimaryMemberId,
+            splitAmountCents: transfer.amountCents,
+          },
+        ],
+      },
+    ];
+
+    const afterPayment = calculateUnifiedHouseholdReconciliation(
+      travelers,
+      withPayment,
+      resolvedSettlementCurrency,
+      {}
+    );
+    assert.strictEqual(afterPayment.settlements.length, 0);
+    for (const hh of afterPayment.householdBreakdown) {
+      assert.strictEqual(hh.netBalanceCents, 0);
+    }
+  });
 });
 
 
