@@ -855,8 +855,14 @@ export function SettleUpDashboard({
               matchedMember.id
             );
 
-            // Normalize URL to clean /[slug]/[member] path (unless user opened stealth "/" with no member URL param)
-            if (!isRootStealthPath || resolved.source !== "storage") {
+            // Normalize URL to clean /[slug]/[member] path (unless user opened stealth "/" or general "/[slug]/settle" with only localStorage)
+            const keepGeneralSettleUrl =
+              currentViewRef.current === "settle" &&
+              resolved.source === "storage";
+            if (
+              (!isRootStealthPath || resolved.source !== "storage") &&
+              !keepGeneralSettleUrl
+            ) {
               const grp = groupsRef.current.find((g) => g.id === activeGroupId);
               const fallbackSeg = window.location.pathname
                 .split("/")
