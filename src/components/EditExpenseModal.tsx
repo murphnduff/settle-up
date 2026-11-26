@@ -7,6 +7,7 @@ import {
   splitAmountByPercentage,
   validateExactSplits,
   buildGroupCategories,
+  getHouseholdGroups,
 } from "@/lib/reconciliation";
 import { GroupMember } from "@/components/MemberInviteModal";
 import {
@@ -503,6 +504,18 @@ export default function EditExpenseModal({
       handleClose();
     }
   };
+
+  const householdGroups = useMemo(
+    () =>
+      getHouseholdGroups(
+        members.map((m) => ({
+          id: m.id,
+          name: m.name,
+          householdName: m.householdName ?? m.household_name ?? null,
+        }))
+      ),
+    [members]
+  );
 
   // Live exact split calculation & auto-summed total
   const exactSummary = useMemo(() => {
@@ -1604,6 +1617,48 @@ export default function EditExpenseModal({
                   >
                     Clear
                   </button>
+                </div>
+              )}
+
+              {type === "expense" && householdGroups.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 pb-1">
+                  <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mr-0.5">
+                    Households:
+                  </span>
+                  {householdGroups.map((hh) => {
+                    const allIn = hh.memberIds.every((id) =>
+                      selectedMembers.includes(id)
+                    );
+                    return (
+                      <button
+                        key={hh.householdKey}
+                        type="button"
+                        onClick={() => {
+                          setSelectedMembers((prev) => {
+                            if (allIn) {
+                              return prev.filter(
+                                (id) => !hh.memberIds.includes(id)
+                              );
+                            }
+                            const nextSet = new Set(prev);
+                            for (const id of hh.memberIds) nextSet.add(id);
+                            return Array.from(nextSet);
+                          });
+                        }}
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border transition cursor-pointer flex items-center gap-1 ${
+                          allIn
+                            ? "bg-indigo-600 text-white border-indigo-600 shadow-2xs"
+                            : "bg-indigo-50/70 text-indigo-800 border-indigo-200 hover:bg-indigo-100"
+                        }`}
+                      >
+                        <span>🏠</span>
+                        <span>{hh.householdName}</span>
+                        <span className="opacity-75">
+                          ({hh.memberIds.length})
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
               )}
 

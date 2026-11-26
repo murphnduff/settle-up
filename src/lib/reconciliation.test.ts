@@ -13,6 +13,10 @@ import {
   calculateCategorySpend,
   calculateUnifiedCategorySpend,
   calculateUnifiedReconciliation,
+  calculateHouseholdReconciliation,
+  calculateUnifiedHouseholdReconciliation,
+  getHouseholdGroups,
+  hasAnyHousehold,
   resolveMemberIdentityFromUrl,
   buildGroupCategories,
   EXPENSE_CATEGORIES,
@@ -796,7 +800,8 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
     assert.strictEqual(formatCurrency(4000, 'AUD'), 'A$40.00');
     assert.strictEqual(formatCurrency(125000, 'THB'), '฿1,250.00');
     assert.strictEqual(formatCurrency(1500, 'EUR'), '€15.00');
-    assert.strictEqual(formatCurrency(150000, 'ISK'), 'kr1,500.00');
+    assert.strictEqual(formatCurrency(150000, 'ISK'), 'kr1,500');
+    assert.strictEqual(formatCurrency(150025, 'ISK'), 'kr1,500.25');
     assert.strictEqual(normalizeCurrencyCode('฿'), 'THB');
     assert.strictEqual(normalizeCurrencyCode('A$'), 'AUD');
     assert.strictEqual(normalizeCurrencyCode('kr'), 'ISK');
@@ -1196,6 +1201,119 @@ describe('Settle Up - Section 4 Math Engine & Edge Case Tests', () => {
       ),
       0
     );
+  });
+
+  // --------------------------------------------------------------------------
+  // Edge Case 19: Household / Family Sub-Group Rollup (8 Travelers -> 3 Households -> 2 Transfers)
+  // --------------------------------------------------------------------------
+  it('Edge Case 19: 8-person (2 couples + family of 4) group nets intra-household balances first and minimizes to 2 household transfers with zero-sum balances', () => {
+    const icelandTravelers: MemberRecord[] = [
+      { id: 'murph', name: 'Murph', householdName: 'Murph & Michelle' },
+      { id: 'michelle', name: 'Michelle', householdName: 'Murph & Michelle' },
+      { id: 'andrew', name: 'Andrew', householdName: 'Andrew & Fiona' },
+      { id: 'fiona', name: 'Fiona', householdName: 'Andrew & Fiona' },
+      { id: 'luke', name: 'Luke', householdName: "Luke's Family" },
+      { id: 'emma', name: 'Emma', householdName: "Luke's Family" },
+      { id: 'kid1', name: 'Kid 1', householdName: "Luke's Family" },
+      { id: 'kid2', name: 'Kid 2', householdName: "Luke's Family" },
+    ];
+
+    assert.strictEqual(hasAnyHousehold(icelandTravelers), true);
+    const hhOptions = getHouseholdGroups(icelandTravelers);
+    assert.strictEqual(hhOptions.length, 3);
+    assert.strictEqual(hhOptions[2].memberIds.length, 4);
+
+    // Expense 1: Luke pays kr80,000 ISK (8,000,000 cents) split equally across all 8 travelers (kr10,000 each)
+    // Expense 2: Murph pays kr16,000 ISK (1,600,000 cents) split equally across all 8 travelers (kr2,000 each)
+    // Individual net balances:
+    // - Luke: +80,000 - 12,000 = +kr68,000; Emma, Kid 1, Kid 2: -kr12,000 each -> Luke's Family nets to +kr32,000!
+    // - Murph: +16,000 - 12,000 = +kr4,000; Michelle: -kr12,000 -> Murph & Michelle nets to -kr8,000!
+    // - Andrew: -kr12,000; Fiona: -kr12,000 -> Andrew & Fiona nets to -kr24,000!
+    const icelandExpenses: ExpenseRecord[] = [
+      {
+        id: 'ice-1',
+        paidByMemberId: 'luke',
+        amountCents: 8000000,
+        currency: 'ISK',
+        type: 'expense',
+        category: 'Lodging',
+        date: '2026-11-20',
+        fxRates: { ISK: 1, USD: Number((1 / 138).toPrecision(10)) },
+        splits: splitAmountEqually(
+          8000000,
+          icelandTravelers.map((m) => m.id)
+        ),
+      },
+      {
+        id: 'ice-2',
+        paidByMemberId: 'murph',
+        amountCents: 1600000,
+        currency: 'ISK',
+        type: 'expense',
+        category: 'Groceries',
+        date: '2026-11-21',
+        fxRates: { ISK: 1, USD: Number((1 / 138).toPrecision(10)) },
+        splits: splitAmountEqually(
+          1600000,
+          icelandTravelers.map((m) => m.id)
+        ),
+      },
+    ];
+
+    const hhResult = calculateHouseholdReconciliation(
+      icelandTravelers,
+      icelandExpenses,
+      'ISK'
+    );
+
+    assert.strictEqual(hhResult.householdBreakdown.length, 3);
+    const lukeFamily = hhResult.householdBreakdown.find(
+      (h) => h.householdName === "Luke's Family"
+    )!;
+    const murphCouple = hhResult.householdBreakdown.find(
+      (h) => h.householdName === 'Murph & Michelle'
+    )!;
+    const andrewCouple = hhResult.householdBreakdown.find(
+      (h) => h.householdName === 'Andrew & Fiona'
+    )!;
+
+    assert.strictEqual(lukeFamily.netBalanceCents, 3200000);
+    assert.strictEqual(lukeFamily.primaryMemberId, 'luke');
+    assert.strictEqual(murphCouple.netBalanceCents, -800000);
+    assert.strictEqual(murphCouple.primaryMemberId, 'murph');
+    assert.strictEqual(andrewCouple.netBalanceCents, -2400000);
+
+    // Strict zero-sum across households
+    const hhNetSum = hhResult.householdBreakdown.reduce(
+      (acc, h) => acc + h.netBalanceCents,
+      0
+    );
+    assert.strictEqual(hhNetSum, 0);
+
+    // Minimized to exactly 2 inter-household transfers (family members NEVER pay each other)
+    assert.strictEqual(hhResult.settlements.length, 2);
+    assert.strictEqual(hhResult.settlements[0].fromHouseholdName, 'Andrew & Fiona');
+    assert.strictEqual(hhResult.settlements[0].toHouseholdName, "Luke's Family");
+    assert.strictEqual(hhResult.settlements[0].amountCents, 2400000);
+    assert.strictEqual(hhResult.settlements[1].fromHouseholdName, 'Murph & Michelle');
+    assert.strictEqual(hhResult.settlements[1].toHouseholdName, "Luke's Family");
+    assert.strictEqual(hhResult.settlements[1].amountCents, 800000);
+
+    // Unified cross-currency household rollup also preserves zero-sum & 2 transfers
+    const unifiedHh = calculateUnifiedHouseholdReconciliation(
+      icelandTravelers,
+      icelandExpenses,
+      'USD',
+      {}
+    );
+    assert.strictEqual(
+      unifiedHh.householdBreakdown.reduce(
+        (acc, h) => acc + h.netBalanceCents,
+        0
+      ),
+      0
+    );
+    assert.strictEqual(unifiedHh.settlements.length, 2);
   });
 });
 

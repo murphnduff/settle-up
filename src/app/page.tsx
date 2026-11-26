@@ -16,6 +16,10 @@ import {
   calculateCategorySpend,
   calculateUnifiedCategorySpend,
   calculateUnifiedReconciliation,
+  calculateHouseholdReconciliation,
+  calculateUnifiedHouseholdReconciliation,
+  hasAnyHousehold,
+  getHouseholdGroups,
   resolveMemberIdentityFromUrl,
   splitAmountEqually,
   splitAmountByPercentage,
@@ -29,6 +33,9 @@ import {
   SettlementInstruction,
   MemberSummaryRecord,
   CategorySpendRecord,
+  HouseholdSummaryRecord,
+  HouseholdSettlementInstruction,
+  MemberRecord,
 } from "@/lib/reconciliation";
 import {
   SUPPORTED_CURRENCIES,
@@ -95,6 +102,7 @@ import {
   RefreshCw,
   Settings2,
   Search,
+  Home,
 } from "lucide-react";
 import type { User, SupabaseClient } from "@supabase/supabase-js";
 
@@ -407,6 +415,12 @@ export function SettleUpDashboard({
   const [analyticsTab, setAnalyticsTab] = useState<
     "settle" | "members" | "categories"
   >("settle");
+  const [groupByHouseholdPref, setGroupByHouseholdPref] = useState<
+    boolean | null
+  >(null);
+  const [expandedHouseholds, setExpandedHouseholds] = useState<
+    Record<string, boolean>
+  >({});
   const [historyCurrencyFilter, setHistoryCurrencyFilter] =
     useState<string>("all");
   const [historyTypeFilter, setHistoryTypeFilter] = useState<
@@ -542,18 +556,38 @@ export function SettleUpDashboard({
     return () => authListener.subscription.unsubscribe();
   }, [supabase]);
 
-  // Refresh members callback (queries ONLY id, group_id, display_name so it never fails on missing columns)
+  // Refresh members callback (includes household_name with safe fallback on legacy schemas)
   const refreshMembers = useCallback(
     async (groupId: string) => {
       if (!groupId) return;
-      const { data, error } = await supabase
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let data: any[] | null = null;
+      const res = await supabase
         .from("group_members")
-        .select("id, group_id, display_name")
+        .select("id, group_id, display_name, household_name")
         .eq("group_id", groupId);
 
-      if (error) {
-        console.error("Failed to fetch group_members:", error.message);
+      if (
+        res.error &&
+        res.error.message?.toLowerCase().includes("household_name")
+      ) {
+        const fallback = await supabase
+          .from("group_members")
+          .select("id, group_id, display_name")
+          .eq("group_id", groupId);
+        if (fallback.error) {
+          console.error(
+            "Failed to fetch group_members:",
+            fallback.error.message
+          );
+          return;
+        }
+        data = fallback.data;
+      } else if (res.error) {
+        console.error("Failed to fetch group_members:", res.error.message);
         return;
+      } else {
+        data = res.data;
       }
 
       if (data) {
@@ -562,6 +596,8 @@ export function SettleUpDashboard({
           groupId: m.group_id,
           name: m.display_name || "Member",
           displayName: m.display_name || "Member",
+          householdName: m.household_name || null,
+          household_name: m.household_name || null,
         }));
         setMembers(list);
         setSelectedMembers((prev) => {
@@ -739,11 +775,27 @@ export function SettleUpDashboard({
 
     supabase
       .from("group_members")
-      .select("id, group_id, display_name")
+      .select("id, group_id, display_name, household_name")
       .eq("group_id", activeGroupId)
-      .then(({ data, error }) => {
+      .then(async ({ data: initialData, error }) => {
         if (cancelled) return;
-        if (error) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let data: any[] | null = initialData;
+        if (error && error.message?.toLowerCase().includes("household_name")) {
+          const fallback = await supabase
+            .from("group_members")
+            .select("id, group_id, display_name")
+            .eq("group_id", activeGroupId);
+          if (cancelled) return;
+          if (fallback.error) {
+            console.error(
+              "Error loading group_members:",
+              fallback.error.message
+            );
+            return;
+          }
+          data = fallback.data;
+        } else if (error) {
           console.error("Error loading group_members:", error.message);
           return;
         }
@@ -754,6 +806,8 @@ export function SettleUpDashboard({
           groupId: m.group_id,
           name: m.display_name || "Member",
           displayName: m.display_name || "Member",
+          householdName: m.household_name || null,
+          household_name: m.household_name || null,
         }));
         setMembers(list);
         setSelectedMembers(list.map((u) => u.id));
@@ -1158,6 +1212,55 @@ export function SettleUpDashboard({
         numericExchangeRates
       ),
     [members, expenses, unifiedTargetCurrency, numericExchangeRates]
+  );
+
+  // Household / Family Sub-Group Rollup State & Calculations
+  const memberRecordsForMath: MemberRecord[] = useMemo(
+    () =>
+      members.map((m) => ({
+        id: m.id,
+        name: m.name,
+        householdName: m.householdName ?? m.household_name ?? null,
+      })),
+    [members]
+  );
+  const hasHouseholds = useMemo(
+    () => hasAnyHousehold(memberRecordsForMath),
+    [memberRecordsForMath]
+  );
+  const householdGroups = useMemo(
+    () => getHouseholdGroups(memberRecordsForMath),
+    [memberRecordsForMath]
+  );
+  const isHouseholdView = hasHouseholds && (groupByHouseholdPref ?? true);
+
+  const householdByCurrency = useMemo(() => {
+    const map: Record<
+      string,
+      {
+        householdBreakdown: HouseholdSummaryRecord[];
+        settlements: HouseholdSettlementInstruction[];
+      }
+    > = {};
+    for (const code of activeGroupCurrencies) {
+      map[code] = calculateHouseholdReconciliation(
+        memberRecordsForMath,
+        expenses,
+        code
+      );
+    }
+    return map;
+  }, [memberRecordsForMath, expenses, activeGroupCurrencies]);
+
+  const unifiedHouseholdResult = useMemo(
+    () =>
+      calculateUnifiedHouseholdReconciliation(
+        memberRecordsForMath,
+        expenses,
+        unifiedTargetCurrency,
+        numericExchangeRates
+      ),
+    [memberRecordsForMath, expenses, unifiedTargetCurrency, numericExchangeRates]
   );
 
   // Unified Spend by Category Result
@@ -1775,7 +1878,11 @@ export function SettleUpDashboard({
 
   // 1-Click "Settle" button handler in the Settlement Plan
   const handleQuickSettle = (
-    instruction: SettlementInstruction,
+    instruction: {
+      fromMemberId: string;
+      toMemberId: string;
+      amountCents: number;
+    },
     targetCurrencyCode: string
   ) => {
     if (activeGroup?.is_archived) return;
@@ -3051,16 +3158,138 @@ export function SettleUpDashboard({
         </div>
       )}
 
+      {/* Household vs Individual View Toggle (Visible on Settle Up & Members when households exist) */}
+      {hasHouseholds && analyticsTab !== "categories" && (
+        <div className="grid grid-cols-2 bg-indigo-50/70 p-0.5 rounded-xl border border-indigo-100 text-[11px] font-semibold gap-1">
+          <button
+            type="button"
+            onClick={() => setGroupByHouseholdPref(true)}
+            className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 truncate ${
+              isHouseholdView
+                ? "bg-white text-indigo-700 shadow-2xs font-bold"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <Home className="w-3 h-3 shrink-0" />
+            <span className="truncate">Group by Household</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setGroupByHouseholdPref(false)}
+            className={`py-1.5 px-2 rounded-lg transition cursor-pointer flex items-center justify-center gap-1 truncate ${
+              !isHouseholdView
+                ? "bg-white text-blue-700 shadow-2xs font-bold"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <Users className="w-3 h-3 shrink-0" />
+            <span className="truncate">Show Individuals</span>
+          </button>
+        </div>
+      )}
+
       {/* TAB 1: Settle Up (Settlement Plan) */}
       {analyticsTab === "settle" && (
         <div className="space-y-2.5">
           <p className="text-[11px] text-slate-500 leading-snug">
             {hasMultipleCurrencies && isUnifiedMode
-              ? `Unified cross-currency cash-flow minimization into ${unifiedTargetCurrency} using each transaction's locked date rate.`
-              : "Greedy cash-flow minimization pairing largest debtors with largest creditors."}
+              ? `Combined across currencies in ${unifiedTargetCurrency} using each transaction's date rate.`
+              : isHouseholdView
+                ? "Suggested payments by household (family balances cancel out first)."
+                : "Suggested payments to settle up."}
           </p>
 
           {hasMultipleCurrencies && isUnifiedMode ? (
+            isHouseholdView ? (
+              <div className="space-y-2 pt-2 border-t border-slate-100">
+                <div className="flex items-center justify-between text-xs font-bold text-emerald-900">
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
+                    Unified ({unifiedTargetCurrency}) Households
+                  </span>
+                  <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                    {unifiedHouseholdResult.settlements.length === 0
+                      ? "Settled"
+                      : `${unifiedHouseholdResult.settlements.length} transfer(s)`}
+                  </span>
+                </div>
+
+                {unifiedHouseholdResult.settlements.length === 0 ? (
+                  <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                    All combined cross-currency household balances are settled.
+                  </div>
+                ) : (
+                  unifiedHouseholdResult.settlements.map((s, idx) => {
+                    const otherCodes = activeGroupCurrencies.filter(
+                      (c) => c !== normalizeCurrencyCode(unifiedTargetCurrency)
+                    );
+                    const secondaryEquivalents = otherCodes
+                      .map((otherCode) => {
+                        const rate = numericExchangeRates[otherCode];
+                        if (!rate || rate <= 0) return null;
+                        const eqCents = Math.round(s.amountCents * rate);
+                        return formatCurrency(eqCents, otherCode);
+                      })
+                      .filter(Boolean);
+
+                    return (
+                      <div
+                        key={idx}
+                        className="p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl text-xs space-y-1.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="space-y-1 min-w-0">
+                            <div className="text-slate-700">
+                              <span className="font-bold text-slate-900">
+                                {s.fromHouseholdName}
+                              </span>{" "}
+                              pays{" "}
+                              <span className="font-bold text-slate-900">
+                                {s.toHouseholdName}
+                              </span>
+                            </div>
+                            <div className="text-sm font-bold text-emerald-800 flex items-baseline gap-1.5 flex-wrap">
+                              <span>
+                                {formatCurrency(
+                                  s.amountCents,
+                                  unifiedTargetCurrency
+                                )}
+                              </span>
+                              {secondaryEquivalents.length > 0 && (
+                                <span className="text-[11px] font-medium text-emerald-700/80">
+                                  (≈ {secondaryEquivalents.join(" • ")})
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {!activeGroup?.is_archived && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleQuickSettle(
+                                  {
+                                    fromMemberId: s.fromPrimaryMemberId,
+                                    toMemberId: s.toPrimaryMemberId,
+                                    amountCents: s.amountCents,
+                                  },
+                                  unifiedTargetCurrency
+                                )
+                              }
+                              title={`Record payment from ${s.fromHouseholdName} to ${s.toHouseholdName}`}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs transition cursor-pointer shrink-0"
+                            >
+                              <CheckCircle2 className="w-3 h-3" />
+                              <span>Settle</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            ) : (
             <div className="space-y-2 pt-2 border-t border-slate-100">
               <div className="flex items-center justify-between text-xs font-bold text-emerald-900">
                 <span className="flex items-center gap-1.5">
@@ -3142,6 +3371,100 @@ export function SettleUpDashboard({
                 })
               )}
             </div>
+            )
+          ) : isHouseholdView ? (
+            displayCurrencies.map((code, idx) => {
+              const list = householdByCurrency[code]?.settlements || [];
+              const sym = getCurrencySymbol(code);
+              const isSecondary = idx % 2 === 1;
+              return (
+                <div
+                  key={code}
+                  className="space-y-2 pt-2 border-t border-slate-100"
+                >
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          isSecondary ? "bg-indigo-600" : "bg-blue-600"
+                        }`}
+                      ></span>
+                      {code} ({sym}) Households
+                    </span>
+                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                      {list.length === 0
+                        ? "Settled"
+                        : `${list.length} transfer(s)`}
+                    </span>
+                  </div>
+
+                  {list.length === 0 ? (
+                    <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
+                      All {code} household balances are settled up.
+                    </div>
+                  ) : (
+                    list.map((s, sIdx) => (
+                      <div
+                        key={sIdx}
+                        className={`p-3 rounded-xl text-xs space-y-1 border ${
+                          isSecondary
+                            ? "bg-indigo-50/50 border-indigo-100"
+                            : "bg-blue-50/50 border-blue-100"
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="space-y-1 min-w-0">
+                            <div className="text-slate-700">
+                              <span className="font-bold text-slate-900">
+                                {s.fromHouseholdName}
+                              </span>{" "}
+                              pays{" "}
+                              <span className="font-bold text-slate-900">
+                                {s.toHouseholdName}
+                              </span>
+                            </div>
+                            <div
+                              className={`text-sm font-bold ${
+                                isSecondary
+                                  ? "text-indigo-700"
+                                  : "text-blue-700"
+                              }`}
+                            >
+                              {formatCurrency(s.amountCents, code)}
+                            </div>
+                          </div>
+
+                          {!activeGroup?.is_archived && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleQuickSettle(
+                                  {
+                                    fromMemberId: s.fromPrimaryMemberId,
+                                    toMemberId: s.toPrimaryMemberId,
+                                    amountCents: s.amountCents,
+                                  },
+                                  code
+                                )
+                              }
+                              title={`Record payment from ${s.fromHouseholdName} to ${s.toHouseholdName}`}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold text-white shadow-2xs transition cursor-pointer shrink-0 ${
+                                isSecondary
+                                  ? "bg-indigo-600 hover:bg-indigo-700"
+                                  : "bg-blue-600 hover:bg-blue-700"
+                              }`}
+                            >
+                              <CheckCircle2 className="w-3 h-3" />
+                              <span>Settle</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              );
+            })
           ) : (
             displayCurrencies.map((code, idx) => {
               const list = settlementsByCurrency[code] || [];
@@ -3230,147 +3553,311 @@ export function SettleUpDashboard({
         </div>
       )}
 
-      {/* TAB 2: Members (Member Summary Table) */}
+      {/* TAB 2: Members (Unclipped Mobile Stacked Rows + Desktop Table + Expandable Households) */}
       {analyticsTab === "members" && (
         <div className="space-y-2.5">
           <p className="text-[11px] text-slate-500 leading-snug">
             {hasMultipleCurrencies && isUnifiedMode
-              ? `All expenses and payments converted into ${unifiedTargetCurrency} using your active exchange rates.`
-              : "Cumulative out-of-pocket expenses paid vs. accrued share vs. net balance."}
+              ? `All expenses and payments converted into ${unifiedTargetCurrency}.`
+              : isHouseholdView
+                ? "Tap a household row to expand individual members."
+                : "Total paid vs. share of group expenses vs. net balance."}
           </p>
 
           {members.length === 0 ? (
             <div className="p-3 bg-slate-50 rounded-xl text-xs text-slate-400 italic text-center">
               No members in this group yet.
             </div>
-          ) : hasMultipleCurrencies && isUnifiedMode ? (
-            <div className="space-y-2">
-              <div className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-emerald-600"></span>
-                Unified {unifiedTargetCurrency} (
-                {getCurrencySymbol(unifiedTargetCurrency)}) Breakdown
-              </div>
-              <div className="overflow-x-auto border border-emerald-100 rounded-xl">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-emerald-50/60 border-b border-emerald-100 text-slate-600 font-semibold">
-                      <th className="py-2 px-2.5">Member</th>
-                      <th className="py-2 px-2 text-right">Paid</th>
-                      <th className="py-2 px-2 text-right">Share</th>
-                      <th className="py-2 px-2.5 text-right">Net</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {unifiedResult.memberBreakdown.map((row) => {
-                      const paidStr = formatCurrency(
-                        row.paidCents,
-                        unifiedTargetCurrency
-                      );
-                      const shareStr = formatCurrency(
-                        row.shareCents,
-                        unifiedTargetCurrency
-                      );
-                      const absFormatted = formatCurrency(
-                        Math.abs(row.netBalanceCents),
-                        unifiedTargetCurrency
-                      );
-                      const netStr =
-                        row.netBalanceCents > 0
-                          ? `+${absFormatted}`
-                          : row.netBalanceCents < 0
-                            ? `-${absFormatted}`
-                            : formatCurrency(0, unifiedTargetCurrency);
-                      const netColorClass =
-                        row.netBalanceCents > 0
-                          ? "text-emerald-600 font-bold"
-                          : row.netBalanceCents < 0
-                            ? "text-rose-600 font-bold"
-                            : "text-slate-400 font-medium";
+          ) : (() => {
+            const renderSignedNet = (netCents: number, curCode: string) => {
+              const absFormatted = formatCurrency(Math.abs(netCents), curCode);
+              return netCents > 0
+                ? `+${absFormatted}`
+                : netCents < 0
+                  ? `-${absFormatted}`
+                  : formatCurrency(0, curCode);
+            };
+            const netColor = (netCents: number) =>
+              netCents > 0
+                ? "text-emerald-600 font-bold"
+                : netCents < 0
+                  ? "text-rose-600 font-bold"
+                  : "text-slate-400 font-medium";
 
-                      return (
-                        <tr
-                          key={row.memberId}
-                          className="hover:bg-slate-50/60 transition"
-                        >
-                          <td className="py-2 px-2.5 font-semibold text-slate-900">
-                            {row.memberName}
-                            {row.memberId === activeMemberId && (
-                              <span className="ml-1 text-[10px] font-semibold text-blue-600">
-                                (You)
-                              </span>
+            const renderHouseholdOrMemberSection = (
+              curCode: string,
+              title: string | null,
+              dotClass: string,
+              borderClass: string,
+              headerBgClass: string,
+              householdRows: HouseholdSummaryRecord[] | null,
+              individualRows: MemberSummaryRecord[]
+            ) => (
+              <div className="space-y-2">
+                {title && (
+                  <div className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <span className={`w-2 h-2 rounded-full ${dotClass}`}></span>
+                    {title}
+                  </div>
+                )}
+
+                {/* Mobile (< sm): Unclipped 2-line stacked rows */}
+                <div className={`sm:hidden divide-y divide-slate-100 border ${borderClass} rounded-xl overflow-hidden bg-white`}>
+                  {householdRows
+                    ? householdRows.map((hh) => {
+                        const isExpanded = Boolean(
+                          expandedHouseholds[hh.householdKey]
+                        );
+                        return (
+                          <div key={hh.householdKey}>
+                            <div
+                              onClick={
+                                hh.isHousehold
+                                  ? () =>
+                                      setExpandedHouseholds((prev) => ({
+                                        ...prev,
+                                        [hh.householdKey]: !isExpanded,
+                                      }))
+                                  : undefined
+                              }
+                              className={`px-3 py-2.5 space-y-1 ${
+                                hh.isHousehold
+                                  ? "cursor-pointer hover:bg-slate-50/80"
+                                  : ""
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5 min-w-0">
+                                  {hh.isHousehold && (
+                                    <span className="text-indigo-600 text-xs shrink-0">
+                                      {isExpanded ? "▾" : "▸"}
+                                    </span>
+                                  )}
+                                  <span className="font-semibold text-xs text-slate-900 truncate">
+                                    {hh.householdName}
+                                  </span>
+                                  {hh.isHousehold && (
+                                    <span className="text-[10px] font-semibold text-indigo-600 bg-indigo-50 px-1.5 py-0.2 rounded-full shrink-0">
+                                      {hh.members.length}
+                                    </span>
+                                  )}
+                                  {!hh.isHousehold &&
+                                    hh.primaryMemberId === activeMemberId && (
+                                      <span className="text-[10px] font-semibold text-blue-600 shrink-0">
+                                        (You)
+                                      </span>
+                                    )}
+                                </div>
+                                <span
+                                  className={`text-xs whitespace-nowrap shrink-0 ${netColor(
+                                    hh.netBalanceCents
+                                  )}`}
+                                >
+                                  {renderSignedNet(hh.netBalanceCents, curCode)}
+                                </span>
+                              </div>
+                              <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+                                <span>
+                                  Paid{" "}
+                                  <strong className="text-slate-700 font-medium">
+                                    {formatCurrency(hh.paidCents, curCode)}
+                                  </strong>
+                                </span>
+                                <span className="text-slate-300">·</span>
+                                <span>
+                                  Share{" "}
+                                  <strong className="text-slate-700 font-medium">
+                                    {formatCurrency(hh.shareCents, curCode)}
+                                  </strong>
+                                </span>
+                              </div>
+                            </div>
+
+                            {hh.isHousehold && isExpanded && (
+                              <div className="bg-slate-50/80 border-t border-slate-100 divide-y divide-slate-100">
+                                {hh.members.map((m) => (
+                                  <div
+                                    key={m.memberId}
+                                    className="pl-7 pr-3 py-2 space-y-0.5 text-[11px]"
+                                  >
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="font-medium text-slate-800 truncate">
+                                        {m.memberName}
+                                        {m.memberId === activeMemberId && (
+                                          <span className="ml-1 text-[10px] text-blue-600 font-semibold">
+                                            (You)
+                                          </span>
+                                        )}
+                                      </span>
+                                      <span
+                                        className={`whitespace-nowrap shrink-0 ${netColor(
+                                          m.netBalanceCents
+                                        )}`}
+                                      >
+                                        {renderSignedNet(
+                                          m.netBalanceCents,
+                                          curCode
+                                        )}
+                                      </span>
+                                    </div>
+                                    <div className="text-[10px] text-slate-400">
+                                      Paid {formatCurrency(m.paidCents, curCode)}{" "}
+                                      · Share{" "}
+                                      {formatCurrency(m.shareCents, curCode)}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
                             )}
-                          </td>
-                          <td className="py-2 px-2 text-right text-slate-700 font-medium">
-                            {paidStr}
-                          </td>
-                          <td className="py-2 px-2 text-right text-slate-700 font-medium">
-                            {shareStr}
-                          </td>
-                          <td
-                            className={`py-2 px-2.5 text-right ${netColorClass}`}
-                          >
-                            {netStr}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ) : (
-            displayCurrencies.map((code, idx) => {
-              const rows = memberBreakdownByCurrency[code] || [];
-              const sym = getCurrencySymbol(code);
-              return (
-                <div
-                  key={code}
-                  className={`space-y-2 ${
-                    idx > 0 ? "pt-2.5 border-t border-slate-100" : ""
-                  }`}
-                >
-                  {displayCurrencies.length > 1 && (
-                    <div className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                      <span
-                        className={`w-2 h-2 rounded-full ${
-                          idx % 2 === 0 ? "bg-blue-600" : "bg-indigo-600"
-                        }`}
-                      ></span>
-                      {code} ({sym}) Breakdown
-                    </div>
-                  )}
-                  <div className="overflow-x-auto border border-slate-100 rounded-xl">
-                    <table className="w-full text-left border-collapse text-xs">
-                      <thead>
-                        <tr className="bg-slate-50/90 border-b border-slate-100 text-slate-500 font-semibold">
-                          <th className="py-2 px-2.5">Member</th>
-                          <th className="py-2 px-2 text-right">Paid</th>
-                          <th className="py-2 px-2 text-right">Share</th>
-                          <th className="py-2 px-2.5 text-right">Net</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                        {rows.map((row) => {
-                          const paidStr = formatCurrency(row.paidCents, code);
-                          const shareStr = formatCurrency(row.shareCents, code);
-                          const absFormatted = formatCurrency(
-                            Math.abs(row.netBalanceCents),
-                            code
-                          );
-                          const netStr =
-                            row.netBalanceCents > 0
-                              ? `+${absFormatted}`
-                              : row.netBalanceCents < 0
-                                ? `-${absFormatted}`
-                                : formatCurrency(0, code);
-                          const netColorClass =
-                            row.netBalanceCents > 0
-                              ? "text-emerald-600 font-bold"
-                              : row.netBalanceCents < 0
-                                ? "text-rose-600 font-bold"
-                                : "text-slate-400 font-medium";
+                          </div>
+                        );
+                      })
+                    : individualRows.map((row) => (
+                        <div key={row.memberId} className="px-3 py-2.5 space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-xs text-slate-900 truncate">
+                              {row.memberName}
+                              {row.memberId === activeMemberId && (
+                                <span className="ml-1 text-[10px] font-semibold text-blue-600">
+                                  (You)
+                                </span>
+                              )}
+                            </span>
+                            <span
+                              className={`text-xs whitespace-nowrap shrink-0 ${netColor(
+                                row.netBalanceCents
+                              )}`}
+                            >
+                              {renderSignedNet(row.netBalanceCents, curCode)}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+                            <span>
+                              Paid{" "}
+                              <strong className="text-slate-700 font-medium">
+                                {formatCurrency(row.paidCents, curCode)}
+                              </strong>
+                            </span>
+                            <span className="text-slate-300">·</span>
+                            <span>
+                              Share{" "}
+                              <strong className="text-slate-700 font-medium">
+                                {formatCurrency(row.shareCents, curCode)}
+                              </strong>
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                </div>
 
-                          return (
+                {/* Desktop & Tablet (sm+): Clean tabular alignment */}
+                <div className={`hidden sm:block overflow-x-auto border ${borderClass} rounded-xl`}>
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className={`${headerBgClass} border-b ${borderClass} text-slate-500 font-semibold`}>
+                        <th className="py-2 px-2.5">
+                          {householdRows ? "Household / Member" : "Member"}
+                        </th>
+                        <th className="py-2 px-2 text-right">Paid</th>
+                        <th className="py-2 px-2 text-right">Share</th>
+                        <th className="py-2 px-2.5 text-right">Net</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {householdRows
+                        ? householdRows.flatMap((hh) => {
+                            const isExpanded = Boolean(
+                              expandedHouseholds[hh.householdKey]
+                            );
+                            const mainRow = (
+                              <tr
+                                key={hh.householdKey}
+                                onClick={
+                                  hh.isHousehold
+                                    ? () =>
+                                        setExpandedHouseholds((prev) => ({
+                                          ...prev,
+                                          [hh.householdKey]: !isExpanded,
+                                        }))
+                                    : undefined
+                                }
+                                className={`hover:bg-slate-50/60 transition ${
+                                  hh.isHousehold ? "cursor-pointer" : ""
+                                }`}
+                              >
+                                <td className="py-2 px-2.5 font-semibold text-slate-900">
+                                  <span className="inline-flex items-center gap-1.5">
+                                    {hh.isHousehold && (
+                                      <span className="text-indigo-600 text-[11px]">
+                                        {isExpanded ? "▾" : "▸"}
+                                      </span>
+                                    )}
+                                    <span>{hh.householdName}</span>
+                                    {hh.isHousehold && (
+                                      <span className="text-[10px] font-semibold text-indigo-600 bg-indigo-50 px-1.5 rounded-full">
+                                        {hh.members.length}
+                                      </span>
+                                    )}
+                                    {!hh.isHousehold &&
+                                      hh.primaryMemberId === activeMemberId && (
+                                        <span className="text-[10px] font-semibold text-blue-600">
+                                          (You)
+                                        </span>
+                                      )}
+                                  </span>
+                                </td>
+                                <td className="py-2 px-2 text-right text-slate-700 font-medium whitespace-nowrap">
+                                  {formatCurrency(hh.paidCents, curCode)}
+                                </td>
+                                <td className="py-2 px-2 text-right text-slate-700 font-medium whitespace-nowrap">
+                                  {formatCurrency(hh.shareCents, curCode)}
+                                </td>
+                                <td
+                                  className={`py-2 px-2.5 text-right whitespace-nowrap ${netColor(
+                                    hh.netBalanceCents
+                                  )}`}
+                                >
+                                  {renderSignedNet(hh.netBalanceCents, curCode)}
+                                </td>
+                              </tr>
+                            );
+
+                            if (!hh.isHousehold || !isExpanded) {
+                              return [mainRow];
+                            }
+
+                            const childRows = hh.members.map((m) => (
+                              <tr
+                                key={`${hh.householdKey}-${m.memberId}`}
+                                className="bg-slate-50/70 text-[11px]"
+                              >
+                                <td className="py-1.5 pl-7 pr-2 font-medium text-slate-700">
+                                  {m.memberName}
+                                  {m.memberId === activeMemberId && (
+                                    <span className="ml-1 text-[10px] font-semibold text-blue-600">
+                                      (You)
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-1.5 px-2 text-right text-slate-500 whitespace-nowrap">
+                                  {formatCurrency(m.paidCents, curCode)}
+                                </td>
+                                <td className="py-1.5 px-2 text-right text-slate-500 whitespace-nowrap">
+                                  {formatCurrency(m.shareCents, curCode)}
+                                </td>
+                                <td
+                                  className={`py-1.5 px-2.5 text-right whitespace-nowrap ${netColor(
+                                    m.netBalanceCents
+                                  )}`}
+                                >
+                                  {renderSignedNet(m.netBalanceCents, curCode)}
+                                </td>
+                              </tr>
+                            ));
+
+                            return [mainRow, ...childRows];
+                          })
+                        : individualRows.map((row) => (
                             <tr
                               key={row.memberId}
                               className="hover:bg-slate-50/60 transition"
@@ -3383,27 +3870,60 @@ export function SettleUpDashboard({
                                   </span>
                                 )}
                               </td>
-                              <td className="py-2 px-2 text-right text-slate-700 font-medium">
-                                {paidStr}
+                              <td className="py-2 px-2 text-right text-slate-700 font-medium whitespace-nowrap">
+                                {formatCurrency(row.paidCents, curCode)}
                               </td>
-                              <td className="py-2 px-2 text-right text-slate-700 font-medium">
-                                {shareStr}
+                              <td className="py-2 px-2 text-right text-slate-700 font-medium whitespace-nowrap">
+                                {formatCurrency(row.shareCents, curCode)}
                               </td>
                               <td
-                                className={`py-2 px-2.5 text-right ${netColorClass}`}
+                                className={`py-2 px-2.5 text-right whitespace-nowrap ${netColor(
+                                  row.netBalanceCents
+                                )}`}
                               >
-                                {netStr}
+                                {renderSignedNet(row.netBalanceCents, curCode)}
                               </td>
                             </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                          ))}
+                    </tbody>
+                  </table>
                 </div>
+              </div>
+            );
+
+            if (hasMultipleCurrencies && isUnifiedMode) {
+              return renderHouseholdOrMemberSection(
+                unifiedTargetCurrency,
+                `Unified ${unifiedTargetCurrency} (${getCurrencySymbol(unifiedTargetCurrency)}) Breakdown`,
+                "bg-emerald-600",
+                "border-emerald-100",
+                "bg-emerald-50/60",
+                isHouseholdView ? unifiedHouseholdResult.householdBreakdown : null,
+                unifiedResult.memberBreakdown
               );
-            })
-          )}
+            }
+
+            return displayCurrencies.map((code, idx) => (
+              <div
+                key={code}
+                className={idx > 0 ? "pt-2.5 border-t border-slate-100" : ""}
+              >
+                {renderHouseholdOrMemberSection(
+                  code,
+                  displayCurrencies.length > 1
+                    ? `${code} (${getCurrencySymbol(code)}) Breakdown`
+                    : null,
+                  idx % 2 === 0 ? "bg-blue-600" : "bg-indigo-600",
+                  "border-slate-100",
+                  "bg-slate-50/90",
+                  isHouseholdView
+                    ? householdByCurrency[code]?.householdBreakdown || []
+                    : null,
+                  memberBreakdownByCurrency[code] || []
+                )}
+              </div>
+            ));
+          })()}
         </div>
       )}
 
@@ -3532,7 +4052,7 @@ export function SettleUpDashboard({
   const showGroupsSidebar = isSuperAdmin || groups.length > 1 || !activeGroup;
 
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen bg-slate-50 overflow-x-hidden">
       <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 sm:py-3.5 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-8 h-8 rounded-lg bg-blue-600 text-white font-black flex items-center justify-center text-base shadow-2xs shrink-0">
@@ -4097,9 +4617,9 @@ export function SettleUpDashboard({
                   )}
                 </div>
 
-                {/* Primary Actions: 🔗 Copy Link (Group + Member), 💱 Currencies, ⚙️ Manage Menu (or Export CSV for non-admins) */}
-                <div className="flex items-center gap-1.5 flex-wrap shrink-0">
-                  <div className="relative inline-flex items-center">
+                {/* Primary Actions: 🔗 Copy Link (Group + Member) & ⚙️ Manage Menu (Currencies, Members, CSV, Archive) */}
+                <div className="flex items-center gap-1.5 flex-wrap shrink-0 max-w-full">
+                  <div className="relative inline-flex items-center max-w-full">
                     <button
                       type="button"
                       onClick={() => handleCopyGroupOrMemberLink(null)}
@@ -4143,7 +4663,7 @@ export function SettleUpDashboard({
                     </button>
 
                     {activeMemberObj ? (
-                      <div className="inline-flex items-center ml-1.5">
+                      <div className="inline-flex items-center ml-1.5 min-w-0">
                         <button
                           type="button"
                           onClick={() =>
@@ -4152,7 +4672,7 @@ export function SettleUpDashboard({
                           data-copied={
                             copyFeedbackTarget === "member" ? "" : undefined
                           }
-                          className={`min-h-6 min-w-6 inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-l-xl transition shadow-2xs cursor-pointer border border-r-0 ${
+                          className={`min-h-6 min-w-6 inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-l-xl transition shadow-2xs cursor-pointer border border-r-0 max-w-[9.5rem] sm:max-w-none ${
                             copyFeedbackTarget === "member"
                               ? "bg-emerald-600 text-white border-emerald-600"
                               : "bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200"
@@ -4172,7 +4692,9 @@ export function SettleUpDashboard({
                                 className="w-3.5 h-3.5 shrink-0"
                                 aria-hidden="true"
                               />
-                              <span>Copy {activeMemberObj.name}&apos;s Link</span>
+                              <span className="truncate">
+                                {activeMemberObj.name}&apos;s Link
+                              </span>
                             </>
                           )}
                         </button>
@@ -4180,7 +4702,7 @@ export function SettleUpDashboard({
                           type="button"
                           aria-label="Choose member link to copy"
                           onClick={() => setIsCopyMenuOpen((prev) => !prev)}
-                          className="min-h-6 min-w-6 inline-flex items-center justify-center px-1.5 py-1.5 text-xs font-semibold rounded-r-xl transition shadow-2xs cursor-pointer bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200"
+                          className="min-h-6 min-w-6 inline-flex items-center justify-center px-1.5 py-1.5 text-xs font-semibold rounded-r-xl transition shadow-2xs cursor-pointer bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 shrink-0"
                         >
                           <ChevronDown
                             className="w-3.5 h-3.5 shrink-0"
@@ -4194,7 +4716,7 @@ export function SettleUpDashboard({
                           type="button"
                           aria-label="Choose member link to copy"
                           onClick={() => setIsCopyMenuOpen((prev) => !prev)}
-                          className="min-h-6 min-w-6 inline-flex items-center justify-center px-1.5 py-1.5 text-xs font-semibold rounded-r-xl transition shadow-2xs cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200"
+                          className="min-h-6 min-w-6 inline-flex items-center justify-center px-1.5 py-1.5 text-xs font-semibold rounded-r-xl transition shadow-2xs cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 shrink-0"
                         >
                           <ChevronDown
                             className="w-3.5 h-3.5 shrink-0"
@@ -4247,27 +4769,6 @@ export function SettleUpDashboard({
                     )}
                   </div>
 
-                  {isSuperAdmin && !activeGroup.is_archived && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingGroupCurrencies(activeGroupCurrencies);
-                        setEditingDefaultCurrency(activeDefaultCurrency);
-                        setCustomIsoInput("");
-                        setIsCurrencyModalOpen(true);
-                      }}
-                      title="Configure enabled currencies for this group"
-                      className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-xl transition shadow-2xs bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 cursor-pointer"
-                    >
-                      <Globe className="w-3.5 h-3.5 shrink-0 text-blue-600" />
-                      <span>
-                        {activeGroupCurrencies.length > 1
-                          ? `Currencies (${activeGroupCurrencies.join(", ")})`
-                          : "Currencies"}
-                      </span>
-                    </button>
-                  )}
-
                   {isSuperAdmin ? (
                     <div className="relative">
                       <button
@@ -4285,19 +4786,41 @@ export function SettleUpDashboard({
                       </button>
 
                       {isManageMenuOpen && (
-                        <div className="absolute right-0 mt-1.5 w-48 bg-white border border-slate-200 rounded-xl shadow-lg p-1.5 z-30 space-y-1 text-xs">
+                        <div className="absolute right-0 mt-1.5 w-52 bg-white border border-slate-200 rounded-xl shadow-lg p-1.5 z-30 space-y-1 text-xs">
                           {!activeGroup.is_archived && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsManageMenuOpen(false);
-                                setIsInviteModalOpen(true);
-                              }}
-                              className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 transition cursor-pointer text-left"
-                            >
-                              <UserPlus className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                              <span>Manage Members</span>
-                            </button>
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsManageMenuOpen(false);
+                                  setIsInviteModalOpen(true);
+                                }}
+                                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 transition cursor-pointer text-left"
+                              >
+                                <UserPlus className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                                <span>Manage Members</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsManageMenuOpen(false);
+                                  setEditingGroupCurrencies(
+                                    activeGroupCurrencies
+                                  );
+                                  setEditingDefaultCurrency(
+                                    activeDefaultCurrency
+                                  );
+                                  setCustomIsoInput("");
+                                  setIsCurrencyModalOpen(true);
+                                }}
+                                className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 transition cursor-pointer text-left"
+                              >
+                                <Globe className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                                <span className="truncate">
+                                  Currencies ({activeGroupCurrencies.join(", ")})
+                                </span>
+                              </button>
+                            </>
                           )}
                           <button
                             type="button"
@@ -5095,6 +5618,49 @@ export function SettleUpDashboard({
 
                   {type === "payment" || splitMode === "equal" ? (
                     <>
+                      {type === "expense" && householdGroups.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5 pb-1">
+                          <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mr-0.5">
+                            Households:
+                          </span>
+                          {householdGroups.map((hh) => {
+                            const allIn = hh.memberIds.every((id) =>
+                              selectedMembers.includes(id)
+                            );
+                            return (
+                              <button
+                                key={hh.householdKey}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedMembers((prev) => {
+                                    if (allIn) {
+                                      return prev.filter(
+                                        (id) => !hh.memberIds.includes(id)
+                                      );
+                                    }
+                                    const nextSet = new Set(prev);
+                                    for (const id of hh.memberIds)
+                                      nextSet.add(id);
+                                    return Array.from(nextSet);
+                                  });
+                                }}
+                                className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border transition cursor-pointer flex items-center gap-1 ${
+                                  allIn
+                                    ? "bg-indigo-600 text-white border-indigo-600 shadow-2xs"
+                                    : "bg-indigo-50/70 text-indigo-800 border-indigo-200 hover:bg-indigo-100"
+                                }`}
+                              >
+                                <span>🏠</span>
+                                <span>{hh.householdName}</span>
+                                <span className="opacity-75">
+                                  ({hh.memberIds.length})
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+
                       <div className="flex flex-wrap gap-1.5">
                         {members.map((m) => {
                           const isSelected = selectedMembers.includes(m.id);

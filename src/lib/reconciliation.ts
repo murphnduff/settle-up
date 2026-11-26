@@ -63,6 +63,7 @@ export function buildGroupCategories(
 export interface MemberRecord {
   id: string;
   name: string;
+  householdName?: string | null;
 }
 
 export interface SplitRecord {
@@ -927,6 +928,305 @@ export function calculateUnifiedReconciliation(
   return {
     targetCurrency: targetCode,
     memberBreakdown,
+    settlements,
+  };
+}
+
+// ============================================================================
+// Household / Family Sub-Group Rollup Helpers
+// ============================================================================
+
+export interface HouseholdMemberDetail {
+  memberId: string;
+  memberName: string;
+  paidCents: number;
+  shareCents: number;
+  netBalanceCents: number;
+}
+
+export interface HouseholdSummaryRecord {
+  householdKey: string;
+  householdName: string;
+  isHousehold: boolean;
+  primaryMemberId: string;
+  primaryMemberName: string;
+  paidCents: number;
+  shareCents: number;
+  netBalanceCents: number;
+  members: HouseholdMemberDetail[];
+}
+
+export interface HouseholdSettlementInstruction {
+  fromHouseholdKey: string;
+  fromHouseholdName: string;
+  fromPrimaryMemberId: string;
+  toHouseholdKey: string;
+  toHouseholdName: string;
+  toPrimaryMemberId: string;
+  amountCents: number;
+  amountFormatted: string;
+  currency: string;
+}
+
+export interface HouseholdGroupOption {
+  householdKey: string;
+  householdName: string;
+  memberIds: string[];
+}
+
+export function hasAnyHousehold(members: MemberRecord[]): boolean {
+  return members.some((m) => (m.householdName || '').trim().length > 0);
+}
+
+/**
+ * Extracts distinct non-empty household sub-groups in first-seen order
+ * for quick-select chips in Add/Edit Transaction and Manage Members.
+ */
+export function getHouseholdGroups(
+  members: MemberRecord[]
+): HouseholdGroupOption[] {
+  const byKey = new Map<string, HouseholdGroupOption>();
+  for (const m of members) {
+    const trimmed = (m.householdName || '').trim();
+    if (!trimmed) continue;
+    const key = `hh:${trimmed.toLowerCase()}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.memberIds.push(m.id);
+    } else {
+      byKey.set(key, {
+        householdKey: key,
+        householdName: trimmed,
+        memberIds: [m.id],
+      });
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+/**
+ * Aggregates individual member Paid, Share, and Net Balance rows by `household_name`
+ * (case-insensitive grouping; members without a `household_name` remain 1-person units).
+ *
+ * Selects each household's `primaryMemberId` deterministically as the member with the
+ * largest combined paid + net activity so recorded settlement payments use valid member IDs.
+ */
+export function groupMemberBreakdownByHousehold(
+  members: MemberRecord[],
+  memberBreakdown: MemberSummaryRecord[]
+): HouseholdSummaryRecord[] {
+  const memberMetaMap = new Map<string, MemberRecord>();
+  for (const m of members) {
+    memberMetaMap.set(m.id, m);
+  }
+
+  const buckets = new Map<
+    string,
+    {
+      householdKey: string;
+      householdName: string;
+      isHousehold: boolean;
+      paidCents: number;
+      shareCents: number;
+      netBalanceCents: number;
+      members: HouseholdMemberDetail[];
+    }
+  >();
+
+  for (const row of memberBreakdown) {
+    const meta = memberMetaMap.get(row.memberId);
+    const trimmedHousehold = (meta?.householdName || '').trim();
+    const isHousehold = trimmedHousehold.length > 0;
+    const key = isHousehold
+      ? `hh:${trimmedHousehold.toLowerCase()}`
+      : `ind:${row.memberId}`;
+    const displayName = isHousehold ? trimmedHousehold : row.memberName;
+
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = {
+        householdKey: key,
+        householdName: displayName,
+        isHousehold,
+        paidCents: 0,
+        shareCents: 0,
+        netBalanceCents: 0,
+        members: [],
+      };
+      buckets.set(key, bucket);
+    }
+
+    bucket.paidCents += row.paidCents;
+    bucket.shareCents += row.shareCents;
+    bucket.netBalanceCents += row.netBalanceCents;
+    bucket.members.push({
+      memberId: row.memberId,
+      memberName: row.memberName,
+      paidCents: row.paidCents,
+      shareCents: row.shareCents,
+      netBalanceCents: row.netBalanceCents,
+    });
+  }
+
+  return Array.from(buckets.values()).map((b) => {
+    let primary = b.members[0];
+    let bestScore = -1;
+    for (const m of b.members) {
+      const score = Math.abs(m.paidCents) + Math.abs(m.netBalanceCents);
+      if (
+        score > bestScore ||
+        (score === bestScore && m.paidCents > (primary?.paidCents ?? -1))
+      ) {
+        bestScore = score;
+        primary = m;
+      }
+    }
+
+    return {
+      householdKey: b.householdKey,
+      householdName: b.householdName,
+      isHousehold: b.isHousehold,
+      primaryMemberId: primary?.memberId || '',
+      primaryMemberName: primary?.memberName || b.householdName,
+      paidCents: b.paidCents,
+      shareCents: b.shareCents,
+      netBalanceCents: b.netBalanceCents,
+      members: b.members,
+    };
+  });
+}
+
+/**
+ * Runs greedy cash-flow minimization on already-netted household balances so
+ * intra-household balances cancel out BEFORE computing inter-household transfers.
+ */
+export function calculateHouseholdSettlementsFromBreakdown(
+  householdBreakdown: HouseholdSummaryRecord[],
+  currency: string
+): HouseholdSettlementInstruction[] {
+  const code = normalizeCurrencyCode(currency);
+  const debtors: Array<{
+    householdKey: string;
+    householdName: string;
+    primaryMemberId: string;
+    amountCents: number;
+  }> = [];
+  const creditors: Array<{
+    householdKey: string;
+    householdName: string;
+    primaryMemberId: string;
+    amountCents: number;
+  }> = [];
+
+  for (const row of householdBreakdown) {
+    if (row.netBalanceCents < 0) {
+      debtors.push({
+        householdKey: row.householdKey,
+        householdName: row.householdName,
+        primaryMemberId: row.primaryMemberId,
+        amountCents: Math.abs(row.netBalanceCents),
+      });
+    } else if (row.netBalanceCents > 0) {
+      creditors.push({
+        householdKey: row.householdKey,
+        householdName: row.householdName,
+        primaryMemberId: row.primaryMemberId,
+        amountCents: row.netBalanceCents,
+      });
+    }
+  }
+
+  debtors.sort((a, b) => b.amountCents - a.amountCents);
+  creditors.sort((a, b) => b.amountCents - a.amountCents);
+
+  const instructions: HouseholdSettlementInstruction[] = [];
+  let d = 0;
+  let c = 0;
+
+  while (d < debtors.length && c < creditors.length) {
+    const debtor = debtors[d];
+    const creditor = creditors[c];
+    const transferCents = Math.min(debtor.amountCents, creditor.amountCents);
+
+    if (transferCents > 0) {
+      instructions.push({
+        fromHouseholdKey: debtor.householdKey,
+        fromHouseholdName: debtor.householdName,
+        fromPrimaryMemberId: debtor.primaryMemberId,
+        toHouseholdKey: creditor.householdKey,
+        toHouseholdName: creditor.householdName,
+        toPrimaryMemberId: creditor.primaryMemberId,
+        amountCents: transferCents,
+        amountFormatted: (transferCents / 100).toFixed(2),
+        currency: code,
+      });
+    }
+
+    debtor.amountCents -= transferCents;
+    creditor.amountCents -= transferCents;
+
+    if (debtor.amountCents === 0) d++;
+    if (creditor.amountCents === 0) c++;
+  }
+
+  return instructions;
+}
+
+/**
+ * Per-currency Household rollup & settlement plan.
+ */
+export function calculateHouseholdReconciliation(
+  members: MemberRecord[],
+  expenses: ExpenseRecord[],
+  currency: string = 'USD'
+): {
+  currency: string;
+  householdBreakdown: HouseholdSummaryRecord[];
+  settlements: HouseholdSettlementInstruction[];
+} {
+  const code = normalizeCurrencyCode(currency);
+  const individualBreakdown = calculateMemberBreakdown(members, expenses, code);
+  const householdBreakdown = groupMemberBreakdownByHousehold(
+    members,
+    individualBreakdown
+  );
+  const settlements = calculateHouseholdSettlementsFromBreakdown(
+    householdBreakdown,
+    code
+  );
+  return { currency: code, householdBreakdown, settlements };
+}
+
+/**
+ * Unified cross-currency Household rollup & settlement plan.
+ */
+export function calculateUnifiedHouseholdReconciliation(
+  members: MemberRecord[],
+  expenses: ExpenseRecord[],
+  targetCurrency: string = 'USD',
+  exchangeRates: Record<string, number> = {}
+): {
+  targetCurrency: string;
+  householdBreakdown: HouseholdSummaryRecord[];
+  settlements: HouseholdSettlementInstruction[];
+} {
+  const unified = calculateUnifiedReconciliation(
+    members,
+    expenses,
+    targetCurrency,
+    exchangeRates
+  );
+  const householdBreakdown = groupMemberBreakdownByHousehold(
+    members,
+    unified.memberBreakdown
+  );
+  const settlements = calculateHouseholdSettlementsFromBreakdown(
+    householdBreakdown,
+    unified.targetCurrency
+  );
+  return {
+    targetCurrency: unified.targetCurrency,
+    householdBreakdown,
     settlements,
   };
 }

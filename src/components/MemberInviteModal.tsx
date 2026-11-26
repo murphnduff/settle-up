@@ -15,6 +15,7 @@ import {
   Edit2,
   Share2,
   Link2,
+  Home,
 } from "lucide-react";
 
 export function generateGroupSlug(name: string): string {
@@ -29,6 +30,8 @@ export interface GroupMember {
   groupId?: string;
   name: string; // display_name
   displayName?: string;
+  householdName?: string | null; // household_name
+  household_name?: string | null;
 }
 
 export interface Group {
@@ -67,8 +70,9 @@ export default function MemberInviteModal({
   const supabase = createClient();
   const dialogRef = useRef<HTMLDialogElement>(null);
 
-  // Form state for adding a member (display_name only)
+  // Form state for adding a member (display_name + optional household_name)
   const [displayName, setDisplayName] = useState("");
+  const [newHouseholdName, setNewHouseholdName] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{
     type: "success" | "error" | "info" | "warning";
@@ -83,9 +87,21 @@ export default function MemberInviteModal({
   const groupCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const memberCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Renaming state
+  // Renaming & household assignment state
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [editingHousehold, setEditingHousehold] = useState("");
+
+  // Existing household names in this group for 1-tap quick-pick pills
+  const existingHouseholds = Array.from(
+    currentMembers.reduce((map, m) => {
+      const hh = (m.householdName || m.household_name || "").trim();
+      if (hh && !map.has(hh.toLowerCase())) {
+        map.set(hh.toLowerCase(), hh);
+      }
+      return map;
+    }, new Map<string, string>()).values()
+  );
 
   // Sync native <dialog> element with isOpen prop
   useEffect(() => {
@@ -106,7 +122,9 @@ export default function MemberInviteModal({
   const handleClose = () => {
     setStatusMessage(null);
     setDisplayName("");
+    setNewHouseholdName("");
     setEditingMemberId(null);
+    setEditingHousehold("");
     onClose();
   };
 
@@ -246,14 +264,35 @@ export default function MemberInviteModal({
     setStatusMessage(null);
 
     try {
-      const { data: insertedRow, error: insertError } = await supabase
+      const trimmedHousehold = newHouseholdName.trim() || null;
+      const insertPayload: Record<string, unknown> = {
+        group_id: group.id,
+        display_name: trimmedName,
+        household_name: trimmedHousehold,
+      };
+      let { data: insertedRow, error: insertError } = await supabase
         .from("group_members")
-        .insert({
-          group_id: group.id,
-          display_name: trimmedName,
-        })
-        .select("id, group_id, display_name")
+        .insert(insertPayload)
+        .select("id, group_id, display_name, household_name")
         .single();
+
+      if (
+        insertError &&
+        insertError.message?.toLowerCase().includes("household_name")
+      ) {
+        const retry = await supabase
+          .from("group_members")
+          .insert({
+            group_id: group.id,
+            display_name: trimmedName,
+          })
+          .select("id, group_id, display_name")
+          .single();
+        insertedRow = retry.data
+          ? { ...retry.data, household_name: null }
+          : null;
+        insertError = retry.error;
+      }
 
       if (insertError || !insertedRow) {
         setStatusMessage({
@@ -268,14 +307,17 @@ export default function MemberInviteModal({
         groupId: insertedRow.group_id,
         name: insertedRow.display_name || trimmedName,
         displayName: insertedRow.display_name || trimmedName,
+        householdName: insertedRow.household_name ?? trimmedHousehold,
+        household_name: insertedRow.household_name ?? trimmedHousehold,
       };
 
       setDisplayName("");
+      setNewHouseholdName("");
       await onMemberAdded(addedMember);
 
       setStatusMessage({
         type: "success",
-        text: `Added "${trimmedName}"! Share the group link or their direct link below.`,
+        text: `Added "${trimmedName}"${trimmedHousehold ? ` (${trimmedHousehold})` : ""}! Share the group link or their direct link below.`,
       });
     } catch (err: unknown) {
       const message =
@@ -286,7 +328,7 @@ export default function MemberInviteModal({
     }
   };
 
-  // Rename member
+  // Rename member & update household assignment
   const handleRenameMember = async (memberId: string) => {
     const trimmed = editingName.trim();
     if (!trimmed) {
@@ -307,19 +349,32 @@ export default function MemberInviteModal({
       return;
     }
 
-    const { error } = await supabase
+    const trimmedHousehold = editingHousehold.trim() || null;
+    let { error } = await supabase
       .from("group_members")
-      .update({ display_name: trimmed })
+      .update({
+        display_name: trimmed,
+        household_name: trimmedHousehold,
+      })
       .eq("id", memberId);
+
+    if (error && error.message?.toLowerCase().includes("household_name")) {
+      const retry = await supabase
+        .from("group_members")
+        .update({ display_name: trimmed })
+        .eq("id", memberId);
+      error = retry.error;
+    }
 
     if (error) {
       setStatusMessage({
         type: "error",
-        text: `Failed to rename: ${error.message}`,
+        text: `Failed to update member: ${error.message}`,
       });
     } else {
       setEditingMemberId(null);
       setEditingName("");
+      setEditingHousehold("");
       await onMemberAdded();
     }
   };
@@ -502,6 +557,46 @@ export default function MemberInviteModal({
                 {isSubmitting ? "Adding..." : "Add Member"}
               </button>
             </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <Home className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                <input
+                  type="text"
+                  placeholder="Optional Household / Family (e.g. Murph & Michelle)"
+                  value={newHouseholdName}
+                  onChange={(e) => setNewHouseholdName(e.target.value)}
+                  disabled={isSubmitting}
+                  className="flex-1 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-900 placeholder:text-slate-400 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition"
+                />
+              </div>
+              {existingHouseholds.length > 0 && (
+                <div className="flex items-center gap-1 flex-wrap pl-5">
+                  <span className="text-[10px] font-semibold text-slate-400 mr-0.5">
+                    Quick-pick:
+                  </span>
+                  {existingHouseholds.map((hh) => (
+                    <button
+                      key={hh}
+                      type="button"
+                      onClick={() =>
+                        setNewHouseholdName((prev) =>
+                          prev.trim().toLowerCase() === hh.toLowerCase()
+                            ? ""
+                            : hh
+                        )
+                      }
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border transition cursor-pointer ${
+                        newHouseholdName.trim().toLowerCase() === hh.toLowerCase()
+                          ? "bg-indigo-600 text-white border-indigo-600"
+                          : "bg-white text-slate-600 border-slate-200 hover:bg-indigo-50"
+                      }`}
+                    >
+                      {hh}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </form>
         ) : (
           <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 flex items-center gap-2">
@@ -560,38 +655,82 @@ export default function MemberInviteModal({
 
                       <div className="min-w-0 flex-1">
                         {isEditing ? (
-                          <div className="flex items-center gap-1.5">
-                            <input
-                              type="text"
-                              value={editingName}
-                              onChange={(e) => setEditingName(e.target.value)}
-                              className="border border-slate-300 rounded px-2 py-0.5 text-xs text-slate-900 bg-white"
-                              autoFocus
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") {
-                                  handleRenameMember(member.id);
-                                } else if (e.key === "Escape") {
-                                  setEditingMemberId(null);
+                          <div className="space-y-1.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <input
+                                type="text"
+                                value={editingName}
+                                onChange={(e) => setEditingName(e.target.value)}
+                                className="border border-slate-300 rounded px-2 py-0.5 text-xs text-slate-900 bg-white w-28 sm:w-36"
+                                autoFocus
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    handleRenameMember(member.id);
+                                  } else if (e.key === "Escape") {
+                                    setEditingMemberId(null);
+                                  }
+                                }}
+                              />
+                              <input
+                                type="text"
+                                placeholder="Household (optional)"
+                                value={editingHousehold}
+                                onChange={(e) =>
+                                  setEditingHousehold(e.target.value)
                                 }
-                              }}
-                            />
-                            <button
-                              type="button"
-                              onClick={() => handleRenameMember(member.id)}
-                              className="text-emerald-600 hover:text-emerald-700 font-bold px-1 cursor-pointer"
-                            >
-                              Save
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setEditingMemberId(null)}
-                              className="text-slate-400 hover:text-slate-600 px-1 cursor-pointer"
-                            >
-                              Cancel
-                            </button>
+                                className="border border-slate-300 rounded px-2 py-0.5 text-xs text-slate-900 bg-white w-32 sm:w-40"
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    handleRenameMember(member.id);
+                                  } else if (e.key === "Escape") {
+                                    setEditingMemberId(null);
+                                  }
+                                }}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleRenameMember(member.id)}
+                                className="text-emerald-600 hover:text-emerald-700 font-bold px-1 cursor-pointer"
+                              >
+                                Save
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setEditingMemberId(null)}
+                                className="text-slate-400 hover:text-slate-600 px-1 cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                            {existingHouseholds.length > 0 && (
+                              <div className="flex items-center gap-1 flex-wrap">
+                                {existingHouseholds.map((hh) => (
+                                  <button
+                                    key={hh}
+                                    type="button"
+                                    onClick={() =>
+                                      setEditingHousehold((prev) =>
+                                        prev.trim().toLowerCase() ===
+                                        hh.toLowerCase()
+                                          ? ""
+                                          : hh
+                                      )
+                                    }
+                                    className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold border transition cursor-pointer ${
+                                      editingHousehold.trim().toLowerCase() ===
+                                      hh.toLowerCase()
+                                        ? "bg-indigo-600 text-white border-indigo-600"
+                                        : "bg-white text-slate-600 border-slate-200 hover:bg-indigo-50"
+                                    }`}
+                                  >
+                                    {hh}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         ) : (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex items-center gap-1.5 flex-wrap">
                             <span className="font-semibold text-slate-900 truncate">
                               {member.name}
                             </span>
@@ -600,14 +739,27 @@ export default function MemberInviteModal({
                                 (You)
                               </span>
                             )}
+                            {(member.householdName || member.household_name) && (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200/80">
+                                <Home className="w-2.5 h-2.5 shrink-0" />
+                                <span>
+                                  {member.householdName || member.household_name}
+                                </span>
+                              </span>
+                            )}
                             {canEditThisMember && (
                               <button
                                 type="button"
                                 onClick={() => {
                                   setEditingMemberId(member.id);
                                   setEditingName(member.name);
+                                  setEditingHousehold(
+                                    member.householdName ||
+                                      member.household_name ||
+                                      ""
+                                  );
                                 }}
-                                title="Rename member"
+                                title="Edit member name or household"
                                 className="text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
                               >
                                 <Edit2 className="w-3 h-3" />

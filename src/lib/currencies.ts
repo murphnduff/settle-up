@@ -108,12 +108,17 @@ export function getCurrencySymbol(raw?: string | null): string {
   return info.symbol === "CHF" ? "CHF " : info.symbol;
 }
 
+const ZERO_DECIMAL_CURRENCIES = new Set(["ISK", "JPY"]);
+
 /**
  * Formats an integer cent amount with the appropriate symbol prefix and thousands separators.
+ * High-denomination / zero-decimal currencies (ISK, JPY) omit `.00` on whole-unit amounts
+ * unless non-zero fractional cents exist from split rounding.
  * Examples:
  * - formatCurrency(2500, 'USD') -> '$25.00'
  * - formatCurrency(4000, 'AUD') -> 'A$40.00'
  * - formatCurrency(125000, 'THB') -> '฿1,250.00'
+ * - formatCurrency(150000, 'ISK') -> 'kr1,500'
  * - formatCurrency(1500, 'EUR') -> '€15.00'
  */
 export function formatCurrency(
@@ -122,10 +127,14 @@ export function formatCurrency(
 ): string {
   const safeCents = Number.isFinite(cents) ? Math.round(cents) : 0;
   const isNegative = safeCents < 0;
-  const absDollars = Math.abs(safeCents) / 100;
+  const absCents = Math.abs(safeCents);
+  const absDollars = absCents / 100;
+  const normalizedCode = normalizeCurrencyCode(currencyCode);
+  const omitWholeDecimals =
+    ZERO_DECIMAL_CURRENCIES.has(normalizedCode) && absCents % 100 === 0;
   const formattedNumber = absDollars.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    minimumFractionDigits: omitWholeDecimals ? 0 : 2,
+    maximumFractionDigits: omitWholeDecimals ? 0 : 2,
   });
 
   const symbol = getCurrencySymbol(currencyCode);

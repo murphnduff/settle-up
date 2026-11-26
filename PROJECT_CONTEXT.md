@@ -30,7 +30,7 @@
 
 ### 2.2 Database Tables & Schema
 - **`groups`**: `id` (UUID PK), `name` (TEXT), `slug` (TEXT UNIQUE), `created_by` (UUID FK Nullable), `is_archived` (BOOLEAN DEFAULT false), `currencies` (TEXT[] DEFAULT `ARRAY['USD']`), `default_currency` (TEXT DEFAULT `'USD'`), `exchange_rates` (JSONB DEFAULT `'{}'`), `created_at` (TIMESTAMPTZ).
-- **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL). Unique constraint on `(group_id, lower(display_name))`.
+- **`group_members`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `display_name` (TEXT NOT NULL), `household_name` (TEXT DEFAULT NULL — optional family/couple sub-group label for household balance rollup). Unique constraint on `(group_id, lower(display_name))`.
 - **`heartbeat_logs`**: `id` (UUID PK), `triggered_by` (TEXT), `groups_count` (INTEGER), `created_at` (TIMESTAMPTZ DEFAULT `now()`).
 - **`expenses`**: `id` (UUID PK), `group_id` (UUID FK CASCADE), `type` (`'expense'` | `'payment'`), `description` (TEXT), `category` (TEXT NOT NULL DEFAULT `'General'`), `receipt_url` (TEXT NULLABLE), `amount_cents` (INTEGER > 0), `currency` (TEXT — any 3-letter ISO currency code such as `'USD'`, `'EUR'`, `'AUD'`, `'THB'`, `'GBP'`, `'CAD'`, `'JPY'`, `'NZD'`, `'CHF'`, `'MXN'`), `fx_rates` (JSONB DEFAULT NULL — transaction-time locked conversion rates normalized as `1 expense.currency = X targetCurrency`), `date` (DATE NOT NULL), `paid_by_member_id` (UUID FK), `created_at` (TIMESTAMPTZ).
 - **`expense_splits`**: `id` (UUID PK), `expense_id` (UUID FK CASCADE), `member_id` (UUID FK), `split_amount_cents` (INTEGER >= 0), `created_at` (TIMESTAMPTZ).
@@ -118,7 +118,8 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Supported Currency Catalog (`SUPPORTED_CURRENCIES`):**
   - First-class support for `USD` (`$`), `EUR` (`€`), `AUD` (`A$`), `THB` (`฿`), `GBP` (`£`), `CAD` (`C$`), `JPY` (`¥`), `NZD` (`NZ$`), `CHF` (`CHF`), `MXN` (`Mex$`), and `ISK` (`kr`), plus any custom 3-letter ISO currency code via `formatCurrency(cents, currencyCode)`.
 - **Per-Group Currency Management:**
-  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency pill selection and custom 3-letter ISO code entry in both **Create Group** and the **Manage Group Currencies** modal (`Currencies` button in the group header) for the Super-Admin (`murph@murphnduff.org`).
+  - New groups default to `currencies = ['USD']` and `default_currency = 'USD'`, with optional multi-currency pill selection and custom 3-letter ISO code entry in both **Create Group** and the **Manage Group Currencies** modal (inside the `⚙️ Manage` menu in the group header) for the Super-Admin (`murph@murphnduff.org`).
+  - **Zero-Decimal Formatting:** `formatCurrency` omits `.00` trailing decimals on whole-unit `ISK` and `JPY` amounts unless fractional cents exist.
   - **Clean Single-Currency UX:** Groups with only 1 currency enabled hide currency switcher tabs and dropdowns so the UI stays minimal.
   - **Auto-Enable on AI Receipt Scan & CSV Import:** Scanning a receipt or importing a CSV with a new currency automatically appends that currency to `group.currencies`.
 - **Transaction-Time Locked FX Rates (`fetchTransactionFxRates` & `expenses.fx_rates`):**
@@ -130,10 +131,10 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 - **Single-Line Top Navbar & Collapsible Mobile Group Switcher (`< lg`):**
   - Hides the header subtitle on mobile (`hidden sm:block`) and collapses the Groups/Create Group sidebar into a compact top bar button (`📂 Groups (<Active Group>) ▾ Switch`) when viewing a group on mobile so the active group header, balances, and transaction form appear immediately above the fold. On desktop (`lg+`), the left sidebar remains visible and sticky (`lg:sticky lg:top-6`).
 - **Compact 2-Row Group Header Card:**
-  - **Row 1:** Group Name, member count pill, inline spent summary pills (`$X Spent` per currency + `N txns`), primary `Copy Link` and `Currencies` buttons, and a compact `⚙️ Manage` dropdown menu (`Manage Members`, `Export CSV`, and `Archive / Unarchive Group`).
+  - **Row 1:** Group Name, member count pill, inline spent summary pills (`$X Spent` per currency + `N txns`), primary `Copy Link` control (general + personalized member links), and a compact `⚙️ Manage` dropdown menu (`Manage Members`, `Currencies`, `Export CSV`, and `Archive / Unarchive Group`) to prevent horizontal overflow on narrow mobile screens.
   - **Row 2:** Single horizontal identity bar (`Viewing as: [Murph] [Fitz (You)] [Kev] • Reset`).
 - **Unified Tabbed "Balances & Analytics" Card (`💸 Settle Up` | `👥 Members` | `🏷️ Categories`):**
-  - Consolidates **Settlement Plan** (`💸 Settle Up` with 1-click `Settle` buttons and Unified Settlement converter), **Member Summary** (`👥 Members`), and **Spend by Category** (`🏷️ Categories`) into a single 3-tab card placed in the sticky right column on desktop (`lg:sticky lg:top-6`) and directly below **Add Transaction** on mobile (`lg:hidden`).
+  - Consolidates **Settlement Plan** (`💸 Settle Up` with 1-click `Settle` buttons and Unified Settlement converter), **Member Summary** (`👥 Members` with unclipped 2-line stacked rows on mobile and `sm+` table), and **Spend by Category** (`🏷️ Categories`) into a single 3-tab card placed in the sticky right column on desktop (`lg:sticky lg:top-6`) and directly below **Add Transaction** on mobile (`lg:hidden`). When `household_name` values exist, **Settle Up** and **Members** default to **Group by Household** with a `Show Individuals` toggle and expandable `▸` / `▾` household rows.
 - **Top-of-View "Add Transaction" Form & Ledger Filtering:**
   - Positioned at the very top of the default group view right beneath the compact Group Header on both Desktop (`lg+`, expanding to `lg:col-span-3` when a single-group non-admin visitor has no left sidebar) and Mobile (`< lg`, above Balances & Analytics and Transaction History).
   - Compact 1-line receipt bar (`grid-cols-3` buttons on mobile), 2-column `Paid By` + `Amount` grid on both mobile and desktop, 3-column `Description` + `Date` row, and tight category/participant pills.
@@ -197,3 +198,9 @@ $$\text{Net Balance}(u) = \sum \text{Paid Expenses}(u) - \sum \text{Split Shares
 16. ✅ **Remote MCP Endpoint (`/api/mcp`):**
     - Exposed Settle Up as a stateless Streamable HTTP MCP server at `src/app/api/mcp/route.ts` (`POST`, `GET`, `DELETE`) secured by `Authorization: Bearer <MCP_SECRET_KEY>` (`process.env.MCP_SECRET_KEY`) and server-side Supabase (`SUPABASE_SERVICE_ROLE_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
     - Implemented `list_groups`, `add_transaction` (with `splitAmountEqually` / exact splits and `fetchTransactionFxRates`), `get_settlement_plan` (per-currency or unified via `calculateUnifiedReconciliation`), and `list_recent_transactions`.
+
+### Phase 6: Traveler UX Polish & Household / Family Rollup (Pass 1 Completed ✅)
+17. ✅ **Households / Family Sub-Groups (`group_members.household_name`):**
+    - Added optional `household_name` assignment with quick-pick pills in `Manage Members` (`MemberInviteModal.tsx`), 1-tap Household quick-select chips in `Split Among` (`page.tsx` & `EditExpenseModal.tsx`), intra-household balance netting before greedy cash-flow minimization (`groupMemberBreakdownByHousehold`, `calculateHouseholdReconciliation`, `calculateUnifiedHouseholdReconciliation` tested in Edge Case 19), and expandable `▸` / `▾` household rows in **Members** with a `Group by Household` / `Show Individuals` toggle.
+18. ✅ **Mobile Overflow Fix, Unclipped Member Rows & Zero-Decimal Currency Formatting:**
+    - Consolidated Group Header `Currencies` inside the `⚙️ Manage` dropdown, added `overflow-x-hidden` / `min-w-0` guards, replaced cramped 4-column mobile member tables with 2-line stacked rows (`sm:hidden`), omitted `.00` on whole-unit `ISK`/`JPY` amounts in `formatCurrency`, and removed developer jargon captions.
