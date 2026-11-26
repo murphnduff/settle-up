@@ -372,13 +372,23 @@ export function SettleUpDashboard({
 }) {
   const supabase = useMemo(() => createClient(), []);
   const routeTarget = initialSlug || initialGroupId || "";
+  const [prevInitialView, setPrevInitialView] = useState<"dashboard" | "settle">(
+    initialView
+  );
   const [currentView, setCurrentView] = useState<"dashboard" | "settle">(
     initialView
   );
+  if (initialView !== prevInitialView) {
+    setPrevInitialView(initialView);
+    setCurrentView(initialView);
+  }
   const currentViewRef = useRef<"dashboard" | "settle">(initialView);
   useEffect(() => {
     currentViewRef.current = currentView;
   }, [currentView]);
+  const [isResolvingTargetGroup, setIsResolvingTargetGroup] = useState<boolean>(
+    Boolean(routeTarget)
+  );
   const [mobileTab, setMobileTab] = useState<"log" | "settle" | "activity">(
     "log"
   );
@@ -674,10 +684,17 @@ export function SettleUpDashboard({
       // 1. If a URL slug or group ID was visited, resolve it immediately (regardless of auth status!)
       let resolvedTargetGroup: Group | null = null;
       if (targetSlugOrId) {
-        resolvedTargetGroup = await resolveGroupBySlugOrId(
-          supabase,
-          targetSlugOrId
-        );
+        setIsResolvingTargetGroup(true);
+        try {
+          resolvedTargetGroup = await resolveGroupBySlugOrId(
+            supabase,
+            targetSlugOrId
+          );
+        } finally {
+          if (!cancelled) {
+            setIsResolvingTargetGroup(false);
+          }
+        }
         if (cancelled) return;
 
         if (resolvedTargetGroup) {
@@ -691,6 +708,8 @@ export function SettleUpDashboard({
             return [resolvedTargetGroup!, ...prev];
           });
         }
+      } else {
+        setIsResolvingTargetGroup(false);
       }
 
       // 2. Load the full sidebar list based on Super-Admin status vs recent_groups in localStorage
@@ -778,9 +797,12 @@ export function SettleUpDashboard({
 
     let livePathMember = "";
     let isRootStealthPath = false;
+    let isGeneralSettlePath = false;
     if (typeof window !== "undefined") {
       const segs = window.location.pathname.split("/").filter(Boolean);
       isRootStealthPath = segs.length === 0;
+      isGeneralSettlePath =
+        segs.length === 2 && segs[1].toLowerCase() === "settle";
       if (
         segs.length >= 2 &&
         !["g", "join", "share-receipt"].includes(segs[0].toLowerCase())
@@ -857,7 +879,7 @@ export function SettleUpDashboard({
 
             // Normalize URL to clean /[slug]/[member] path (unless user opened stealth "/" or general "/[slug]/settle" with only localStorage)
             const keepGeneralSettleUrl =
-              currentViewRef.current === "settle" &&
+              (currentViewRef.current === "settle" || isGeneralSettlePath) &&
               resolved.source === "storage";
             if (
               (!isRootStealthPath || resolved.source !== "storage") &&
@@ -5091,6 +5113,17 @@ export function SettleUpDashboard({
 
       {currentView === "settle" && activeGroup ? (
         renderDedicatedSettleView()
+      ) : isResolvingTargetGroup && !activeGroup ? (
+        <div className="max-w-md mx-auto px-6 py-24">
+          <div className="bg-white border border-slate-200 p-8 rounded-2xl shadow-xs text-center space-y-2">
+            <p className="text-sm font-semibold text-slate-700">
+              Loading group...
+            </p>
+            <p className="text-xs text-slate-400">
+              Resolving your shared group link.
+            </p>
+          </div>
+        </div>
       ) : !isSuperAdmin && groups.length === 0 && !activeGroup ? (
         <div className="max-w-md mx-auto px-6 py-24">
           <div className="bg-white border border-slate-200 p-8 rounded-2xl shadow-xs text-center space-y-4">
